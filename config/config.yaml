@@ -25,7 +25,7 @@ server:
 # ─────────────────────────────────────────
 telemetry:
   log_level: info    # trace|debug|info|warn|error — override with LOG_LEVEL env var
-  log_format: json   # json | text — override with LOG_FORMAT env var
+  log_format: json   # json | text (default: text) — set to json for log aggregators
 
   metrics:
     enabled: true

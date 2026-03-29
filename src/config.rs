@@ -178,7 +178,7 @@ fn default_log_level() -> String {
     "info".to_string()
 }
 fn default_log_format() -> String {
-    "json".to_string()
+    "text".to_string()
 }
 
 impl Default for TelemetryConfig {

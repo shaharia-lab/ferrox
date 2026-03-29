@@ -57,7 +57,7 @@
         "log_format": {
           "type": "string",
           "enum": ["json", "text"],
-          "default": "json"
+          "default": "text"
         },
         "metrics": { "$ref": "#/definitions/MetricsConfig" },
         "tracing": { "$ref": "#/definitions/TracingConfig" }
