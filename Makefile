@@ -28,10 +28,10 @@ check: fmt-check lint test
 
 # ── Run locally ────────────────────────────────────────────────────────────────
 
-## Copy config template if local config does not exist yet
+## Copy minimal config template if local config does not exist yet
 config/local.yaml:
-	cp config/config.yaml config/local.yaml
-	@echo "Created config/local.yaml — edit it with your API keys before running."
+	cp config/config_minimal.yaml config/local.yaml
+	@echo "Created config/local.yaml from config_minimal.yaml — set your API keys in .env before running."
 
 ## Run dev server (requires config/local.yaml and .env)
 run: config/local.yaml

@@ -1,104 +1,226 @@
 name: Release
 
 on:
-  push:
-    tags:
-      - "v*"
+  release:
+    types: [published]
 
 env:
   CARGO_TERM_COLOR: always
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
 
 jobs:
-  build:
-    name: Build ${{ matrix.target }}
+  # ── Cross-platform binaries ───────────────────────────────────────────────────
+  upload-assets:
+    name: Upload binaries (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
     strategy:
       fail-fast: false
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
-            artifact: ferrox-linux-amd64
-            cross: false
-
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
-            artifact: ferrox-linux-arm64
-            cross: true
-
           - target: x86_64-apple-darwin
             os: macos-latest
-            artifact: ferrox-macos-amd64
-            cross: false
-
           - target: aarch64-apple-darwin
             os: macos-latest
-            artifact: ferrox-macos-arm64
-            cross: false
-
     steps:
       - uses: actions/checkout@v4
-
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: ${{ matrix.target }}
-
       - name: Install protobuf compiler (Linux)
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
-
       - name: Install protobuf compiler (macOS)
         if: runner.os == 'macOS'
         run: brew install protobuf
-
-      - name: Install cross
-        if: matrix.cross
-        run: cargo install cross --quiet
-
-      - name: Build (native)
-        if: "!matrix.cross"
-        run: cargo build --release --target ${{ matrix.target }}
-
-      - name: Build (cross)
-        if: matrix.cross
-        run: cross build --release --target ${{ matrix.target }}
-
-      - name: Rename artifact
-        run: |
-          cp target/${{ matrix.target }}/release/ferrox ${{ matrix.artifact }}
-
-      - uses: actions/upload-artifact@v4
+      - uses: taiki-e/upload-rust-binary-action@v1
         with:
-          name: ${{ matrix.artifact }}
-          path: ${{ matrix.artifact }}
-          if-no-files-found: error
+          bin: ferrox
+          target: ${{ matrix.target }}
+          token: ${{ secrets.GITHUB_TOKEN }}
 
-  release:
-    name: Create GitHub Release
-    needs: build
+  # ── Docker image — multi-platform, push to GHCR ───────────────────────────────
+  docker:
+    name: Docker image
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      contents: read
+      packages: write
     steps:
       - uses: actions/checkout@v4
-
-      - uses: actions/download-artifact@v4
+      - name: Set up QEMU (ARM emulation)
+        uses: docker/setup-qemu-action@v3
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
         with:
-          path: artifacts
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=raw,value=latest
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
-      - name: Generate checksums
+  # ── Homebrew tap ──────────────────────────────────────────────────────────────
+  homebrew:
+    name: Update Homebrew formula
+    needs: upload-assets
+    runs-on: ubuntu-latest
+    steps:
+      - name: Update Homebrew formulas
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
         run: |
-          cd artifacts
-          find . -type f -exec sha256sum {} \; | sed 's|  ./||' > ../checksums.sha256
-          cat ../checksums.sha256
+          VERSION="${{ github.ref_name }}"
+          VERSION_NUM="${VERSION#v}"
+          VERSION_CLASS=$(echo "$VERSION_NUM" | tr -d '.')
 
-      - uses: softprops/action-gh-release@v2
-        with:
-          generate_release_notes: true
-          files: |
-            artifacts/**/*
-            checksums.sha256
+          echo "Calculating SHA256 checksums..."
+          SHA_MACOS_X86=$(curl -sL "https://github.com/shaharia-lab/ferrox/releases/download/${VERSION}/ferrox-x86_64-apple-darwin.tar.gz" | sha256sum | cut -d' ' -f1)
+          SHA_MACOS_ARM=$(curl -sL "https://github.com/shaharia-lab/ferrox/releases/download/${VERSION}/ferrox-aarch64-apple-darwin.tar.gz" | sha256sum | cut -d' ' -f1)
+          SHA_LINUX_X86=$(curl -sL "https://github.com/shaharia-lab/ferrox/releases/download/${VERSION}/ferrox-x86_64-unknown-linux-gnu.tar.gz" | sha256sum | cut -d' ' -f1)
+          SHA_LINUX_ARM=$(curl -sL "https://github.com/shaharia-lab/ferrox/releases/download/${VERSION}/ferrox-aarch64-unknown-linux-gnu.tar.gz" | sha256sum | cut -d' ' -f1)
+
+          MAIN_FORMULA='# typed: false
+          # frozen_string_literal: true
+
+          class Ferrox < Formula
+            desc "High-performance, stateless LLM API gateway"
+            homepage "https://github.com/shaharia-lab/ferrox"
+            version "'"${VERSION_NUM}"'"
+            license "MIT"
+
+            on_macos do
+              if Hardware::CPU.intel?
+                url "https://github.com/shaharia-lab/ferrox/releases/download/'"${VERSION}"'/ferrox-x86_64-apple-darwin.tar.gz"
+                sha256 "'"${SHA_MACOS_X86}"'"
+                def install
+                  bin.install "ferrox"
+                end
+              end
+              if Hardware::CPU.arm?
+                url "https://github.com/shaharia-lab/ferrox/releases/download/'"${VERSION}"'/ferrox-aarch64-apple-darwin.tar.gz"
+                sha256 "'"${SHA_MACOS_ARM}"'"
+                def install
+                  bin.install "ferrox"
+                end
+              end
+            end
+
+            on_linux do
+              if Hardware::CPU.intel? && Hardware::CPU.is_64_bit?
+                url "https://github.com/shaharia-lab/ferrox/releases/download/'"${VERSION}"'/ferrox-x86_64-unknown-linux-gnu.tar.gz"
+                sha256 "'"${SHA_LINUX_X86}"'"
+                def install
+                  bin.install "ferrox"
+                end
+              end
+              if Hardware::CPU.arm? && Hardware::CPU.is_64_bit?
+                url "https://github.com/shaharia-lab/ferrox/releases/download/'"${VERSION}"'/ferrox-aarch64-unknown-linux-gnu.tar.gz"
+                sha256 "'"${SHA_LINUX_ARM}"'"
+                def install
+                  bin.install "ferrox"
+                end
+              end
+            end
+
+            test do
+              system "#{bin}/ferrox", "--version"
+            end
+          end'
+
+          VERSIONED_FORMULA='# typed: false
+          # frozen_string_literal: true
+
+          class FerroxAT'"${VERSION_CLASS}"' < Formula
+            desc "High-performance, stateless LLM API gateway"
+            homepage "https://github.com/shaharia-lab/ferrox"
+            version "'"${VERSION_NUM}"'"
+            license "MIT"
+
+            keg_only :versioned_formula
+
+            on_macos do
+              if Hardware::CPU.intel?
+                url "https://github.com/shaharia-lab/ferrox/releases/download/'"${VERSION}"'/ferrox-x86_64-apple-darwin.tar.gz"
+                sha256 "'"${SHA_MACOS_X86}"'"
+                def install
+                  bin.install "ferrox"
+                end
+              end
+              if Hardware::CPU.arm?
+                url "https://github.com/shaharia-lab/ferrox/releases/download/'"${VERSION}"'/ferrox-aarch64-apple-darwin.tar.gz"
+                sha256 "'"${SHA_MACOS_ARM}"'"
+                def install
+                  bin.install "ferrox"
+                end
+              end
+            end
+
+            on_linux do
+              if Hardware::CPU.intel? && Hardware::CPU.is_64_bit?
+                url "https://github.com/shaharia-lab/ferrox/releases/download/'"${VERSION}"'/ferrox-x86_64-unknown-linux-gnu.tar.gz"
+                sha256 "'"${SHA_LINUX_X86}"'"
+                def install
+                  bin.install "ferrox"
+                end
+              end
+              if Hardware::CPU.arm? && Hardware::CPU.is_64_bit?
+                url "https://github.com/shaharia-lab/ferrox/releases/download/'"${VERSION}"'/ferrox-aarch64-unknown-linux-gnu.tar.gz"
+                sha256 "'"${SHA_LINUX_ARM}"'"
+                def install
+                  bin.install "ferrox"
+                end
+              end
+            end
+
+            test do
+              system "#{bin}/ferrox", "--version"
+            end
+          end'
+
+          MAIN_SHA=$(gh api "repos/shaharia-lab/homebrew-tap/contents/Formula/ferrox.rb" --jq '.sha' 2>/dev/null || echo "")
+          if [ -n "$MAIN_SHA" ]; then
+            gh api --method PUT "repos/shaharia-lab/homebrew-tap/contents/Formula/ferrox.rb" \
+              -f message="ferrox ${VERSION_NUM}" \
+              -f content="$(echo "$MAIN_FORMULA" | base64 -w0)" \
+              -f sha="$MAIN_SHA" \
+              -f branch="main"
+          else
+            gh api --method PUT "repos/shaharia-lab/homebrew-tap/contents/Formula/ferrox.rb" \
+              -f message="ferrox ${VERSION_NUM}" \
+              -f content="$(echo "$MAIN_FORMULA" | base64 -w0)" \
+              -f branch="main"
+          fi
+
+          if gh api "repos/shaharia-lab/homebrew-tap/contents/Formula/ferrox@${VERSION_NUM}.rb" --silent 2>/dev/null; then
+            echo "Versioned formula ferrox@${VERSION_NUM}.rb already exists, skipping"
+          else
+            gh api --method PUT "repos/shaharia-lab/homebrew-tap/contents/Formula/ferrox@${VERSION_NUM}.rb" \
+              -f message="Add ferrox@${VERSION_NUM} versioned formula" \
+              -f content="$(echo "$VERSIONED_FORMULA" | base64 -w0)" \
+              -f branch="main"
+          fi
+
+          echo "Homebrew formulas updated successfully!"

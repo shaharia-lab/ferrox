@@ -18,8 +18,8 @@ The runtime image runs as a non-root user.
 ### Run with Docker Compose
 
 ```bash
-# Copy and edit config
-cp config/config.yaml config/local.yaml
+# Copy minimal config and set your keys in .env
+cp config/config_minimal.yaml config/local.yaml
 
 # Start the full stack
 docker compose up

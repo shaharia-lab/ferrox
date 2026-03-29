@@ -1,0 +1,55 @@
+# ─────────────────────────────────────────
+# Ferrox — minimal configuration
+# Copy this to config/local.yaml and fill in your API keys.
+# All other settings use safe, production-ready defaults.
+# ─────────────────────────────────────────
+
+providers:
+  - name: anthropic
+    type: anthropic
+    api_key: "${ANTHROPIC_API_KEY}"
+
+  - name: openai
+    type: openai
+    api_key: "${OPENAI_API_KEY:-placeholder}"
+
+  - name: gemini
+    type: gemini
+    api_key: "${GEMINI_API_KEY:-placeholder}"
+
+models:
+  - alias: claude-sonnet
+    routing:
+      strategy: failover
+      targets:
+        - provider: anthropic
+          model_id: "claude-sonnet-4-20250514"
+
+  - alias: claude-haiku
+    routing:
+      strategy: failover
+      targets:
+        - provider: anthropic
+          model_id: "claude-haiku-4-5-20251001"
+
+  - alias: gpt-4o
+    routing:
+      strategy: failover
+      targets:
+        - provider: openai
+          model_id: "gpt-4o"
+
+  - alias: gemini-flash
+    routing:
+      strategy: failover
+      targets:
+        - provider: gemini
+          model_id: "gemini-2.5-flash-lite"
+
+virtual_keys:
+  - key: "${PROXY_KEY:-sk-local-dev}"
+    name: local-dev
+    allowed_models: ["*"]
+    rate_limit:
+      requests_per_minute: 120
+      burst: 20

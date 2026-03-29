@@ -59,8 +59,8 @@ cargo test -- --nocapture
 # 1. Copy the example env file and fill in your API keys
 cp .env.example .env
 
-# 2. Create a local config (Makefile does this automatically on first run)
-cp config/config.yaml config/local.yaml
+# 2. Create a local config from the minimal template (Makefile does this automatically on first run)
+cp config/config_minimal.yaml config/local.yaml
 
 # 3. Run (Makefile loads .env automatically)
 make run

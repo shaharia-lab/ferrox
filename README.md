@@ -41,39 +41,94 @@ flowchart LR
     Ferrox --> OTLP[OTLP Collector]
 ```
 
+## Installation
+
+### Pre-built binary
+
+Download the latest release for your platform from [GitHub Releases](https://github.com/shaharia-lab/ferrox/releases/latest):
+
+```bash
+# macOS (Apple Silicon)
+curl -L https://github.com/shaharia-lab/ferrox/releases/latest/download/ferrox-aarch64-apple-darwin.tar.gz | tar xz
+sudo mv ferrox /usr/local/bin/
+
+# macOS (Intel)
+curl -L https://github.com/shaharia-lab/ferrox/releases/latest/download/ferrox-x86_64-apple-darwin.tar.gz | tar xz
+sudo mv ferrox /usr/local/bin/
+
+# Linux (x86_64)
+curl -L https://github.com/shaharia-lab/ferrox/releases/latest/download/ferrox-x86_64-unknown-linux-gnu.tar.gz | tar xz
+sudo mv ferrox /usr/local/bin/
+
+# Linux (ARM64)
+curl -L https://github.com/shaharia-lab/ferrox/releases/latest/download/ferrox-aarch64-unknown-linux-gnu.tar.gz | tar xz
+sudo mv ferrox /usr/local/bin/
+```
+
+### Homebrew (macOS and Linux)
+
+```bash
+brew install shaharia-lab/tap/ferrox
+```
+
+To install a specific version:
+
+```bash
+brew install shaharia-lab/tap/ferrox@1.0.0
+```
+
+### Docker
+
+```bash
+docker pull ghcr.io/shaharia-lab/ferrox:latest
+```
+
+Or with Docker Compose (includes full LGTM observability stack):
+
+```bash
+docker compose up
+```
+
+Starts Ferrox + Grafana (`:3000`), OTLP (`:4317`), and the full logging/tracing/metrics stack.
+
+### Build from source
+
+```bash
+# Prerequisites: Rust 1.74+, protobuf-compiler
+# Ubuntu/Debian: sudo apt install protobuf-compiler
+# macOS: brew install protobuf
+
+git clone https://github.com/shaharia-lab/ferrox
+cd ferrox
+cargo build --release
+# Binary at: ./target/release/ferrox
+```
+
 ## Quick Start
 
 ```bash
-# 1. Copy and edit the example config
-cp config/config.yaml config/local.yaml
+# 1. Copy the minimal config (pre-configured with sensible defaults)
+cp config/config_minimal.yaml config/local.yaml
 
 # 2. Set your API keys
 export ANTHROPIC_API_KEY=sk-ant-...
 export OPENAI_API_KEY=sk-...
 
 # 3. Run
-LLM_PROXY_CONFIG=config/local.yaml cargo run --release
+LLM_PROXY_CONFIG=config/local.yaml ferrox
 ```
 
 Send a request:
 
 ```bash
 curl http://localhost:8080/v1/chat/completions \
-  -H "Authorization: Bearer sk-proxy-dev-key" \
+  -H "Authorization: Bearer sk-local-dev" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "claude-sonnet",
     "messages": [{"role": "user", "content": "Hello"}]
   }'
 ```
-
-## Docker
-
-```bash
-docker compose up
-```
-
-Starts Ferrox + Prometheus + Grafana + Jaeger + OTEL Collector.
 
 ## Documentation
 
@@ -95,7 +150,7 @@ Starts Ferrox + Prometheus + Grafana + Jaeger + OTEL Collector.
 |---|---|
 | [Architecture](docs/developer/architecture.md) | System design and request flow |
 | [Development](docs/developer/development.md) | Build, test, contribute |
-| [Deployment](docs/developer/deployment.md) | Docker and Kubernetes |
+| [Deployment](docs/developer/deployment.md) | Docker |
 
 ## License
 
