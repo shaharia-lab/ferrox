@@ -1,6 +1,6 @@
 # Providers
 
-Ferrox supports four provider types. Each can appear multiple times in the config with different API keys or base URLs.
+Ferrox supports five provider types. Each can appear multiple times in the config with different API keys or base URLs.
 
 ## Anthropic
 
@@ -74,6 +74,25 @@ Credentials are loaded from the standard AWS credential chain:
 Currently supports Anthropic models on Bedrock (`anthropic.*` model IDs) using the `anthropic_version: "bedrock-2023-05-31"` format.
 
 **No API key required**
+
+---
+
+## Z.AI GLM
+
+```yaml
+providers:
+  - name: glm-primary
+    type: glm
+    api_key: "${GLM_API_KEY}"
+    base_url: "https://api.z.ai/api/paas/v4"
+    # GLM Coding Plan: use https://api.z.ai/api/coding/paas/v4
+```
+
+GLM uses an OpenAI-compatible API, so Ferrox routes requests through the same adapter as OpenAI with no transformation. All OpenAI features (streaming, tool use, system prompts) work as-is.
+
+Available models: `GLM-5.1`, `GLM-5`, `GLM-4.7`, `GLM-4.5-air`.
+
+**Required env var:** `GLM_API_KEY`
 
 ---
 
