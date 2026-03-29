@@ -59,7 +59,7 @@ Send a request:
 
 ```bash
 curl http://localhost:8080/v1/chat/completions \
-  -H "Authorization: Bearer sk-proxy-dev-key" \
+  -H "Authorization: Bearer sk-local-dev" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "claude-sonnet",
@@ -73,7 +73,7 @@ curl http://localhost:8080/v1/chat/completions \
 docker compose up
 ```
 
-Starts Ferrox + Prometheus + Grafana + Jaeger + OTEL Collector.
+Starts Ferrox + full LGTM observability stack (Grafana `:3000`, OTLP `:4317`).
 
 ## Documentation
 
