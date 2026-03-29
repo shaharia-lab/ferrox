@@ -80,4 +80,4 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install check-jsonschema
-      - run: check-jsonschema --schemafile config.schema.json config/config.yaml
+      - run: check-jsonschema --schemafile config.schema.json config/*.yaml
