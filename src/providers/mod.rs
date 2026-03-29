@@ -53,7 +53,7 @@ pub async fn build_registry(
                     format!("Failed to build Anthropic provider '{}'", cfg.name)
                 })?,
             ),
-            ProviderType::OpenAI => Arc::new(
+            ProviderType::OpenAI | ProviderType::Glm => Arc::new(
                 openai::OpenAIAdapter::new(cfg, defaults)
                     .with_context(|| format!("Failed to build OpenAI provider '{}'", cfg.name))?,
             ),

@@ -272,6 +272,8 @@ pub enum ProviderType {
     OpenAI,
     Gemini,
     Bedrock,
+    /// Z.AI GLM — fully OpenAI-compatible; uses OpenAI adapter with a custom base URL.
+    Glm,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
