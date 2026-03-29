@@ -10,75 +10,39 @@ env:
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
-  # ── Cross-platform binary builds ─────────────────────────────────────────────
-  build:
-    name: Build ${{ matrix.target }}
+  # ── Cross-platform binaries ───────────────────────────────────────────────────
+  # Uses taiki-e/upload-rust-binary-action which handles toolchain setup,
+  # cross-compilation, archiving, and release upload in one step.
+  upload-assets:
+    name: Upload binaries (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
     permissions:
-      contents: read
+      contents: write
     strategy:
       fail-fast: false
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
-            artifact: ferrox-linux-amd64
-            cross: false
-
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
-            artifact: ferrox-linux-arm64
-            cross: true
-
           - target: x86_64-apple-darwin
             os: macos-latest
-            artifact: ferrox-macos-amd64
-            cross: false
-
           - target: aarch64-apple-darwin
             os: macos-latest
-            artifact: ferrox-macos-arm64
-            cross: false
-
     steps:
       - uses: actions/checkout@v4
-
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: ${{ matrix.target }}
-
       - name: Install protobuf compiler (Linux)
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
-
       - name: Install protobuf compiler (macOS)
         if: runner.os == 'macOS'
         run: brew install protobuf
-
-      - name: Install cross
-        if: matrix.cross
-        run: cargo install cross --quiet
-
-      - name: Build (native)
-        if: "!matrix.cross"
-        run: cargo build --release --target ${{ matrix.target }}
-
-      - name: Build (cross)
-        if: matrix.cross
-        run: cross build --release --target ${{ matrix.target }}
-
-      - name: Rename artifact
-        run: cp target/${{ matrix.target }}/release/ferrox ${{ matrix.artifact }}
-
-      - uses: actions/upload-artifact@v4
+      - uses: taiki-e/upload-rust-binary-action@v1
         with:
-          name: ${{ matrix.artifact }}
-          path: ${{ matrix.artifact }}
-          if-no-files-found: error
+          bin: ferrox
+          target: ${{ matrix.target }}
+          token: ${{ secrets.GITHUB_TOKEN }}
 
   # ── Docker image — multi-platform, push to GHCR ───────────────────────────────
   docker:
@@ -89,20 +53,16 @@ jobs:
       packages: write
     steps:
       - uses: actions/checkout@v4
-
       - name: Set up QEMU (ARM emulation)
         uses: docker/setup-qemu-action@v3
-
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
-
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-
       - name: Extract Docker metadata
         id: meta
         uses: docker/metadata-action@v5
@@ -113,7 +73,6 @@ jobs:
             type=semver,pattern={{major}}.{{minor}}
             type=semver,pattern={{major}}
             type=raw,value=latest
-
       - name: Build and push
         uses: docker/build-push-action@v6
         with:
@@ -124,30 +83,3 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-
-  # ── GitHub Release — attach binaries and checksums ────────────────────────────
-  release:
-    name: Attach release assets
-    needs: build
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/download-artifact@v4
-        with:
-          path: artifacts
-
-      - name: Generate checksums
-        run: |
-          cd artifacts
-          find . -type f -exec sha256sum {} \; | sed 's|  ./||' > ../checksums.sha256
-          cat ../checksums.sha256
-
-      - uses: softprops/action-gh-release@v2
-        with:
-          generate_release_notes: true
-          files: |
-            artifacts/**/*
-            checksums.sha256
