@@ -18,39 +18,71 @@ use std::sync::{
     Arc,
 };
 
+use clap::Parser;
 use metrics::Metrics;
 use ratelimit::build_rate_limiter;
 use router::ModelRouter;
 use state::AppState;
+
+const VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    " (",
+    env!("GIT_SHA"),
+    " ",
+    env!("BUILD_DATE"),
+    ")"
+);
+
+/// Ferrox — high-performance stateless LLM API gateway
+#[derive(Parser)]
+#[command(name = "ferrox", version = VERSION, about, long_about = None)]
+struct Cli {
+    /// Path to the configuration file
+    #[arg(
+        short,
+        long,
+        env = "LLM_PROXY_CONFIG",
+        default_value = "config/local.yaml"
+    )]
+    config: String,
+}
 
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
     // 1. Load .env (local dev only, no-op in prod)
     dotenvy::dotenv().ok();
 
-    // 2. Load and validate config
-    let config = config::load_config()?;
+    // 2. Parse CLI args (handles --version and --help automatically)
+    let cli = Cli::parse();
 
-    // 3. Init logging (before anything else that might log)
+    // 3. Load and validate config
+    let config = config::load_config_from(&cli.config)?;
+
+    // 4. Init logging (before anything else that might log)
     telemetry::init_logging(&config.telemetry)?;
 
-    tracing::info!(version = env!("CARGO_PKG_VERSION"), "Starting Ferrox");
+    tracing::info!(
+        version = env!("CARGO_PKG_VERSION"),
+        git_sha = env!("GIT_SHA"),
+        build_date = env!("BUILD_DATE"),
+        "Starting Ferrox"
+    );
 
-    // 4. Build provider registry
+    // 5. Build provider registry
     let providers = providers::build_registry(&config.providers, &config.defaults).await?;
     tracing::info!(count = providers.len(), "Providers registered");
 
-    // 5. Build model router (RoutePool per alias, circuit breakers initialized)
+    // 6. Build model router (RoutePool per alias, circuit breakers initialized)
     let model_router = ModelRouter::from_config(&config, &providers)?;
 
-    // 6. Build per-key rate limiters
+    // 7. Build per-key rate limiters
     let rate_limiter = build_rate_limiter(&config.virtual_keys);
     tracing::info!(count = rate_limiter.len(), "Rate limiters initialized");
 
-    // 7. Init metrics
+    // 8. Init metrics
     let metrics = Metrics::new();
 
-    // 8. Build AppState
+    // 9. Build AppState
     let ready = Arc::new(AtomicBool::new(false));
     let state = AppState {
         config: Arc::new(config),
@@ -61,18 +93,18 @@ async fn main() -> Result<(), anyhow::Error> {
         ready: ready.clone(),
     };
 
-    // 9. Build axum router
+    // 10. Build axum router
     let app = server::build_router(state.clone());
 
-    // 10. Bind listener
+    // 11. Bind listener
     let addr = format!("{}:{}", state.config.server.host, state.config.server.port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     tracing::info!(addr = %addr, "Ferrox listening");
 
-    // 11. Mark ready
+    // 12. Mark ready
     ready.store(true, Ordering::Release);
 
-    // 12. Serve with graceful shutdown
+    // 13. Serve with graceful shutdown
     let graceful_timeout = state.config.server.graceful_shutdown_timeout_secs;
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal(ready, graceful_timeout))

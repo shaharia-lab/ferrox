@@ -59,6 +59,7 @@ regex = "1"
 once_cell = "1"
 dotenvy = "0.15"
 rand = "0.8"
+clap = { version = "4", features = ["derive", "env"] }
 
 # AWS Bedrock
 aws-config = { version = "1", features = ["behavior-version-latest"] }

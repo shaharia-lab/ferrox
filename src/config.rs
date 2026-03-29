@@ -352,11 +352,10 @@ pub struct Config {
 
 // ── Loading ──────────────────────────────────────────────────────────────────
 
-pub fn load_config() -> Result<Config, anyhow::Error> {
-    let path = resolve_config_path()?;
-    tracing::info!(path = %path, "Loading config");
+pub fn load_config_from(path: &str) -> Result<Config, anyhow::Error> {
+    tracing::debug!(path = %path, "Loading config");
 
-    let raw = std::fs::read_to_string(&path)
+    let raw = std::fs::read_to_string(path)
         .with_context(|| format!("Failed to read config file: {path}"))?;
 
     // Parse YAML into a Value tree first
@@ -373,23 +372,6 @@ pub fn load_config() -> Result<Config, anyhow::Error> {
     validate(&config)?;
 
     Ok(config)
-}
-
-pub(crate) fn resolve_config_path() -> Result<String, anyhow::Error> {
-    if let Ok(p) = env::var("LLM_PROXY_CONFIG") {
-        return Ok(p);
-    }
-    let local = "config/config.yaml";
-    if std::path::Path::new(local).exists() {
-        return Ok(local.to_string());
-    }
-    let system = "/etc/ferrox/config.yaml";
-    if std::path::Path::new(system).exists() {
-        return Ok(system.to_string());
-    }
-    bail!(
-        "No config file found. Set LLM_PROXY_CONFIG or place config at ./config/config.yaml or /etc/ferrox/config.yaml"
-    )
 }
 
 /// Interpolate `${VAR}` and `${VAR:-default}` in all string leaves of a YAML value tree.
