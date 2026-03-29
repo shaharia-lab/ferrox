@@ -44,8 +44,8 @@ flowchart LR
 ## Quick Start
 
 ```bash
-# 1. Copy and edit the example config
-cp config/config.yaml config/local.yaml
+# 1. Copy the minimal config (pre-configured with sensible defaults)
+cp config/config_minimal.yaml config/local.yaml
 
 # 2. Set your API keys
 export ANTHROPIC_API_KEY=sk-ant-...
