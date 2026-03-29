@@ -5,7 +5,7 @@ This guide gets Ferrox running locally in under 5 minutes.
 ## Prerequisites
 
 - Rust 1.74+ (`rustup update stable`)
-- At least one LLM provider API key
+- At least one LLM provider API key (Anthropic, OpenAI, or Gemini)
 
 ## 1. Clone and build
 
@@ -17,48 +17,39 @@ cargo build --release
 
 ## 2. Configure
 
-Copy the example config:
+Copy the minimal config (pre-configured with sensible defaults):
 
 ```bash
-cp config/config.yaml config/local.yaml
+cp config/config_minimal.yaml config/local.yaml
 ```
 
-Edit `config/local.yaml`. At minimum, set one provider and one model:
-
-```yaml
-providers:
-  - name: anthropic
-    type: anthropic
-    api_key: "${ANTHROPIC_API_KEY}"
-
-models:
-  - alias: claude-sonnet
-    routing:
-      strategy: failover
-      targets:
-        - provider: anthropic
-          model_id: claude-sonnet-4-20250514
-
-virtual_keys:
-  - key: "${PROXY_KEY:-sk-local-dev}"
-    name: local-dev
-    allowed_models: ["*"]
-    rate_limit:
-      requests_per_minute: 120
-      burst: 20
-```
+`config_minimal.yaml` includes Anthropic, OpenAI, and Gemini providers and four ready-to-use model aliases. All timeouts, retries, and circuit breaker settings use production-ready defaults — no changes needed unless you want to customise.
 
 ## 3. Set environment variables
 
+Create a `.env` file:
+
 ```bash
-export ANTHROPIC_API_KEY=sk-ant-...
-export PROXY_KEY=sk-local-dev
+cp .env.example .env
 ```
+
+Then set at least one provider key:
+
+```bash
+# .env
+ANTHROPIC_API_KEY=sk-ant-...
+PROXY_KEY=sk-local-dev       # your inbound virtual key
+```
+
+Keys for providers you don't use can be left blank — those providers will be skipped.
 
 ## 4. Run
 
 ```bash
-LLM_PROXY_CONFIG=config/local.yaml ./target/release/ferrox
+make run
+# or directly:
+# set -a && . ./.env && set +a
+# LLM_PROXY_CONFIG=config/local.yaml ./target/release/ferrox
 ```
 
 ## 5. Send a request
@@ -73,29 +64,34 @@ curl http://localhost:8080/v1/chat/completions \
   }'
 ```
 
+Available model aliases out of the box: `claude-sonnet`, `claude-haiku`, `gpt-4o`, `gemini-flash`.
+
 ## 6. Verify health
 
 ```bash
-curl http://localhost:8080/healthz   # -> "ok"
+curl http://localhost:8080/healthz   # -> {"status":"ok"}
 curl http://localhost:8080/readyz    # -> "ready" when startup is complete
 curl http://localhost:8080/metrics   # -> Prometheus text format
 ```
 
 ## Using Docker Compose
 
-The fastest way to get the full observability stack running:
+Starts Ferrox and the full LGTM observability stack (Grafana, Loki, Tempo, Mimir + OTEL Collector) in a single command:
 
 ```bash
-cp config/config.yaml config/local.yaml
-# Edit config/local.yaml with your keys
+cp config/config_minimal.yaml config/local.yaml
+# Edit config/local.yaml or set keys in .env
 docker compose up
 ```
 
-This starts Ferrox, Prometheus (`:9090`), Grafana (`:3000`), Jaeger (`:16686`), and the OTEL Collector.
+| URL | Purpose |
+|---|---|
+| `http://localhost:8080` | Ferrox proxy |
+| `http://localhost:3000` | Grafana dashboards (admin / admin) |
 
 ## Next steps
 
-- [Configuration reference](configuration.md) - all config options
-- [Providers](providers.md) - add OpenAI, Gemini, or Bedrock
-- [Routing](routing.md) - set up failover and weighted routing
-- [Virtual keys](virtual-keys.md) - issue scoped keys for each service
+- [Configuration reference](configuration.md) — all config options
+- [Providers](providers.md) — add Bedrock, GLM, or additional API keys
+- [Routing](routing.md) — set up failover and weighted routing
+- [Virtual keys](virtual-keys.md) — issue scoped keys for each service
