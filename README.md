@@ -120,7 +120,7 @@ export OPENAI_API_KEY=sk-...
 LLM_PROXY_CONFIG=config/local.yaml ferrox
 ```
 
-### Docker (no repo clone needed)
+### Docker
 
 ```bash
 # 1. Download the minimal config

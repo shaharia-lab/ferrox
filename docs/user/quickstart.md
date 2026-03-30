@@ -54,7 +54,7 @@ Pull the image:
 docker pull ghcr.io/shaharia-lab/ferrox:latest
 ```
 
-Download the minimal config (no repo clone needed):
+Download the minimal config:
 
 ```bash
 curl -Lo local.yaml https://raw.githubusercontent.com/shaharia-lab/ferrox/main/config/config_minimal.yaml
