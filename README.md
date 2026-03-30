@@ -106,6 +106,8 @@ cargo build --release
 
 ## Quick Start
 
+### Binary or Homebrew
+
 ```bash
 # 1. Copy the minimal config (pre-configured with sensible defaults)
 cp config/config_minimal.yaml config/local.yaml
@@ -116,6 +118,20 @@ export OPENAI_API_KEY=sk-...
 
 # 3. Run
 LLM_PROXY_CONFIG=config/local.yaml ferrox
+```
+
+### Docker
+
+```bash
+# 1. Download the minimal config
+curl -Lo local.yaml https://raw.githubusercontent.com/shaharia-lab/ferrox/main/config/config_minimal.yaml
+
+# 2. Run (API keys passed as env vars)
+docker run -p 8080:8080 \
+  -e ANTHROPIC_API_KEY=sk-ant-... \
+  -v $(pwd)/local.yaml:/etc/ferrox/config.yaml \
+  ghcr.io/shaharia-lab/ferrox:latest \
+  ferrox --config /etc/ferrox/config.yaml
 ```
 
 Send a request:
