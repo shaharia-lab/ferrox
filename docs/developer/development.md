@@ -23,13 +23,13 @@ This runs `cargo fmt` and `cargo clippy -- -D warnings` automatically on every c
 ## Common tasks (Makefile)
 
 ```bash
-make build          # debug build
-make build-release  # release build
-make test           # run all tests
+make build          # debug build (all workspace members)
+make build-release  # release build (all workspace members)
+make test           # run all tests (all workspace members)
 make fmt            # format code
 make lint           # clippy
 make check          # fmt-check + lint + test (CI equivalent)
-make run            # run dev server (loads .env, uses config/local.yaml)
+make run            # run dev server (loads .env, uses ferrox/config/local.yaml)
 make docker-up      # start full stack with Docker Compose
 make help           # list all targets
 ```
@@ -37,20 +37,25 @@ make help           # list all targets
 ## Build
 
 ```bash
-cargo build
-cargo build --release
+# Build all workspace members
+cargo build --workspace
+cargo build --release --workspace
+
+# Build a specific package
+cargo build -p ferrox
+cargo build -p ferrox-cp
 ```
 
 ## Run tests
 
 ```bash
-cargo test
+cargo test --workspace
 
 # Specific module
-cargo test config::tests
+cargo test -p ferrox config::tests
 
 # Show stdout for all tests
-cargo test -- --nocapture
+cargo test --workspace -- --nocapture
 ```
 
 ## Run locally
@@ -60,14 +65,14 @@ cargo test -- --nocapture
 cp .env.example .env
 
 # 2. Create a local config from the minimal template (Makefile does this automatically on first run)
-cp config/config_minimal.yaml config/local.yaml
+cp ferrox/config/config_minimal.yaml ferrox/config/local.yaml
 
 # 3. Run (Makefile loads .env automatically)
 make run
 
 # Or manually:
 set -a && . ./.env && set +a
-LLM_PROXY_CONFIG=config/local.yaml cargo run
+LLM_PROXY_CONFIG=ferrox/config/local.yaml cargo run -p ferrox
 ```
 
 Or with the full observability stack (Grafana + Loki + Tempo + Prometheus + OTEL Collector bundled in one container):
@@ -81,27 +86,42 @@ make docker-up
 
 ## Project structure
 
+This is a Cargo workspace. The root `Cargo.toml` is the workspace manifest.
+
 ```
-src/
-  main.rs           entry point
-  server.rs         HTTP router construction
-  config.rs         config loading and validation
-  state.rs          shared application state
-  auth.rs           auth middleware
-  router.rs         model alias resolution
-  error.rs          error types and HTTP responses
-  types.rs          OpenAI wire types
-  retry.rs          retry logic with backoff
-  metrics.rs        startup metrics shim
+Cargo.toml          workspace manifest (members: ferrox, ferrox-cp)
+Cargo.lock          shared workspace lock file
 
-  providers/        one file per provider
-  lb/               load balancing and circuit breakers
-  ratelimit/        token bucket rate limiter
-  telemetry/        logging, metrics, tracing
-  handlers/         HTTP request handlers
+ferrox/             gateway binary crate
+  Cargo.toml
+  build.rs          version embedding (git SHA at compile time)
+  src/
+    main.rs           entry point
+    server.rs         HTTP router construction
+    config.rs         config loading and validation
+    state.rs          shared application state
+    auth.rs           auth middleware
+    router.rs         model alias resolution
+    error.rs          error types and HTTP responses
+    types.rs          OpenAI wire types
+    retry.rs          retry logic with backoff
+    metrics.rs        startup metrics shim
 
-config/
-  config.yaml       example configuration
+    providers/        one file per provider
+    lb/               load balancing and circuit breakers
+    ratelimit/        token bucket rate limiter
+    telemetry/        logging, metrics, tracing
+    handlers/         HTTP request handlers
+
+  config/
+    config.yaml           example configuration
+    config_minimal.yaml   quickstart template
+  config.schema.json      JSON Schema for config validation
+
+ferrox-cp/          control plane binary crate (Phase 3)
+  Cargo.toml
+  src/
+    main.rs
 
 docs/
   user/             user-facing guides
@@ -110,7 +130,7 @@ docs/
 
 ## Adding a new provider
 
-1. Create `src/providers/yourprovider.rs`
+1. Create `ferrox/src/providers/yourprovider.rs`
 2. Implement the `ProviderAdapter` trait:
 
 ```rust
@@ -136,16 +156,16 @@ impl ProviderAdapter for YourAdapter {
 }
 ```
 
-3. Add a new variant to `ProviderType` in `config.rs`
-4. Register the adapter in `providers/mod.rs` inside `build_registry()`
+3. Add a new variant to `ProviderType` in `ferrox/src/config.rs`
+4. Register the adapter in `ferrox/src/providers/mod.rs` inside `build_registry()`
 5. Add a test covering at least the request transformation
 
 ## Adding a new routing strategy
 
-1. Add a variant to `LbStrategy` in `lb/strategy.rs`
+1. Add a variant to `LbStrategy` in `ferrox/src/lb/strategy.rs`
 2. Implement the `select(&[bool]) -> Option<usize>` match arm
-3. Add a corresponding variant to `RoutingStrategy` in `config.rs`
-4. Wire it in `lb/mod.rs` inside `RoutePool::from_config()`
+3. Add a corresponding variant to `RoutingStrategy` in `ferrox/src/config.rs`
+4. Wire it in `ferrox/src/lb/mod.rs` inside `RoutePool::from_config()`
 5. Add unit tests
 
 ## Testing guidelines
@@ -168,7 +188,7 @@ impl ProviderAdapter for YourAdapter {
 
 The CI pipeline runs:
 
-1. `cargo fmt --check`
-2. `cargo clippy -- -D warnings`
-3. `cargo test`
-4. `cargo build --release`
+1. `cargo fmt --all --check`
+2. `cargo clippy --workspace -- -D warnings`
+3. `cargo test --workspace`
+4. `cargo build --release --workspace`

@@ -15,21 +15,21 @@ repos:
     hooks:
       - id: cargo-fmt
         name: cargo fmt
-        entry: cargo fmt --
+        entry: cargo fmt --all --
         language: system
         types: [rust]
         pass_filenames: true
 
       - id: cargo-clippy
         name: cargo clippy
-        entry: cargo clippy -- -D warnings
+        entry: cargo clippy --workspace -- -D warnings
         language: system
         types: [rust]
         pass_filenames: false
 
       - id: validate-config-schema
         name: validate config schema
-        entry: bash -c 'if command -v check-jsonschema >/dev/null 2>&1; then find . -name "config*.yaml" -o -name "config*.yml" | grep -v ".pre-commit" | xargs -I{} check-jsonschema --schemafile config.schema.json {} 2>/dev/null || true; fi'
+        entry: bash -c 'if command -v check-jsonschema >/dev/null 2>&1; then find . -name "config*.yaml" -o -name "config*.yml" | grep -v ".pre-commit" | xargs -I{} check-jsonschema --schemafile ferrox/config.schema.json {} 2>/dev/null || true; fi'
         language: system
         files: \.(yaml|yml|json)$
         pass_filenames: false

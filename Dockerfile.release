@@ -18,7 +18,7 @@ RUN groupadd -r ferrox && useradd -r -g ferrox ferrox
 WORKDIR /app
 
 COPY ferrox-${TARGETARCH} ./ferrox
-COPY config/config.yaml ./config/config.yaml
+COPY ferrox/config/config.yaml ./config/config.yaml
 
 RUN chmod +x ./ferrox
 

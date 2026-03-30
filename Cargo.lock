@@ -1050,6 +1050,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferrox-cp"
+version = "0.1.0"
+dependencies = [
+ "tokio",
+]
+
+[[package]]
 name = "find-msvc-tools"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"

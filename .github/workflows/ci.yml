@@ -20,7 +20,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
-      - run: cargo fmt --check
+      - run: cargo fmt --all --check
 
   # ── Lint ─────────────────────────────────────────────────────────────────────
   clippy:
@@ -34,7 +34,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Install protobuf compiler
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
-      - run: cargo clippy -- -D warnings
+      - run: cargo clippy --workspace -- -D warnings
 
   # ── Test ─────────────────────────────────────────────────────────────────────
   test:
@@ -46,7 +46,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Install protobuf compiler
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
-      - run: cargo test
+      - run: cargo test --workspace
 
   # ── Build release ─────────────────────────────────────────────────────────────
   build:
@@ -58,7 +58,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Install protobuf compiler
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
-      - run: cargo build --release
+      - run: cargo build --release --workspace
 
   # ── Security audit ────────────────────────────────────────────────────────────
   audit:
@@ -80,4 +80,4 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install check-jsonschema
-      - run: check-jsonschema --schemafile config.schema.json config/*.yaml
+      - run: check-jsonschema --schemafile ferrox/config.schema.json ferrox/config/*.yaml

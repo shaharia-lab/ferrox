@@ -39,6 +39,7 @@ jobs:
       - uses: taiki-e/upload-rust-binary-action@v1
         with:
           bin: ferrox
+          manifest-path: ferrox/Cargo.toml
           target: ${{ matrix.target }}
           token: ${{ secrets.GITHUB_TOKEN }}
 

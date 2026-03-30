@@ -4,24 +4,24 @@
 # ── Build ──────────────────────────────────────────────────────────────────────
 
 build:
-	cargo build
+	cargo build --workspace
 
 build-release:
-	cargo build --release
+	cargo build --release --workspace
 
 # ── Quality ────────────────────────────────────────────────────────────────────
 
 test:
-	cargo test
+	cargo test --workspace
 
 fmt:
-	cargo fmt
+	cargo fmt --all
 
 fmt-check:
-	cargo fmt --check
+	cargo fmt --all --check
 
 lint:
-	cargo clippy -- -D warnings
+	cargo clippy --workspace -- -D warnings
 
 ## Run fmt-check + lint + test (same as CI)
 check: fmt-check lint test
@@ -29,24 +29,24 @@ check: fmt-check lint test
 # ── Run locally ────────────────────────────────────────────────────────────────
 
 ## Copy minimal config template if local config does not exist yet
-config/local.yaml:
-	cp config/config_minimal.yaml config/local.yaml
-	@echo "Created config/local.yaml from config_minimal.yaml — set your API keys in .env before running."
+ferrox/config/local.yaml:
+	cp ferrox/config/config_minimal.yaml ferrox/config/local.yaml
+	@echo "Created ferrox/config/local.yaml from config_minimal.yaml — set your API keys in .env before running."
 
-## Run dev server (requires config/local.yaml and .env)
-run: config/local.yaml
+## Run dev server (requires ferrox/config/local.yaml and .env)
+run: ferrox/config/local.yaml
 	@if [ -f .env ]; then \
-		set -a && . ./.env && set +a && LLM_PROXY_CONFIG=config/local.yaml cargo run; \
+		set -a && . ./.env && set +a && LLM_PROXY_CONFIG=ferrox/config/local.yaml cargo run -p ferrox; \
 	else \
-		LLM_PROXY_CONFIG=config/local.yaml cargo run; \
+		LLM_PROXY_CONFIG=ferrox/config/local.yaml cargo run -p ferrox; \
 	fi
 
 ## Run release binary
-run-release: config/local.yaml build-release
+run-release: ferrox/config/local.yaml build-release
 	@if [ -f .env ]; then \
-		set -a && . ./.env && set +a && LLM_PROXY_CONFIG=config/local.yaml ./target/release/ferrox; \
+		set -a && . ./.env && set +a && LLM_PROXY_CONFIG=ferrox/config/local.yaml ./target/release/ferrox; \
 	else \
-		LLM_PROXY_CONFIG=config/local.yaml ./target/release/ferrox; \
+		LLM_PROXY_CONFIG=ferrox/config/local.yaml ./target/release/ferrox; \
 	fi
 
 # ── Health checks (requires a running instance) ───────────────────────────────
@@ -87,16 +87,16 @@ help:
 	@echo ""
 	@echo "Usage: make <target>"
 	@echo ""
-	@echo "  build              Debug build"
-	@echo "  build-release      Release build"
+	@echo "  build              Debug build (all workspace members)"
+	@echo "  build-release      Release build (all workspace members)"
 	@echo ""
-	@echo "  test               Run all tests"
+	@echo "  test               Run all tests (all workspace members)"
 	@echo "  fmt                Format code"
 	@echo "  fmt-check          Check formatting (no changes)"
 	@echo "  lint               Run clippy"
 	@echo "  check              fmt-check + lint + test (CI equivalent)"
 	@echo ""
-	@echo "  run                Run dev server (loads .env, uses config/local.yaml)"
+	@echo "  run                Run dev server (loads .env, uses ferrox/config/local.yaml)"
 	@echo "  run-release        Run release binary"
 	@echo "  health             Check /healthz and /readyz"
 	@echo "  metrics            Print /metrics output"

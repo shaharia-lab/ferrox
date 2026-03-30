@@ -10,17 +10,22 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /build
 
-# Cache dependency compilation layer — copy manifests + build script first, stub src.
+# Cache dependency compilation layer — copy workspace manifests + build script first, stub src.
 # build.rs runs here too; GIT_SHA will be "unknown" for the dep-cache layer, which is fine.
-COPY Cargo.toml Cargo.lock build.rs ./
-RUN mkdir -p src && echo 'fn main() {}' > src/main.rs \
-    && cargo build --release \
-    && rm -rf src
+COPY Cargo.toml Cargo.lock ./
+COPY ferrox/Cargo.toml ferrox/Cargo.toml
+COPY ferrox/build.rs ferrox/build.rs
+COPY ferrox-cp/Cargo.toml ferrox-cp/Cargo.toml
+RUN mkdir -p ferrox/src ferrox-cp/src \
+    && echo 'fn main() {}' > ferrox/src/main.rs \
+    && echo 'fn main() {}' > ferrox-cp/src/main.rs \
+    && cargo build --release -p ferrox \
+    && rm -rf ferrox/src ferrox-cp/src
 
 # Copy real source and rebuild only ferrox (deps already cached above)
-COPY src ./src
-RUN touch src/main.rs \
-    && cargo build --release
+COPY ferrox/src ./ferrox/src
+RUN touch ferrox/src/main.rs \
+    && cargo build --release -p ferrox
 
 # ── Stage 2: Runtime ──────────────────────────────────────────────────────────
 FROM debian:bookworm-slim
@@ -36,7 +41,7 @@ RUN groupadd -r ferrox && useradd -r -g ferrox ferrox
 WORKDIR /app
 
 COPY --from=builder /build/target/release/ferrox ./ferrox
-COPY config/config.yaml ./config/config.yaml
+COPY ferrox/config/config.yaml ./config/config.yaml
 
 USER ferrox
 

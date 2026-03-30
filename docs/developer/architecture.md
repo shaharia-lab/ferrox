@@ -32,10 +32,17 @@ flowchart TD
     Ferrox -->|OTLP gRPC| Collector[OTEL Collector]
 ```
 
+## Repository layout
+
+This is a Cargo workspace with two crates:
+
+- **`ferrox/`** — the gateway binary (this document describes its internals)
+- **`ferrox-cp/`** — the control plane binary (Phase 3, in progress)
+
 ## Module map
 
 ```
-src/
+ferrox/src/
   main.rs             startup, graceful shutdown
   server.rs           axum router, middleware stack
   config.rs           YAML loading, env var interpolation, validation

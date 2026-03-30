@@ -110,7 +110,7 @@ cargo build --release
 
 ```bash
 # 1. Copy the minimal config (pre-configured with sensible defaults)
-cp config/config_minimal.yaml config/local.yaml
+cp ferrox/config/config_minimal.yaml config/local.yaml
 
 # 2. Set your API keys
 export ANTHROPIC_API_KEY=sk-ant-...
@@ -124,7 +124,7 @@ LLM_PROXY_CONFIG=config/local.yaml ferrox
 
 ```bash
 # 1. Download the minimal config
-curl -Lo local.yaml https://raw.githubusercontent.com/shaharia-lab/ferrox/main/config/config_minimal.yaml
+curl -Lo local.yaml https://raw.githubusercontent.com/shaharia-lab/ferrox/main/ferrox/config/config_minimal.yaml
 
 # 2. Run (API keys passed as env vars)
 docker run -p 8080:8080 \

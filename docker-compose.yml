@@ -14,7 +14,7 @@ services:
       AWS_DEFAULT_REGION: "${AWS_DEFAULT_REGION:-us-east-1}"
       LLM_PROXY_CONFIG: /app/config/config.yaml
     volumes:
-      - ./config:/app/config:ro
+      - ./ferrox/config:/app/config:ro
     depends_on:
       lgtm:
         condition: service_healthy

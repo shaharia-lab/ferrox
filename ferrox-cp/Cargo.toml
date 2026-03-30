@@ -1,0 +1,14 @@
+[package]
+name = "ferrox-cp"
+version = "0.1.0"
+edition = "2021"
+description = "Ferrox control plane — key management, tenant administration, JWT signing"
+repository = "https://github.com/shaharia-lab/ferrox"
+license = "MIT"
+
+[[bin]]
+name = "ferrox-cp"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
