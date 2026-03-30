@@ -128,14 +128,13 @@ impl JwksCache {
                     match self.fetch_issuer(issuer_cfg).await {
                         Ok(keys) => {
                             let mut map = self.inner.write().await;
-                            let entry =
-                                map.entry(issuer_cfg.issuer.clone()).or_insert_with(|| {
-                                    IssuerCache {
-                                        jwks_uri: issuer_cfg.jwks_uri.clone(),
-                                        keys: JwkSet { keys: vec![] },
-                                        fetched_at: Instant::now(),
-                                    }
-                                });
+                            let entry = map.entry(issuer_cfg.issuer.clone()).or_insert_with(|| {
+                                IssuerCache {
+                                    jwks_uri: issuer_cfg.jwks_uri.clone(),
+                                    keys: JwkSet { keys: vec![] },
+                                    fetched_at: Instant::now(),
+                                }
+                            });
                             entry.keys = keys;
                             entry.fetched_at = Instant::now();
                             tracing::debug!(issuer = %issuer_cfg.issuer, "JWKS background refresh OK");

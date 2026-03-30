@@ -90,7 +90,10 @@ async fn main() -> Result<(), anyhow::Error> {
     jwks_cache.prefetch_all().await;
     if !config.trusted_issuers.is_empty() {
         jwks_cache.clone().spawn_refresh_task();
-        tracing::info!(count = config.trusted_issuers.len(), "Trusted JWKS issuers configured");
+        tracing::info!(
+            count = config.trusted_issuers.len(),
+            "Trusted JWKS issuers configured"
+        );
     }
 
     // 9. Init metrics

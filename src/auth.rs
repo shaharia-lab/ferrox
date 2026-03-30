@@ -133,8 +133,8 @@ async fn validate_jwt(token: &str, state: &AppState) -> Result<AuthOutcome, Prox
         .map_err(|_| ProxyError::Unauthorized("Invalid token".to_string()))?;
 
     // 2. Peek at iss to find the trusted issuer config
-    let iss = peek_iss(token)
-        .ok_or_else(|| ProxyError::Unauthorized("Invalid token".to_string()))?;
+    let iss =
+        peek_iss(token).ok_or_else(|| ProxyError::Unauthorized("Invalid token".to_string()))?;
 
     let issuer_cfg = state
         .config
