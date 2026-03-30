@@ -48,25 +48,35 @@ brew install shaharia-lab/tap/ferrox@1.0.0
 
 ### Option 3: Docker
 
+Pull the image:
+
 ```bash
 docker pull ghcr.io/shaharia-lab/ferrox:latest
 ```
 
-Run with a config file:
+Download the minimal config (no repo clone needed):
+
+```bash
+curl -Lo local.yaml https://raw.githubusercontent.com/shaharia-lab/ferrox/main/config/config_minimal.yaml
+```
+
+Run with your API keys:
 
 ```bash
 docker run -p 8080:8080 \
   -e ANTHROPIC_API_KEY=sk-ant-... \
-  -v $(pwd)/config/local.yaml:/etc/ferrox/config.yaml \
+  -e OPENAI_API_KEY=sk-... \
+  -v $(pwd)/local.yaml:/etc/ferrox/config.yaml \
   ghcr.io/shaharia-lab/ferrox:latest \
   ferrox --config /etc/ferrox/config.yaml
 ```
 
-Or use Docker Compose for the full observability stack:
+**Docker Compose** (full observability stack — requires cloning the repo):
 
 ```bash
+git clone https://github.com/shaharia-lab/ferrox && cd ferrox
 cp config/config_minimal.yaml config/local.yaml
-# Edit config/local.yaml or set keys in .env
+# Set your keys in .env (cp .env.example .env)
 docker compose up
 ```
 
@@ -74,6 +84,8 @@ docker compose up
 |---|---|
 | `http://localhost:8080` | Ferrox proxy |
 | `http://localhost:3000` | Grafana dashboards (admin / admin) |
+
+> **Note:** Docker Compose mounts the entire `config/` directory and reads `config/config.yaml` by default. The `local.yaml` copy is only needed if you want to customise settings without modifying the committed `config.yaml`.
 
 ### Option 4: Build from source
 
@@ -90,17 +102,23 @@ cargo build --release
 
 ## Configure
 
-Copy the minimal config (pre-configured with sensible defaults):
+**Binary / Homebrew / build from source** — copy the minimal config from the repo:
 
 ```bash
 cp config/config_minimal.yaml config/local.yaml
 ```
 
-`config_minimal.yaml` includes Anthropic, OpenAI, and Gemini providers and four ready-to-use model aliases. All timeouts, retries, and circuit breaker settings use production-ready defaults — no changes needed unless you want to customise.
+**Docker (no repo clone)** — download the minimal config directly:
+
+```bash
+curl -Lo local.yaml https://raw.githubusercontent.com/shaharia-lab/ferrox/main/config/config_minimal.yaml
+```
+
+`config_minimal.yaml` includes Anthropic, OpenAI, and Gemini providers and four ready-to-use model aliases (`claude-sonnet`, `claude-haiku`, `gpt-4o`, `gemini-flash`). All timeouts, retries, and circuit breaker settings use production-ready defaults — no changes needed unless you want to customise.
 
 ## Set environment variables
 
-Create a `.env` file:
+**Binary / Homebrew / build from source** — create a `.env` file:
 
 ```bash
 cp .env.example .env
@@ -114,16 +132,31 @@ ANTHROPIC_API_KEY=sk-ant-...
 PROXY_KEY=sk-local-dev       # your inbound virtual key
 ```
 
-Keys for providers you don't use can be left blank — those providers will be skipped.
+**Docker** — pass keys directly with `-e` flags (see the run command below). Keys for providers you don't use can be omitted — those providers will be skipped.
 
 ## Run
 
+**Binary or Homebrew:**
+
 ```bash
-# If installed as a binary or via Homebrew:
 set -a && . ./.env && set +a
 LLM_PROXY_CONFIG=config/local.yaml ferrox
+```
 
-# If built from source (using Makefile):
+**Docker:**
+
+```bash
+docker run -p 8080:8080 \
+  -e ANTHROPIC_API_KEY=sk-ant-... \
+  -e PROXY_KEY=sk-local-dev \
+  -v $(pwd)/local.yaml:/etc/ferrox/config.yaml \
+  ghcr.io/shaharia-lab/ferrox:latest \
+  ferrox --config /etc/ferrox/config.yaml
+```
+
+**Build from source (Makefile):**
+
+```bash
 make run
 ```
 

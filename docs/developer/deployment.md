@@ -18,12 +18,21 @@ The runtime image runs as a non-root user.
 ### Run with Docker Compose
 
 ```bash
-# Copy minimal config and set your keys in .env
-cp config/config_minimal.yaml config/local.yaml
+# Clone the repo if you haven't already
+git clone https://github.com/shaharia-lab/ferrox && cd ferrox
+
+# Copy minimal config — Compose reads config/config.yaml by default
+cp config/config_minimal.yaml config/config.yaml   # or edit config/config.yaml directly
+
+# Set your provider API keys
+cp .env.example .env
+# Edit .env and fill in at least one provider key
 
 # Start the full stack
 docker compose up
 ```
+
+> **`config.yaml` vs `local.yaml`:** The `docker-compose.yml` mounts the entire `config/` directory and sets `LLM_PROXY_CONFIG=/app/config/config.yaml`. If you prefer to keep a clean committed baseline, copy `config_minimal.yaml` to `config/local.yaml` instead and update the `LLM_PROXY_CONFIG` value in your `.env` or `docker-compose.override.yml`.
 
 Services:
 
