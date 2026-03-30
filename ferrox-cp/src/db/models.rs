@@ -9,7 +9,10 @@ pub struct Client {
     pub id: Uuid,
     pub name: String,
     pub description: Option<String>,
-    /// bcrypt hash of the `sk-cp-...` API key.
+    /// First 8 characters of the raw API key, stored in plain text.
+    /// Used as a fast lookup discriminator before the full bcrypt comparison.
+    pub key_prefix: String,
+    /// bcrypt hash of the full raw API key.
     pub api_key_hash: String,
     /// Model aliases this client is permitted to call.  `["*"]` means all.
     pub allowed_models: Vec<String>,

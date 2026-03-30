@@ -3,7 +3,7 @@
 /// All fields can be supplied via environment variables (names match the field
 /// names, uppercased).  `database_url` is the only strictly required field at
 /// startup; the others have sensible defaults.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct CpConfig {
     /// PostgreSQL connection string, e.g. `postgres://user:pass@host/db`.
     pub database_url: String,
@@ -22,6 +22,22 @@ pub struct CpConfig {
 
     /// TCP port the control-plane HTTP server listens on.  Defaults to `9090`.
     pub port: u16,
+}
+
+/// Manual `Debug` impl that redacts secrets so they never appear in logs or
+/// panic output.  `database_url` is redacted entirely because it embeds the
+/// DB password; `cp_encryption_key` and `admin_key` are replaced with a fixed
+/// placeholder.
+impl std::fmt::Debug for CpConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CpConfig")
+            .field("database_url", &"[redacted]")
+            .field("cp_issuer", &self.cp_issuer)
+            .field("cp_encryption_key", &"[redacted]")
+            .field("admin_key", &"[redacted]")
+            .field("port", &self.port)
+            .finish()
+    }
 }
 
 impl CpConfig {
@@ -132,6 +148,28 @@ mod tests {
         std::env::set_var("CP_ADMIN_KEY", "k");
         let err = CpConfig::from_env().unwrap_err();
         assert!(err.to_string().contains("DATABASE_URL"));
+        unset_required(saved);
+    }
+
+    #[test]
+    fn debug_output_redacts_secrets() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let key = "d".repeat(64);
+        let saved = set_required("postgres://user:secret@host/db", &key, "super-secret-admin");
+        let cfg = CpConfig::from_env().expect("should succeed");
+        let debug = format!("{:?}", cfg);
+        assert!(
+            !debug.contains("secret"),
+            "debug output must not contain the raw password or admin key: {debug}"
+        );
+        assert!(
+            !debug.contains(&key),
+            "debug output must not contain the raw encryption key: {debug}"
+        );
+        assert!(
+            debug.contains("[redacted]"),
+            "debug output should show [redacted]: {debug}"
+        );
         unset_required(saved);
     }
 

@@ -114,7 +114,16 @@ mod tests {
 
     async fn create_client(pool: &sqlx::PgPool, name: &str) -> Uuid {
         ClientRepository::new(pool)
-            .create(name, None, "hash", &["*".to_string()], 10, 5, 300)
+            .create(
+                name,
+                None,
+                "pfx00000",
+                "hash",
+                &["*".to_string()],
+                10,
+                5,
+                300,
+            )
             .await
             .unwrap()
             .id
