@@ -14,7 +14,6 @@ use tracing::info;
 use config::CpConfig;
 use crypto::encrypt::encrypt_private_key;
 use crypto::keys::generate_keypair;
-use db::signing_key_repo::SigningKeyRepository;
 use error::CpError;
 use state::CpState;
 
@@ -68,17 +67,37 @@ pub fn parse_encryption_key(hex_key: &str) -> Result<[u8; 32], CpError> {
     })
 }
 
+/// Stable advisory lock key for the key-seed critical section.
+/// Any fixed non-zero i64 works; this one is the fnv-1a hash of "ferrox-cp-keyseed".
+const KEY_SEED_ADVISORY_LOCK: i64 = 0x6665_7272_6f78_2d63_i64.wrapping_add(1);
+
 /// If the `signing_keys` table is empty, generate an RSA-2048 keypair, encrypt
 /// the private key, and persist it.  Idempotent: does nothing if a key exists.
+///
+/// Uses a Postgres transaction-scoped advisory lock so concurrent instances
+/// cannot both observe an empty table and insert duplicate seed keys (TOCTOU).
+/// The lock is released automatically when the transaction commits or rolls back.
 async fn seed_signing_key(db: &sqlx::PgPool, encryption_key: &[u8; 32]) -> Result<(), CpError> {
-    let repo = SigningKeyRepository::new(db);
-    let active_keys = repo.get_active().await?;
+    let mut tx = db.begin().await?;
 
-    if !active_keys.is_empty() {
+    // Acquire a transaction-scoped exclusive advisory lock.  Only one instance
+    // can hold this lock at a time; others block until the transaction ends.
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(KEY_SEED_ADVISORY_LOCK)
+        .execute(&mut *tx)
+        .await?;
+
+    // Re-check inside the lock: a concurrent instance may have already seeded.
+    let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM signing_keys WHERE active = true")
+        .fetch_one(&mut *tx)
+        .await?;
+
+    if count.0 > 0 {
         info!(
-            count = active_keys.len(),
+            count = count.0,
             "signing keys already present, skipping seed"
         );
+        tx.commit().await?;
         return Ok(());
     }
 
@@ -87,8 +106,14 @@ async fn seed_signing_key(db: &sqlx::PgPool, encryption_key: &[u8; 32]) -> Resul
     let kp = generate_keypair()?;
     let encrypted_private_key = encrypt_private_key(&kp.private_key_der, encryption_key);
 
-    repo.create(&kp.kid, &encrypted_private_key, &kp.public_key_der)
+    sqlx::query("INSERT INTO signing_keys (kid, private_key, public_key) VALUES ($1, $2, $3)")
+        .bind(&kp.kid)
+        .bind(&encrypted_private_key)
+        .bind(&kp.public_key_der)
+        .execute(&mut *tx)
         .await?;
+
+    tx.commit().await?;
 
     info!(kid = %kp.kid, "generated initial signing key");
     Ok(())
@@ -97,6 +122,7 @@ async fn seed_signing_key(db: &sqlx::PgPool, encryption_key: &[u8; 32]) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+    use db::signing_key_repo::SigningKeyRepository;
 
     #[test]
     fn parse_encryption_key_valid_hex() {
@@ -153,6 +179,29 @@ mod tests {
         let repo = SigningKeyRepository::new(&pool);
         let keys = repo.get_active().await.expect("query ok");
         assert_eq!(keys.len(), 1, "second call must not insert a duplicate key");
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn seed_signing_key_concurrent_calls_produce_one_key(pool: sqlx::PgPool) {
+        // Simulate two instances racing to seed simultaneously.
+        // Both are given the same pool so they share the same Postgres instance.
+        let enc_key = [0u8; 32];
+        let pool2 = pool.clone();
+        let (r1, r2) = tokio::join!(
+            seed_signing_key(&pool, &enc_key),
+            seed_signing_key(&pool2, &enc_key),
+        );
+        r1.expect("first concurrent seed ok");
+        r2.expect("second concurrent seed ok");
+
+        let repo = SigningKeyRepository::new(&pool);
+        let keys = repo.get_active().await.expect("query ok");
+        assert_eq!(
+            keys.len(),
+            1,
+            "concurrent seeds must produce exactly one key, got {}",
+            keys.len()
+        );
     }
 
     #[sqlx::test(migrator = "crate::MIGRATOR")]
