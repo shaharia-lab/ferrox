@@ -121,3 +121,62 @@ impl RateLimitBackend for RedisBackend {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn limit(rpm: u32, burst: u32) -> RateLimitConfig {
+        RateLimitConfig {
+            requests_per_minute: rpm,
+            burst,
+        }
+    }
+
+    fn backend_with_bad_url(fail_open: bool) -> RedisBackend {
+        // Use an unreachable URL — pool creation succeeds (lazy), but get() will fail.
+        RedisBackend::new(
+            "redis://127.0.0.1:1", // nothing listening on port 1
+            1,
+            "ferrox:rl:test:".to_string(),
+            fail_open,
+        )
+        .expect("pool creation should not fail eagerly")
+    }
+
+    #[tokio::test]
+    async fn fail_open_allows_request_when_redis_unreachable() {
+        let backend = backend_with_bad_url(true);
+        // Connection will fail; fail_open=true → Ok(())
+        let result = backend.check_and_record("tenant-a", &limit(60, 10)).await;
+        assert!(
+            result.is_ok(),
+            "fail_open should allow request on connection error"
+        );
+    }
+
+    #[tokio::test]
+    async fn fail_closed_denies_request_when_redis_unreachable() {
+        let backend = backend_with_bad_url(false);
+        // Connection will fail; fail_open=false → Err(())
+        let result = backend.check_and_record("tenant-a", &limit(60, 10)).await;
+        assert!(
+            result.is_err(),
+            "fail_closed should deny request on connection error"
+        );
+    }
+
+    #[tokio::test]
+    async fn fail_open_isolates_different_keys() {
+        let backend = backend_with_bad_url(true);
+        // Both keys should be independently allowed (fail_open)
+        assert!(backend
+            .check_and_record("key-a", &limit(60, 1))
+            .await
+            .is_ok());
+        assert!(backend
+            .check_and_record("key-b", &limit(60, 1))
+            .await
+            .is_ok());
+    }
+}

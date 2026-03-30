@@ -19,6 +19,7 @@ models:               [ ... ]   # required
 virtual_keys:         [ ... ]   # optional; static Bearer keys
 trusted_issuers:      [ ... ]   # optional; JWKS-based JWT auth
 jwks_cache_ttl_secs:  300       # optional; default 300
+rate_limiting:        { ... }   # optional; default: memory backend
 ```
 
 `virtual_keys` and `trusted_issuers` are both optional. You can use one, the other, or both simultaneously.
@@ -183,6 +184,53 @@ virtual_keys:
 Use `allowed_models: ["*"]` to allow access to all model aliases.
 
 See [Virtual Keys](virtual-keys.md) for more detail.
+
+---
+
+## rate_limiting
+
+Controls how rate limit counters are stored. The default in-process memory backend is correct for single-instance deployments. Switch to Redis for accurate enforcement across horizontally scaled replicas.
+
+```yaml
+rate_limiting:
+  backend: memory          # memory (default) | redis
+```
+
+**Redis backend:**
+
+```yaml
+rate_limiting:
+  backend: redis
+  redis_url: "redis://localhost:6379"   # required
+  redis_key_prefix: "ferrox:rl:"       # optional; default shown
+  redis_pool_size: 10                  # optional; default shown
+  redis_fail_open: true                # optional; default shown
+```
+
+| Field | Required | Default | Description |
+|---|---|---|---|
+| `backend` | no | `memory` | Storage backend: `memory` or `redis` |
+| `redis_url` | if redis | — | Redis connection URL |
+| `redis_key_prefix` | no | `ferrox:rl:` | Key prefix in Redis |
+| `redis_pool_size` | no | `10` | Async connection pool size |
+| `redis_fail_open` | no | `true` | Allow requests when Redis is unavailable |
+
+### Backend comparison
+
+| | `memory` | `redis` |
+|---|---|---|
+| Accuracy | Per-instance | Shared across all replicas |
+| Latency | Zero overhead | +1 Redis round-trip |
+| Availability | Always available | Depends on Redis |
+| Config change | None | Requires `redis_url` |
+
+### Redis algorithm
+
+The Redis backend uses a sliding-window counter (sorted set + Lua script, one atomic round-trip per request). This avoids the 2× burst allowed at window boundaries by fixed-window approaches.
+
+### Fail-open behaviour
+
+When `redis_fail_open: true` (default), requests are **allowed** if Redis is unavailable or the Lua script errors. A warning is logged and `ferrox_ratelimit_backend_errors_total{backend="redis"}` is incremented. Set `redis_fail_open: false` to deny requests when Redis is down.
 
 ---
 

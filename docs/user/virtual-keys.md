@@ -53,7 +53,7 @@ Requests to a model alias not in the list receive a `403 Forbidden` response.
 
 ## Rate limiting
 
-Ferrox uses a lock-free token bucket per key, per instance. It is approximate for multi-instance deployments (each instance maintains its own bucket independently).
+Each virtual key can be independently rate-limited. Ferrox uses a token bucket per key.
 
 ```yaml
 rate_limit:
@@ -64,6 +64,20 @@ rate_limit:
 When the bucket is empty, the request is rejected immediately with `429 Too Many Requests`.
 
 The `burst` value sets the bucket capacity. A fully-charged bucket allows `burst` requests instantly before the sustained limit applies.
+
+### Single-instance vs distributed
+
+By default, rate limiting is **per-instance** (in-process memory). Under horizontal scaling each replica tracks its own counters independently — a client reaching N replicas effectively gets N× the configured limit.
+
+For accurate distributed enforcement, configure the Redis backend:
+
+```yaml
+rate_limiting:
+  backend: redis
+  redis_url: "${REDIS_URL}"
+```
+
+All replicas then share counters via Redis. See [Configuration → rate_limiting](configuration.md#rate_limiting) for the full reference.
 
 ### Disabling rate limiting
 

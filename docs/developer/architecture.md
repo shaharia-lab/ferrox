@@ -61,7 +61,10 @@ src/
     circuit_breaker.rs  lock-free CircuitBreaker (AtomicU8 state, AtomicU32 counters)
 
   ratelimit/
-    mod.rs            build_rate_limiter
+    mod.rs            re-exports: RateLimitBackend trait, MemoryBackend, RedisBackend
+    backend.rs        RateLimitBackend async trait
+    memory.rs         MemoryBackend: lock-free per-instance token buckets (default)
+    redis_backend.rs  RedisBackend: sliding-window Lua script via deadpool-redis
     token_bucket.rs   lock-free TokenBucket (AtomicU64 milli-tokens, CAS loop)
 
   telemetry/
@@ -98,10 +101,10 @@ sequenceDiagram
         JWKS-->>A: DecodingKey + Algorithm
         A->>A: full JWT validation (signature, exp, aud)
         A->>A: extract ferrox claims (allowed_models, rate_limit)
-        A->>A: check per-tenant JWT rate limiter (token bucket)
+        A->>A: check per-tenant rate limit (RateLimitBackend)
     else static virtual key
         A->>A: lookup key in virtual_keys config
-        A->>A: check per-key rate limiter (token bucket)
+        A->>A: check per-key rate limit (RateLimitBackend)
     end
 
     A->>R: attach RequestContext, forward request
@@ -128,20 +131,21 @@ sequenceDiagram
 
 ## Concurrency model
 
-The hot path (routing, circuit breaking, rate limiting) is entirely lock-free. The two `RwLock` types used for JWKS and JWT buckets are taken only when a new issuer or tenant is first seen, which is rare after warmup.
+The hot path (routing, circuit breaking, memory rate limiting) is entirely lock-free. The `RwLock` for the JWKS cache is taken only on TTL refresh — rare after warmup.
 
 | Component | Primitive | Notes |
 |---|---|---|
 | Circuit breaker state | `AtomicU8` | CAS transitions between Closed/Open/HalfOpen |
 | Circuit breaker probe guard | `AtomicBool` | CAS allows exactly one probe at a time |
 | Failure/success counters | `AtomicU32` | Incremented with `fetch_add` |
-| Token bucket | `AtomicU64` | CAS loop subtracts tokens |
+| Token bucket (memory backend) | `AtomicU64` | CAS loop subtracts tokens |
 | Round-robin counter | `AtomicUsize` | Monotonically incrementing, modulo target count |
 | Weighted slot counter | `AtomicUsize` | Monotonically incrementing, modulo slot array length |
 | JWKS key cache | `tokio::sync::RwLock` | Write held briefly on TTL refresh (background task) |
-| JWT rate limiter map | `std::sync::RwLock` | Write held only when a new tenant_id is first seen |
+| MemoryBackend bucket map | `std::sync::RwLock` | Write held only when a new key is first seen |
+| Redis backend | `deadpool-redis` async pool | One Lua round-trip per rated request |
 
-The `AppState` struct is wrapped in `Arc` and cloned into each request handler.
+The `AppState` struct is wrapped in `Arc` and cloned into each request handler. The rate limit backend (`Arc<dyn RateLimitBackend>`) is chosen at startup — memory or Redis — and is transparent to the rest of the gateway.
 
 ---
 
