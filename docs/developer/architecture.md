@@ -10,7 +10,7 @@ flowchart TD
 
     subgraph Ferrox["Ferrox (single binary)"]
         Axum[axum HTTP server]
-        Auth[auth middleware\nBearer token + rate limit]
+        Auth[auth middleware\nBearer token — static key or JWT]
         Router[ModelRouter\nalias -> RoutePool]
         Dispatch[dispatch\nprimary targets + fallback chain]
         CB[CircuitBreaker\nper provider+model]
@@ -40,7 +40,8 @@ src/
   server.rs           axum router, middleware stack
   config.rs           YAML loading, env var interpolation, validation
   state.rs            AppState (shared, Arc-wrapped)
-  auth.rs             Bearer token extraction, virtual key lookup, rate limit gate
+  auth.rs             Bearer token auth: static virtual key or JWKS-validated JWT
+  jwks.rs             JWKS cache: fetch, TTL refresh, stale fallback, background task
   router.rs           ModelRouter: alias -> Arc<RoutePool>
   error.rs            ProxyError enum, OpenAI-format HTTP responses
   types.rs            OpenAI wire types (request, response, chunk)
@@ -83,14 +84,26 @@ src/
 sequenceDiagram
     participant C as Client
     participant A as Auth Middleware
+    participant JWKS as JwksCache
     participant R as ModelRouter
     participant P as RoutePool
     participant CB as CircuitBreaker
     participant Up as Upstream Provider
 
-    C->>A: POST /v1/chat/completions<br/>Authorization: Bearer sk-...
-    A->>A: lookup virtual key
-    A->>A: check rate limiter (token bucket)
+    C->>A: POST /v1/chat/completions<br/>Authorization: Bearer <token>
+
+    alt token looks like a JWT (two dots)
+        A->>A: peek issuer (base64 decode payload, no sig check)
+        A->>JWKS: get_decoding_key(issuer, kid)
+        JWKS-->>A: DecodingKey + Algorithm
+        A->>A: full JWT validation (signature, exp, aud)
+        A->>A: extract ferrox claims (allowed_models, rate_limit)
+        A->>A: check per-tenant JWT rate limiter (token bucket)
+    else static virtual key
+        A->>A: lookup key in virtual_keys config
+        A->>A: check per-key rate limiter (token bucket)
+    end
+
     A->>R: attach RequestContext, forward request
 
     R->>P: resolve model alias
@@ -115,7 +128,7 @@ sequenceDiagram
 
 ## Concurrency model
 
-All hot-path state uses lock-free atomics. No `Mutex` or `RwLock` is used after startup.
+The hot path (routing, circuit breaking, rate limiting) is entirely lock-free. The two `RwLock` types used for JWKS and JWT buckets are taken only when a new issuer or tenant is first seen, which is rare after warmup.
 
 | Component | Primitive | Notes |
 |---|---|---|
@@ -125,8 +138,10 @@ All hot-path state uses lock-free atomics. No `Mutex` or `RwLock` is used after 
 | Token bucket | `AtomicU64` | CAS loop subtracts tokens |
 | Round-robin counter | `AtomicUsize` | Monotonically incrementing, modulo target count |
 | Weighted slot counter | `AtomicUsize` | Monotonically incrementing, modulo slot array length |
+| JWKS key cache | `tokio::sync::RwLock` | Write held briefly on TTL refresh (background task) |
+| JWT rate limiter map | `std::sync::RwLock` | Write held only when a new tenant_id is first seen |
 
-The `AppState` struct is wrapped in `Arc` and cloned into each request handler. No mutation happens at request time; all mutable state is inside the atomic types.
+The `AppState` struct is wrapped in `Arc` and cloned into each request handler.
 
 ---
 

@@ -161,6 +161,26 @@ models:
           model_id: "GLM-4.7"
 
 # ─────────────────────────────────────────
+# Trusted JWT issuers (optional — for JWKS-based auth)
+# Clients can authenticate with a signed JWT instead of a static virtual key.
+# Ferrox fetches the JWKS from each issuer and validates the JWT signature.
+# ─────────────────────────────────────────
+# trusted_issuers:
+#   - issuer: "https://accounts.google.com"
+#     jwks_uri: "https://www.googleapis.com/oauth2/v3/certs"
+#     audience: "my-ferrox-gateway"    # optional; validated if present
+#
+#   - issuer: "https://login.microsoftonline.com/<tenant>/v2.0"
+#     jwks_uri: "https://login.microsoftonline.com/<tenant>/discovery/v2.0/keys"
+#
+#   - issuer: "https://your-okta-domain.okta.com/oauth2/default"
+#     jwks_uri: "https://your-okta-domain.okta.com/oauth2/default/v1/keys"
+
+# JWKS cache TTL in seconds (default: 300).
+# Keys are refreshed proactively at 80% of this value in the background.
+# jwks_cache_ttl_secs: 300
+
+# ─────────────────────────────────────────
 # Virtual keys (inbound auth)
 # ─────────────────────────────────────────
 virtual_keys:

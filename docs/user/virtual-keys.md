@@ -1,6 +1,17 @@
-# Virtual Keys
+# Virtual Keys and Authentication
 
-Virtual keys are the credentials clients use to authenticate with Ferrox. Each key can be scoped to specific models and rate-limited independently.
+Ferrox supports two authentication mechanisms. Both use the standard HTTP Bearer token header and can be used simultaneously.
+
+| Method | How it works | Best for |
+|---|---|---|
+| **Static virtual keys** | Pre-shared opaque strings defined in `virtual_keys` config | Simple setups, self-hosted teams, CI/CD |
+| **JWKS JWT** | Signed JWT validated against a trusted issuer's public keys | Enterprise IdP (Okta, Azure AD, Google), microservices with existing identity |
+
+---
+
+## Static virtual keys
+
+Virtual keys are pre-shared opaque strings configured in YAML. Each key can be scoped to specific models and rate-limited independently.
 
 Ferrox itself does not call upstream providers with these keys. Each virtual key maps to one or more upstream provider API keys through the routing config.
 
@@ -91,6 +102,64 @@ virtual_keys:
       requests_per_minute: 30
       burst: 5
 ```
+
+---
+
+## JWT authentication
+
+For teams with an existing identity provider (Okta, Azure AD, Google, Auth0), Ferrox can validate JWTs directly. No pre-shared key distribution required.
+
+### Setup
+
+1. Add one or more `trusted_issuers` entries pointing to your IdP's JWKS URI:
+
+```yaml
+trusted_issuers:
+  - issuer: "https://your-okta-domain.okta.com/oauth2/default"
+    jwks_uri: "https://your-okta-domain.okta.com/oauth2/default/v1/keys"
+    audience: "my-ferrox-gateway"   # optional but recommended
+```
+
+2. Clients present the JWT as a Bearer token — no changes to the Authorization header format:
+
+```
+Authorization: Bearer eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9...
+```
+
+### Custom claims
+
+Ferrox reads the following optional custom claims from the JWT payload to control access and rate limiting:
+
+```json
+{
+  "iss": "https://your-okta-domain.okta.com/oauth2/default",
+  "sub": "service-account-123",
+  "ferrox/tenant_id": "team-backend",
+  "ferrox/allowed_models": ["claude-sonnet", "gpt-4o"],
+  "ferrox/rate_limit": {
+    "requests_per_minute": 120,
+    "burst": 20
+  }
+}
+```
+
+| Claim | Type | Default if absent |
+|---|---|---|
+| `ferrox/tenant_id` | string | Uses `sub` as bucket key |
+| `ferrox/allowed_models` | list or `["*"]` | All aliases allowed |
+| `ferrox/rate_limit.requests_per_minute` | integer | No rate limit |
+| `ferrox/rate_limit.burst` | integer | No rate limit |
+
+### Key rotation
+
+Ferrox caches JWKS keys and refreshes them in the background (see `jwks_cache_ttl_secs`). During a key rotation:
+- New keys are picked up automatically within one TTL cycle (default: 5 minutes).
+- If a kid is not found in the current cache, Ferrox immediately fetches fresh keys before failing the request.
+- On refresh failure, the stale cache is served so existing valid tokens continue to work.
+
+See [Configuration](configuration.md#trusted_issuers) for the full reference.
+
+---
 
 ## Metrics
 

@@ -3,7 +3,7 @@
   "title": "Ferrox Configuration",
   "description": "Configuration file for the Ferrox LLM API gateway. String values may contain ${VAR} or ${VAR:-default} environment variable references.",
   "type": "object",
-  "required": ["providers", "models", "virtual_keys"],
+  "required": ["providers", "models"],
   "additionalProperties": false,
   "properties": {
     "server": { "$ref": "#/definitions/ServerConfig" },
@@ -21,7 +21,20 @@
     },
     "virtual_keys": {
       "type": "array",
-      "items": { "$ref": "#/definitions/VirtualKeyConfig" }
+      "items": { "$ref": "#/definitions/VirtualKeyConfig" },
+      "default": []
+    },
+    "trusted_issuers": {
+      "type": "array",
+      "items": { "$ref": "#/definitions/TrustedIssuerConfig" },
+      "default": [],
+      "description": "List of trusted JWT issuers. Clients may authenticate with a signed JWT instead of a static virtual key."
+    },
+    "jwks_cache_ttl_secs": {
+      "type": "integer",
+      "minimum": 10,
+      "default": 300,
+      "description": "How long to cache JWKS public keys (seconds). Keys are proactively refreshed at 80% of this TTL."
     }
   },
   "definitions": {
@@ -192,6 +205,27 @@
           "default": []
         },
         "rate_limit": { "$ref": "#/definitions/RateLimitConfig" }
+      }
+    },
+    "TrustedIssuerConfig": {
+      "type": "object",
+      "required": ["issuer", "jwks_uri"],
+      "additionalProperties": false,
+      "properties": {
+        "issuer": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Expected value of the JWT `iss` claim. Must match exactly."
+        },
+        "jwks_uri": {
+          "type": "string",
+          "format": "uri",
+          "description": "URL to fetch the JWKS (JSON Web Key Set) public keys from."
+        },
+        "audience": {
+          "type": "string",
+          "description": "Expected value of the JWT `aud` claim. Omit to skip audience validation."
+        }
       }
     }
   }

@@ -11,13 +11,17 @@ Environment variables can be embedded anywhere in string values using `${VAR}` o
 ## Top-level structure
 
 ```yaml
-server:     { ... }
-telemetry:  { ... }
-defaults:   { ... }
-providers:  [ ... ]
-models:     [ ... ]
-virtual_keys: [ ... ]
+server:               { ... }   # optional; all fields have defaults
+telemetry:            { ... }   # optional; all fields have defaults
+defaults:             { ... }   # optional; all fields have defaults
+providers:            [ ... ]   # required
+models:               [ ... ]   # required
+virtual_keys:         [ ... ]   # optional; static Bearer keys
+trusted_issuers:      [ ... ]   # optional; JWKS-based JWT auth
+jwks_cache_ttl_secs:  300       # optional; default 300
 ```
+
+`virtual_keys` and `trusted_issuers` are both optional. You can use one, the other, or both simultaneously.
 
 ---
 
@@ -179,6 +183,62 @@ virtual_keys:
 Use `allowed_models: ["*"]` to allow access to all model aliases.
 
 See [Virtual Keys](virtual-keys.md) for more detail.
+
+---
+
+## trusted_issuers
+
+Defines external JWT issuers whose tokens Ferrox will accept for authentication. Ferrox fetches each issuer's JWKS, caches the public keys, and validates signatures on incoming JWTs.
+
+```yaml
+trusted_issuers:
+  - issuer: "https://accounts.google.com"
+    jwks_uri: "https://www.googleapis.com/oauth2/v3/certs"
+    audience: "my-ferrox-gateway"    # optional
+
+  - issuer: "https://login.microsoftonline.com/<tenant>/v2.0"
+    jwks_uri: "https://login.microsoftonline.com/<tenant>/discovery/v2.0/keys"
+
+  - issuer: "https://your-okta-domain.okta.com/oauth2/default"
+    jwks_uri: "https://your-okta-domain.okta.com/oauth2/default/v1/keys"
+```
+
+| Field | Required | Description |
+|---|---|---|
+| `issuer` | yes | Expected `iss` claim value — must match exactly |
+| `jwks_uri` | yes | URL to fetch the JWKS public keys from |
+| `audience` | no | Expected `aud` claim value — omit to skip validation |
+
+### JWT claims
+
+Clients pass a JWT as the Bearer token. Ferrox reads the following custom claims from the token payload:
+
+| Claim | Type | Description |
+|---|---|---|
+| `ferrox/tenant_id` | string | Used as the rate limit bucket key |
+| `ferrox/allowed_models` | `["*"]` or list | Models the token is permitted to use |
+| `ferrox/rate_limit.requests_per_minute` | integer | Sustained rate limit |
+| `ferrox/rate_limit.burst` | integer | Burst capacity |
+
+All Ferrox-specific claims are optional. If `ferrox/allowed_models` is absent, the token may access all aliases.
+
+See [Virtual Keys](virtual-keys.md) for a comparison of static keys vs JWT auth.
+
+---
+
+## jwks_cache_ttl_secs
+
+How long to cache JWKS public keys (in seconds). Ferrox proactively refreshes keys in the background at 80% of this interval. On refresh failure, the stale cache is served until the next successful refresh.
+
+```yaml
+jwks_cache_ttl_secs: 300   # default
+```
+
+| Value | Behaviour |
+|---|---|
+| `300` (default) | Keys are refreshed every ~4 minutes; served stale on failure |
+| `3600` | Refresh every ~48 minutes; reduces external calls for stable key sets |
+| `60` | Aggressive refresh; use during key rotation events |
 
 ---
 
