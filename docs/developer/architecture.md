@@ -39,7 +39,57 @@ This is a Cargo workspace with two crates:
 - **`ferrox/`** — the gateway binary (this document describes its internals)
 - **`ferrox-cp/`** — the control plane binary (Phase 3, in progress)
 
-## Module map
+## Control plane (`ferrox-cp`)
+
+The control plane manages JWT signing keys, API clients, and token issuance. It is a separate binary in the workspace (`ferrox-cp/`) that connects to a PostgreSQL database.
+
+### Data layer
+
+Three tables form the persistence model:
+
+| Table | Purpose |
+|---|---|
+| `clients` | API client registrations — name, bcrypt-hashed key, allowed models, rate-limit settings |
+| `signing_keys` | RS256 keypairs — private key is AES-256-GCM encrypted at rest; public key is DER-encoded SubjectPublicKeyInfo |
+| `audit_log` | Append-only event log — `client_created`, `token_issued`, `key_rotated`, `client_revoked` |
+
+Migrations are embedded in the binary at compile time via `sqlx::migrate!("./migrations")` and applied at startup. The `MIGRATOR` static is `pub` so integration tests can reference it with `#[sqlx::test(migrator = "crate::MIGRATOR")]`.
+
+### Repository pattern
+
+Each table has a typed repository struct (`ClientRepository`, `SigningKeyRepository`, `AuditRepository`). All SQL is written with runtime queries (`sqlx::query_as::<_, T>(sql).bind(...)`) rather than compile-time macros so the binary compiles without a live database. Repositories borrow a `&PgPool` and are cheap to construct per request.
+
+```
+ferrox-cp/src/
+  main.rs             startup, MIGRATOR static
+  config.rs           CpConfig loaded from env vars
+  state.rs            CpState (db pool + config, Arc-wrapped)
+
+  db/
+    mod.rs            re-exports all repo types
+    models.rs         Client, SigningKey, AuditEntry, AuditEvent
+    error.rs          RepoError (Conflict / NotFound / Database)
+    client_repo.rs    CRUD + revoke + paginate for clients
+    signing_key_repo.rs  create / get_active / retire for signing keys
+    audit_repo.rs     record / list / count_tokens_issued
+
+ferrox-cp/migrations/
+  20240001000000_initial_schema.sql
+```
+
+### Environment variables
+
+| Variable | Required | Default | Description |
+|---|---|---|---|
+| `DATABASE_URL` | yes | — | PostgreSQL connection string |
+| `CP_ENCRYPTION_KEY` | yes | — | 64 hex chars (32 bytes) — AES-256-GCM key for private keys at rest |
+| `CP_ADMIN_KEY` | yes | — | Static bearer token protecting all admin endpoints |
+| `CP_ISSUER` | no | `https://ferrox-cp` | `iss` claim in signed JWTs |
+| `CP_PORT` | no | `9090` | TCP port for the control-plane HTTP server |
+
+---
+
+## Gateway module map
 
 ```
 ferrox/src/

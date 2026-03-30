@@ -48,14 +48,45 @@ cargo build -p ferrox-cp
 
 ## Run tests
 
+### Gateway tests (no database required)
+
 ```bash
-cargo test --workspace
+cargo test -p ferrox
 
 # Specific module
 cargo test -p ferrox config::tests
 
-# Show stdout for all tests
-cargo test --workspace -- --nocapture
+# Show stdout
+cargo test -p ferrox -- --nocapture
+```
+
+### Control-plane tests (requires PostgreSQL)
+
+The `ferrox-cp` integration tests use `#[sqlx::test]` which spins up isolated temporary databases. You need a running Postgres instance:
+
+```bash
+# Start a local Postgres container (first time only)
+docker run --name ferrox-test-pg \
+  -e POSTGRES_PASSWORD=testpass \
+  -p 5433:5432 \
+  -d postgres:16-alpine
+
+# Run ferrox-cp tests
+DATABASE_URL="postgres://postgres:testpass@localhost:5433/postgres" \
+  cargo test -p ferrox-cp -- --test-threads=1
+
+# Or export the variable for the session
+export DATABASE_URL="postgres://postgres:testpass@localhost:5433/postgres"
+cargo test -p ferrox-cp -- --test-threads=1
+```
+
+> **Why `--test-threads=1`?** `#[sqlx::test]` creates a temporary database per test. The `config::tests` module mutates `DATABASE_URL` via environment variables; serialising all tests prevents races between those env-var writes and the DB integration tests.
+
+### All workspace tests
+
+```bash
+# Set DATABASE_URL first (see above), then:
+cargo test --workspace -- --test-threads=1
 ```
 
 ## Run locally
@@ -120,8 +151,19 @@ ferrox/             gateway binary crate
 
 ferrox-cp/          control plane binary crate (Phase 3)
   Cargo.toml
+  migrations/
+    20240001000000_initial_schema.sql
   src/
-    main.rs
+    main.rs           entry point, MIGRATOR static
+    config.rs         CpConfig loaded from env vars
+    state.rs          CpState (db pool + config)
+    db/
+      mod.rs
+      models.rs       Client, SigningKey, AuditEntry, AuditEvent
+      error.rs        RepoError
+      client_repo.rs
+      signing_key_repo.rs
+      audit_repo.rs
 
 docs/
   user/             user-facing guides
@@ -190,5 +232,5 @@ The CI pipeline runs:
 
 1. `cargo fmt --all --check`
 2. `cargo clippy --workspace -- -D warnings`
-3. `cargo test --workspace`
+3. `cargo test --workspace -- --test-threads=1` (with a Postgres 16 service container)
 4. `cargo build --release --workspace`

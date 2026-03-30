@@ -40,13 +40,29 @@ jobs:
   test:
     name: Test
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: testpass
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgres://postgres:testpass@localhost:5432/postgres
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Install protobuf compiler
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
-      - run: cargo test --workspace
+      - run: cargo test --workspace -- --test-threads=1
 
   # ── Build release ─────────────────────────────────────────────────────────────
   build:
@@ -69,6 +85,10 @@ jobs:
       - uses: rustsec/audit-check@v1
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+          # RUSTSEC-2023-0071: timing side-channel in `rsa` crate (Marvin Attack).
+          # Pulled in transitively via sqlx → sqlx-mysql → rsa. We do not use MySQL
+          # or any RSA operations through sqlx-mysql; no patch is available upstream.
+          ignore: RUSTSEC-2023-0071
 
   # ── Config schema validation ──────────────────────────────────────────────────
   validate-config:
