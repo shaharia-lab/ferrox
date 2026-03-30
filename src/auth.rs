@@ -45,6 +45,7 @@ struct JwtRateLimitClaims {
 
 // ── Intermediate auth result ──────────────────────────────────────────────────
 
+#[derive(Debug)]
 struct AuthOutcome {
     key_name: String,
     allowed_models: Vec<String>,
@@ -317,5 +318,374 @@ mod tests {
     #[test]
     fn peek_iss_returns_none_for_non_jwt() {
         assert_eq!(peek_iss("sk-local-dev"), None);
+    }
+
+    #[test]
+    fn peek_iss_returns_none_when_iss_missing_from_payload() {
+        let payload = r#"{"sub":"only-sub","exp":9999999999}"#;
+        let encoded = URL_SAFE_NO_PAD.encode(payload.as_bytes());
+        let fake_jwt = format!("header.{}.sig", encoded);
+        assert_eq!(peek_iss(&fake_jwt), None);
+    }
+
+    #[test]
+    fn looks_like_jwt_with_exactly_two_dots() {
+        assert!(looks_like_jwt("a.b.c"));
+    }
+
+    #[test]
+    fn looks_like_jwt_false_with_one_dot() {
+        assert!(!looks_like_jwt("a.b"));
+    }
+
+    #[test]
+    fn looks_like_jwt_false_with_three_dots() {
+        assert!(!looks_like_jwt("a.b.c.d"));
+    }
+
+    #[test]
+    fn looks_like_jwt_false_for_empty_string() {
+        assert!(!looks_like_jwt(""));
+    }
+
+    // ── get_or_create_jwt_bucket ──────────────────────────────────────────────
+
+    #[test]
+    fn get_or_create_bucket_creates_on_first_call() {
+        let limiters = Arc::new(RwLock::new(HashMap::new()));
+        let bucket = get_or_create_jwt_bucket(&limiters, "tenant-a", 60, 5);
+        assert!(bucket.try_consume()); // freshly created bucket should have tokens
+    }
+
+    #[test]
+    fn get_or_create_bucket_reuses_existing_bucket() {
+        let limiters = Arc::new(RwLock::new(HashMap::new()));
+        let b1 = get_or_create_jwt_bucket(&limiters, "tenant-a", 60, 1);
+        b1.try_consume(); // exhaust the single-token bucket
+                          // Second call returns the same (exhausted) bucket
+        let b2 = get_or_create_jwt_bucket(&limiters, "tenant-a", 60, 1);
+        assert!(!b2.try_consume());
+    }
+
+    #[test]
+    fn get_or_create_bucket_isolates_different_tenants() {
+        let limiters = Arc::new(RwLock::new(HashMap::new()));
+        let ba = get_or_create_jwt_bucket(&limiters, "tenant-a", 60, 1);
+        ba.try_consume(); // exhaust tenant-a
+                          // tenant-b gets its own fresh bucket
+        let bb = get_or_create_jwt_bucket(&limiters, "tenant-b", 60, 1);
+        assert!(bb.try_consume());
+    }
+
+    // ── validate_static_key ───────────────────────────────────────────────────
+
+    mod static_key_tests {
+        use super::*;
+        use crate::config::{
+            Config, DefaultsConfig, RateLimitConfig, ServerConfig, TelemetryConfig,
+            TrustedIssuerConfig, VirtualKeyConfig,
+        };
+        use crate::jwks::JwksCache;
+        use crate::metrics::Metrics;
+        use crate::providers::ProviderRegistry;
+        use crate::ratelimit::build_rate_limiter;
+        use crate::router::ModelRouter;
+        use std::sync::atomic::AtomicBool;
+
+        fn config_with_key(key_str: &str, rpm: Option<u32>) -> Config {
+            Config {
+                server: ServerConfig::default(),
+                telemetry: TelemetryConfig::default(),
+                defaults: DefaultsConfig::default(),
+                providers: vec![],
+                models: vec![],
+                virtual_keys: vec![VirtualKeyConfig {
+                    key: key_str.to_string(),
+                    name: "test-key".to_string(),
+                    description: None,
+                    allowed_models: vec!["claude-sonnet".to_string()],
+                    rate_limit: rpm.map(|r| RateLimitConfig {
+                        requests_per_minute: r,
+                        burst: 1,
+                    }),
+                }],
+                trusted_issuers: vec![],
+                jwks_cache_ttl_secs: 300,
+            }
+        }
+
+        fn build_state(config: Config) -> AppState {
+            let registry: ProviderRegistry = HashMap::new();
+            let router = ModelRouter::from_config(&config, &registry).unwrap();
+            let rate_limiter = build_rate_limiter(&config.virtual_keys);
+            let jwks_cache = JwksCache::new(vec![], 300, reqwest::Client::new());
+            AppState {
+                rate_limiter: Arc::new(rate_limiter),
+                router: Arc::new(router),
+                providers: Arc::new(registry),
+                metrics: Arc::new(Metrics::new()),
+                ready: Arc::new(AtomicBool::new(true)),
+                jwks_cache: Arc::new(jwks_cache),
+                jwt_rate_limiters: Arc::new(RwLock::new(HashMap::new())),
+                config: Arc::new(config),
+            }
+        }
+
+        #[test]
+        fn unknown_static_key_returns_unauthorized() {
+            let state = build_state(config_with_key("sk-real", None));
+            let err = validate_static_key("sk-wrong", &state).unwrap_err();
+            assert!(matches!(err, ProxyError::Unauthorized(_)));
+        }
+
+        #[test]
+        fn valid_static_key_returns_correct_outcome() {
+            let state = build_state(config_with_key("sk-real", None));
+            let outcome = validate_static_key("sk-real", &state).unwrap();
+            assert_eq!(outcome.key_name, "test-key");
+            assert_eq!(outcome.allowed_models, vec!["claude-sonnet"]);
+        }
+
+        #[test]
+        fn rate_limited_static_key_returns_rate_limited_error() {
+            // burst = 1, so the second request is denied
+            let state = build_state(config_with_key("sk-real", Some(60)));
+            let _ = validate_static_key("sk-real", &state).unwrap(); // first: ok
+            let err = validate_static_key("sk-real", &state).unwrap_err();
+            assert!(matches!(err, ProxyError::RateLimited(_)));
+        }
+    }
+
+    // ── validate_jwt ──────────────────────────────────────────────────────────
+
+    mod jwt_tests {
+        use super::*;
+        use crate::config::{
+            Config, DefaultsConfig, ServerConfig, TelemetryConfig, TrustedIssuerConfig,
+        };
+        use crate::jwks::JwksCache;
+        use crate::metrics::Metrics;
+        use crate::providers::ProviderRegistry;
+        use crate::ratelimit::build_rate_limiter;
+        use crate::router::ModelRouter;
+        use std::sync::atomic::AtomicBool;
+
+        const SECRET: &[u8] = b"test-secret-for-jwt-auth-tests";
+        const KID: &str = "test-kid";
+        const ISSUER: &str = "https://test.example.com";
+
+        fn oct_jwks(kid: &str, secret: &[u8]) -> jsonwebtoken::jwk::JwkSet {
+            let k = URL_SAFE_NO_PAD.encode(secret);
+            serde_json::from_str(&format!(
+                r#"{{"keys":[{{"kty":"oct","kid":"{}","alg":"HS256","k":"{}"}}]}}"#,
+                kid, k
+            ))
+            .unwrap()
+        }
+
+        fn make_jwt(claims: serde_json::Value, secret: &[u8], kid: &str) -> String {
+            let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256);
+            header.kid = Some(kid.to_string());
+            jsonwebtoken::encode(
+                &header,
+                &claims,
+                &jsonwebtoken::EncodingKey::from_secret(secret),
+            )
+            .unwrap()
+        }
+
+        fn valid_claims() -> serde_json::Value {
+            serde_json::json!({
+                "sub": "test-service",
+                "iss": ISSUER,
+                "exp": 9_999_999_999u64,
+            })
+        }
+
+        fn config_with_issuer(issuer: &str, audience: Option<&str>) -> Config {
+            Config {
+                server: ServerConfig::default(),
+                telemetry: TelemetryConfig::default(),
+                defaults: DefaultsConfig::default(),
+                providers: vec![],
+                models: vec![],
+                virtual_keys: vec![],
+                trusted_issuers: vec![TrustedIssuerConfig {
+                    issuer: issuer.to_string(),
+                    jwks_uri: format!("{}/jwks.json", issuer),
+                    audience: audience.map(str::to_string),
+                }],
+                jwks_cache_ttl_secs: 300,
+            }
+        }
+
+        async fn build_state(config: Config) -> AppState {
+            let registry: ProviderRegistry = HashMap::new();
+            let router = ModelRouter::from_config(&config, &registry).unwrap();
+            let rate_limiter = build_rate_limiter(&config.virtual_keys);
+            let jwks_cache = JwksCache::new(
+                config.trusted_issuers.clone(),
+                config.jwks_cache_ttl_secs,
+                reqwest::Client::new(),
+            );
+            jwks_cache
+                .seed_for_test(
+                    ISSUER,
+                    &format!("{}/jwks.json", ISSUER),
+                    oct_jwks(KID, SECRET),
+                )
+                .await;
+            AppState {
+                rate_limiter: Arc::new(rate_limiter),
+                router: Arc::new(router),
+                providers: Arc::new(registry),
+                metrics: Arc::new(Metrics::new()),
+                ready: Arc::new(AtomicBool::new(true)),
+                jwks_cache: Arc::new(jwks_cache),
+                jwt_rate_limiters: Arc::new(RwLock::new(HashMap::new())),
+                config: Arc::new(config),
+            }
+        }
+
+        #[tokio::test]
+        async fn untrusted_issuer_returns_unauthorized() {
+            let state = build_state(config_with_issuer(ISSUER, None)).await;
+            let token = make_jwt(
+                serde_json::json!({"sub":"s","iss":"https://evil.com","exp":9_999_999_999u64}),
+                SECRET,
+                KID,
+            );
+            let err = validate_jwt(&token, &state).await.unwrap_err();
+            assert!(matches!(err, ProxyError::Unauthorized(_)));
+        }
+
+        #[tokio::test]
+        async fn expired_jwt_returns_unauthorized() {
+            let state = build_state(config_with_issuer(ISSUER, None)).await;
+            let token = make_jwt(
+                serde_json::json!({"sub":"s","iss":ISSUER,"exp":1u64}), // exp in the past
+                SECRET,
+                KID,
+            );
+            let err = validate_jwt(&token, &state).await.unwrap_err();
+            assert!(matches!(err, ProxyError::Unauthorized(_)));
+        }
+
+        #[tokio::test]
+        async fn tampered_signature_returns_unauthorized() {
+            let state = build_state(config_with_issuer(ISSUER, None)).await;
+            let token = make_jwt(valid_claims(), SECRET, KID);
+            // Append garbage to break the signature
+            let tampered = format!("{}xyz", token);
+            let err = validate_jwt(&tampered, &state).await.unwrap_err();
+            assert!(matches!(err, ProxyError::Unauthorized(_)));
+        }
+
+        #[tokio::test]
+        async fn wrong_secret_returns_unauthorized() {
+            let state = build_state(config_with_issuer(ISSUER, None)).await;
+            // Signed with a different secret than what the JWKS cache has
+            let token = make_jwt(valid_claims(), b"completely-different-secret", KID);
+            let err = validate_jwt(&token, &state).await.unwrap_err();
+            assert!(matches!(err, ProxyError::Unauthorized(_)));
+        }
+
+        #[tokio::test]
+        async fn valid_jwt_without_ferrox_claims_falls_back_to_sub() {
+            let state = build_state(config_with_issuer(ISSUER, None)).await;
+            let token = make_jwt(valid_claims(), SECRET, KID);
+            let outcome = validate_jwt(&token, &state).await.unwrap();
+            assert_eq!(outcome.key_name, "test-service"); // from sub
+            assert_eq!(outcome.allowed_models, vec!["*"]); // default
+        }
+
+        #[tokio::test]
+        async fn valid_jwt_with_ferrox_tenant_id_uses_tenant_id() {
+            let state = build_state(config_with_issuer(ISSUER, None)).await;
+            let token = make_jwt(
+                serde_json::json!({
+                    "sub": "test-service",
+                    "iss": ISSUER,
+                    "exp": 9_999_999_999u64,
+                    "ferrox": { "tenant_id": "payments-team" }
+                }),
+                SECRET,
+                KID,
+            );
+            let outcome = validate_jwt(&token, &state).await.unwrap();
+            assert_eq!(outcome.key_name, "payments-team");
+        }
+
+        #[tokio::test]
+        async fn valid_jwt_with_allowed_models_restricts_access() {
+            let state = build_state(config_with_issuer(ISSUER, None)).await;
+            let token = make_jwt(
+                serde_json::json!({
+                    "sub": "s",
+                    "iss": ISSUER,
+                    "exp": 9_999_999_999u64,
+                    "ferrox": { "allowed_models": ["claude-sonnet", "gpt-4o"] }
+                }),
+                SECRET,
+                KID,
+            );
+            let outcome = validate_jwt(&token, &state).await.unwrap();
+            assert_eq!(outcome.allowed_models, vec!["claude-sonnet", "gpt-4o"]);
+        }
+
+        #[tokio::test]
+        async fn valid_jwt_with_rate_limit_enforces_burst() {
+            let state = build_state(config_with_issuer(ISSUER, None)).await;
+            let make_token = || {
+                make_jwt(
+                    serde_json::json!({
+                        "sub": "s",
+                        "iss": ISSUER,
+                        "exp": 9_999_999_999u64,
+                        "ferrox": { "rate_limit": { "requests_per_minute": 60, "burst": 1 } }
+                    }),
+                    SECRET,
+                    KID,
+                )
+            };
+            // First request: allowed
+            assert!(validate_jwt(&make_token(), &state).await.is_ok());
+            // Second request: bucket exhausted (burst = 1)
+            let err = validate_jwt(&make_token(), &state).await.unwrap_err();
+            assert!(matches!(err, ProxyError::RateLimited(_)));
+        }
+
+        #[tokio::test]
+        async fn jwt_with_correct_audience_passes_validation() {
+            let state = build_state(config_with_issuer(ISSUER, Some("ferrox"))).await;
+            let token = make_jwt(
+                serde_json::json!({
+                    "sub": "s",
+                    "iss": ISSUER,
+                    "aud": "ferrox",
+                    "exp": 9_999_999_999u64
+                }),
+                SECRET,
+                KID,
+            );
+            assert!(validate_jwt(&token, &state).await.is_ok());
+        }
+
+        #[tokio::test]
+        async fn jwt_with_wrong_audience_returns_unauthorized() {
+            let state = build_state(config_with_issuer(ISSUER, Some("ferrox"))).await;
+            let token = make_jwt(
+                serde_json::json!({
+                    "sub": "s",
+                    "iss": ISSUER,
+                    "aud": "some-other-service",
+                    "exp": 9_999_999_999u64
+                }),
+                SECRET,
+                KID,
+            );
+            let err = validate_jwt(&token, &state).await.unwrap_err();
+            assert!(matches!(err, ProxyError::Unauthorized(_)));
+        }
     }
 }
