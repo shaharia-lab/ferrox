@@ -122,7 +122,7 @@ pub static RETRIES_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
     .expect("register ferrox_retries_total")
 });
 
-/// Rate-limited requests.
+/// Rate-limited requests (per key name — backwards-compatible label).
 /// Labels: key_name
 pub static RATE_LIMITED_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
     register_counter_vec!(
@@ -131,6 +131,39 @@ pub static RATE_LIMITED_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
         &["key_name"]
     )
     .expect("register ferrox_rate_limited_total")
+});
+
+/// Requests allowed by the rate limiter, by backend.
+/// Labels: backend (memory | redis)
+pub static RATELIMIT_ALLOWED_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
+    register_counter_vec!(
+        "ferrox_ratelimit_allowed_total",
+        "Requests allowed by the rate limit backend",
+        &["backend"]
+    )
+    .expect("register ferrox_ratelimit_allowed_total")
+});
+
+/// Requests denied by the rate limiter, by backend.
+/// Labels: backend (memory | redis)
+pub static RATELIMIT_DENIED_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
+    register_counter_vec!(
+        "ferrox_ratelimit_denied_total",
+        "Requests denied by the rate limit backend",
+        &["backend"]
+    )
+    .expect("register ferrox_ratelimit_denied_total")
+});
+
+/// Errors contacting the rate limit backend (Redis unavailable, script error, etc).
+/// Labels: backend (redis)
+pub static RATELIMIT_BACKEND_ERRORS_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
+    register_counter_vec!(
+        "ferrox_ratelimit_backend_errors_total",
+        "Errors contacting the rate limit backend",
+        &["backend"]
+    )
+    .expect("register ferrox_ratelimit_backend_errors_total")
 });
 
 /// Which target was selected by the load balancer.
@@ -161,6 +194,9 @@ pub fn gather() -> String {
     Lazy::force(&RETRIES_TOTAL);
     Lazy::force(&RATE_LIMITED_TOTAL);
     Lazy::force(&ROUTING_TARGET_SELECTED);
+    Lazy::force(&RATELIMIT_ALLOWED_TOTAL);
+    Lazy::force(&RATELIMIT_DENIED_TOTAL);
+    Lazy::force(&RATELIMIT_BACKEND_ERRORS_TOTAL);
 
     let encoder = TextEncoder::new();
     let families = prometheus::gather();

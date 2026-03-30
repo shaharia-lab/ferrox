@@ -161,6 +161,17 @@ models:
           model_id: "GLM-4.7"
 
 # ─────────────────────────────────────────
+# Rate limiting backend (optional — default: memory)
+# Set backend: redis for distributed enforcement across replicas.
+# ─────────────────────────────────────────
+# rate_limiting:
+#   backend: memory            # memory (default, per-instance) | redis (distributed)
+#   redis_url: "redis://localhost:6379"   # required only when backend: redis
+#   redis_key_prefix: "ferrox:rl:"       # optional, default shown
+#   redis_pool_size: 10                  # optional, default shown
+#   redis_fail_open: true                # allow requests when Redis is unavailable
+
+# ─────────────────────────────────────────
 # Trusted JWT issuers (optional — for JWKS-based auth)
 # Clients can authenticate with a signed JWT instead of a static virtual key.
 # Ferrox fetches the JWKS from each issuer and validates the JWT signature.

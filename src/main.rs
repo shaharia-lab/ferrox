@@ -21,7 +21,7 @@ use std::sync::{
 
 use clap::Parser;
 use metrics::Metrics;
-use ratelimit::build_rate_limiter;
+use ratelimit::{MemoryBackend, RateLimitBackend, RedisBackend};
 use router::ModelRouter;
 use state::AppState;
 
@@ -76,9 +76,28 @@ async fn main() -> Result<(), anyhow::Error> {
     // 6. Build model router (RoutePool per alias, circuit breakers initialized)
     let model_router = ModelRouter::from_config(&config, &providers)?;
 
-    // 7. Build per-key rate limiters
-    let rate_limiter = build_rate_limiter(&config.virtual_keys);
-    tracing::info!(count = rate_limiter.len(), "Rate limiters initialized");
+    // 7. Build rate limit backend (memory or Redis)
+    let rate_limit_backend: Arc<dyn RateLimitBackend> = match &config.rate_limiting.backend {
+        config::RateLimitBackendType::Memory => {
+            tracing::info!("Rate limit backend: memory");
+            Arc::new(MemoryBackend::new())
+        }
+        config::RateLimitBackendType::Redis => {
+            let url = config
+                .rate_limiting
+                .redis_url
+                .as_deref()
+                .expect("redis_url is required when backend is redis");
+            let backend = RedisBackend::new(
+                url,
+                config.rate_limiting.redis_pool_size,
+                config.rate_limiting.redis_key_prefix.clone(),
+                config.rate_limiting.redis_fail_open,
+            )?;
+            tracing::info!(url = %url, "Rate limit backend: redis");
+            Arc::new(backend)
+        }
+    };
 
     // 8. Build JWKS cache and prefetch
     let http_client = reqwest::Client::new();
@@ -105,11 +124,10 @@ async fn main() -> Result<(), anyhow::Error> {
         config: Arc::new(config),
         providers: Arc::new(providers),
         router: Arc::new(model_router),
-        rate_limiter: Arc::new(rate_limiter),
+        rate_limit_backend,
         metrics: Arc::new(metrics),
         ready: ready.clone(),
         jwks_cache,
-        jwt_rate_limiters: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
     };
 
     // 11. Build axum router

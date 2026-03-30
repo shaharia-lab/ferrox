@@ -335,6 +335,51 @@ pub struct VirtualKeyConfig {
     pub rate_limit: Option<RateLimitConfig>,
 }
 
+// ── Rate limiting backend config ─────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum RateLimitBackendType {
+    #[default]
+    Memory,
+    Redis,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RateLimitingConfig {
+    #[serde(default)]
+    pub backend: RateLimitBackendType,
+    /// Redis URL — required when `backend: redis`
+    pub redis_url: Option<String>,
+    #[serde(default = "default_redis_key_prefix")]
+    pub redis_key_prefix: String,
+    #[serde(default = "default_redis_pool_size")]
+    pub redis_pool_size: usize,
+    /// When true, rate limiting failures (e.g. Redis unavailable) allow the request through.
+    /// Default: true
+    #[serde(default = "default_true")]
+    pub redis_fail_open: bool,
+}
+
+fn default_redis_key_prefix() -> String {
+    "ferrox:rl:".to_string()
+}
+fn default_redis_pool_size() -> usize {
+    10
+}
+
+impl Default for RateLimitingConfig {
+    fn default() -> Self {
+        Self {
+            backend: RateLimitBackendType::Memory,
+            redis_url: None,
+            redis_key_prefix: default_redis_key_prefix(),
+            redis_pool_size: default_redis_pool_size(),
+            redis_fail_open: true,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrustedIssuerConfig {
     pub issuer: String,
@@ -361,6 +406,8 @@ pub struct Config {
     pub trusted_issuers: Vec<TrustedIssuerConfig>,
     #[serde(default = "default_jwks_cache_ttl_secs")]
     pub jwks_cache_ttl_secs: u64,
+    #[serde(default)]
+    pub rate_limiting: RateLimitingConfig,
 }
 
 fn default_jwks_cache_ttl_secs() -> u64 {
@@ -473,6 +520,13 @@ pub(crate) fn validate(config: &Config) -> Result<(), anyhow::Error> {
         if !key_names.insert(k.name.clone()) {
             bail!("Duplicate virtual key name: '{}'", k.name);
         }
+    }
+
+    // Validate rate limiting config
+    if config.rate_limiting.backend == RateLimitBackendType::Redis
+        && config.rate_limiting.redis_url.is_none()
+    {
+        bail!("rate_limiting.backend is 'redis' but redis_url is not set");
     }
 
     // Validate model routing references
@@ -604,6 +658,7 @@ mod tests {
             virtual_keys: vec![],
             trusted_issuers: vec![],
             jwks_cache_ttl_secs: default_jwks_cache_ttl_secs(),
+            rate_limiting: RateLimitingConfig::default(),
         }
     }
 
@@ -708,5 +763,37 @@ mod tests {
         });
         let err = validate(&config).unwrap_err().to_string();
         assert!(err.contains("unknown provider"));
+    }
+
+    // ── rate_limiting validation ──────────────────────────────────────────────
+
+    #[test]
+    fn validate_rejects_redis_backend_without_url() {
+        let mut config = minimal_config("openai", "gpt-4");
+        config.rate_limiting = RateLimitingConfig {
+            backend: RateLimitBackendType::Redis,
+            redis_url: None,
+            ..RateLimitingConfig::default()
+        };
+        let err = validate(&config).unwrap_err().to_string();
+        assert!(err.contains("redis_url"));
+    }
+
+    #[test]
+    fn validate_accepts_redis_backend_with_url() {
+        let mut config = minimal_config("openai", "gpt-4");
+        config.rate_limiting = RateLimitingConfig {
+            backend: RateLimitBackendType::Redis,
+            redis_url: Some("redis://localhost:6379".to_string()),
+            ..RateLimitingConfig::default()
+        };
+        assert!(validate(&config).is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_memory_backend_without_url() {
+        let config = minimal_config("openai", "gpt-4");
+        // default backend is memory, no redis_url needed
+        assert!(validate(&config).is_ok());
     }
 }

@@ -1,6 +1,3 @@
-use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
-
 use axum::{
     extract::{Request, State},
     middleware::Next,
@@ -10,8 +7,8 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use serde::Deserialize;
 use uuid::Uuid;
 
+use crate::config::RateLimitConfig;
 use crate::error::ProxyError;
-use crate::ratelimit::token_bucket::TokenBucket;
 use crate::state::AppState;
 use crate::telemetry::metrics::RATE_LIMITED_TOTAL;
 use crate::types::RequestContext;
@@ -63,7 +60,7 @@ pub async fn auth_middleware(
     let outcome = if looks_like_jwt(&token) {
         validate_jwt(&token, &state).await?
     } else {
-        validate_static_key(&token, &state)?
+        validate_static_key(&token, &state).await?
     };
 
     let request_id = req
@@ -85,7 +82,7 @@ pub async fn auth_middleware(
 
 // ── Static key path ───────────────────────────────────────────────────────────
 
-fn validate_static_key(token: &str, state: &AppState) -> Result<AuthOutcome, ProxyError> {
+async fn validate_static_key(token: &str, state: &AppState) -> Result<AuthOutcome, ProxyError> {
     let key_config = state
         .config
         .virtual_keys
@@ -93,8 +90,13 @@ fn validate_static_key(token: &str, state: &AppState) -> Result<AuthOutcome, Pro
         .find(|k| k.key == token)
         .ok_or_else(|| ProxyError::Unauthorized("Invalid API key".to_string()))?;
 
-    if let Some(bucket) = state.rate_limiter.get(&key_config.name) {
-        if !bucket.try_consume() {
+    if let Some(rl) = &key_config.rate_limit {
+        if state
+            .rate_limit_backend
+            .check_and_record(&key_config.name, rl)
+            .await
+            .is_err()
+        {
             RATE_LIMITED_TOTAL
                 .with_label_values(&[&key_config.name])
                 .inc();
@@ -178,15 +180,18 @@ async fn validate_jwt(token: &str, state: &AppState) -> Result<AuthOutcome, Prox
         .and_then(|f| f.allowed_models.clone())
         .unwrap_or_else(|| vec!["*".to_string()]);
 
-    // 6. In-process rate limiting from JWT claims (per tenant_id / sub)
+    // 6. Rate limiting from JWT claims (per tenant_id / sub)
     if let Some(rl) = ferrox.and_then(|f| f.rate_limit.as_ref()) {
-        let bucket = get_or_create_jwt_bucket(
-            &state.jwt_rate_limiters,
-            &key_name,
-            rl.requests_per_minute,
-            rl.burst,
-        );
-        if !bucket.try_consume() {
+        let rl_config = RateLimitConfig {
+            requests_per_minute: rl.requests_per_minute,
+            burst: rl.burst,
+        };
+        if state
+            .rate_limit_backend
+            .check_and_record(&key_name, &rl_config)
+            .await
+            .is_err()
+        {
             RATE_LIMITED_TOTAL.with_label_values(&[&key_name]).inc();
             tracing::warn!(key_name = %key_name, "JWT rate limit exceeded");
             return Err(ProxyError::RateLimited(format!(
@@ -199,26 +204,6 @@ async fn validate_jwt(token: &str, state: &AppState) -> Result<AuthOutcome, Prox
         key_name,
         allowed_models,
     })
-}
-
-fn get_or_create_jwt_bucket(
-    limiters: &Arc<RwLock<HashMap<String, Arc<TokenBucket>>>>,
-    key: &str,
-    rpm: u32,
-    burst: u32,
-) -> Arc<TokenBucket> {
-    // Fast path: bucket already exists
-    {
-        let map = limiters.read().unwrap();
-        if let Some(b) = map.get(key) {
-            return b.clone();
-        }
-    }
-    // Slow path: create and insert (guard against concurrent inserts with entry API)
-    let mut map = limiters.write().unwrap();
-    map.entry(key.to_string())
-        .or_insert_with(|| Arc::new(TokenBucket::new(rpm, burst)))
-        .clone()
 }
 
 // ── Token extraction ──────────────────────────────────────────────────────────
@@ -348,49 +333,22 @@ mod tests {
         assert!(!looks_like_jwt(""));
     }
 
-    // ── get_or_create_jwt_bucket ──────────────────────────────────────────────
-
-    #[test]
-    fn get_or_create_bucket_creates_on_first_call() {
-        let limiters = Arc::new(RwLock::new(HashMap::new()));
-        let bucket = get_or_create_jwt_bucket(&limiters, "tenant-a", 60, 5);
-        assert!(bucket.try_consume()); // freshly created bucket should have tokens
-    }
-
-    #[test]
-    fn get_or_create_bucket_reuses_existing_bucket() {
-        let limiters = Arc::new(RwLock::new(HashMap::new()));
-        let b1 = get_or_create_jwt_bucket(&limiters, "tenant-a", 60, 1);
-        b1.try_consume(); // exhaust the single-token bucket
-                          // Second call returns the same (exhausted) bucket
-        let b2 = get_or_create_jwt_bucket(&limiters, "tenant-a", 60, 1);
-        assert!(!b2.try_consume());
-    }
-
-    #[test]
-    fn get_or_create_bucket_isolates_different_tenants() {
-        let limiters = Arc::new(RwLock::new(HashMap::new()));
-        let ba = get_or_create_jwt_bucket(&limiters, "tenant-a", 60, 1);
-        ba.try_consume(); // exhaust tenant-a
-                          // tenant-b gets its own fresh bucket
-        let bb = get_or_create_jwt_bucket(&limiters, "tenant-b", 60, 1);
-        assert!(bb.try_consume());
-    }
-
     // ── validate_static_key ───────────────────────────────────────────────────
 
     mod static_key_tests {
         use super::*;
+        use std::collections::HashMap;
+        use std::sync::{atomic::AtomicBool, Arc};
+
         use crate::config::{
-            Config, DefaultsConfig, RateLimitConfig, ServerConfig, TelemetryConfig,
-            TrustedIssuerConfig, VirtualKeyConfig,
+            Config, DefaultsConfig, RateLimitConfig, RateLimitingConfig, ServerConfig,
+            TelemetryConfig, VirtualKeyConfig,
         };
         use crate::jwks::JwksCache;
         use crate::metrics::Metrics;
         use crate::providers::ProviderRegistry;
-        use crate::ratelimit::build_rate_limiter;
+        use crate::ratelimit::MemoryBackend;
         use crate::router::ModelRouter;
-        use std::sync::atomic::AtomicBool;
 
         fn config_with_key(key_str: &str, rpm: Option<u32>) -> Config {
             Config {
@@ -411,47 +369,46 @@ mod tests {
                 }],
                 trusted_issuers: vec![],
                 jwks_cache_ttl_secs: 300,
+                rate_limiting: RateLimitingConfig::default(),
             }
         }
 
         fn build_state(config: Config) -> AppState {
             let registry: ProviderRegistry = HashMap::new();
             let router = ModelRouter::from_config(&config, &registry).unwrap();
-            let rate_limiter = build_rate_limiter(&config.virtual_keys);
             let jwks_cache = JwksCache::new(vec![], 300, reqwest::Client::new());
             AppState {
-                rate_limiter: Arc::new(rate_limiter),
+                rate_limit_backend: Arc::new(MemoryBackend::new()),
                 router: Arc::new(router),
                 providers: Arc::new(registry),
                 metrics: Arc::new(Metrics::new()),
                 ready: Arc::new(AtomicBool::new(true)),
                 jwks_cache: Arc::new(jwks_cache),
-                jwt_rate_limiters: Arc::new(RwLock::new(HashMap::new())),
                 config: Arc::new(config),
             }
         }
 
-        #[test]
-        fn unknown_static_key_returns_unauthorized() {
+        #[tokio::test]
+        async fn unknown_static_key_returns_unauthorized() {
             let state = build_state(config_with_key("sk-real", None));
-            let err = validate_static_key("sk-wrong", &state).unwrap_err();
+            let err = validate_static_key("sk-wrong", &state).await.unwrap_err();
             assert!(matches!(err, ProxyError::Unauthorized(_)));
         }
 
-        #[test]
-        fn valid_static_key_returns_correct_outcome() {
+        #[tokio::test]
+        async fn valid_static_key_returns_correct_outcome() {
             let state = build_state(config_with_key("sk-real", None));
-            let outcome = validate_static_key("sk-real", &state).unwrap();
+            let outcome = validate_static_key("sk-real", &state).await.unwrap();
             assert_eq!(outcome.key_name, "test-key");
             assert_eq!(outcome.allowed_models, vec!["claude-sonnet"]);
         }
 
-        #[test]
-        fn rate_limited_static_key_returns_rate_limited_error() {
+        #[tokio::test]
+        async fn rate_limited_static_key_returns_rate_limited_error() {
             // burst = 1, so the second request is denied
             let state = build_state(config_with_key("sk-real", Some(60)));
-            let _ = validate_static_key("sk-real", &state).unwrap(); // first: ok
-            let err = validate_static_key("sk-real", &state).unwrap_err();
+            let _ = validate_static_key("sk-real", &state).await.unwrap(); // first: ok
+            let err = validate_static_key("sk-real", &state).await.unwrap_err();
             assert!(matches!(err, ProxyError::RateLimited(_)));
         }
     }
@@ -460,15 +417,18 @@ mod tests {
 
     mod jwt_tests {
         use super::*;
+        use std::collections::HashMap;
+        use std::sync::{atomic::AtomicBool, Arc};
+
         use crate::config::{
-            Config, DefaultsConfig, ServerConfig, TelemetryConfig, TrustedIssuerConfig,
+            Config, DefaultsConfig, RateLimitingConfig, ServerConfig, TelemetryConfig,
+            TrustedIssuerConfig,
         };
         use crate::jwks::JwksCache;
         use crate::metrics::Metrics;
         use crate::providers::ProviderRegistry;
-        use crate::ratelimit::build_rate_limiter;
+        use crate::ratelimit::MemoryBackend;
         use crate::router::ModelRouter;
-        use std::sync::atomic::AtomicBool;
 
         const SECRET: &[u8] = b"test-secret-for-jwt-auth-tests";
         const KID: &str = "test-kid";
@@ -516,13 +476,13 @@ mod tests {
                     audience: audience.map(str::to_string),
                 }],
                 jwks_cache_ttl_secs: 300,
+                rate_limiting: RateLimitingConfig::default(),
             }
         }
 
         async fn build_state(config: Config) -> AppState {
             let registry: ProviderRegistry = HashMap::new();
             let router = ModelRouter::from_config(&config, &registry).unwrap();
-            let rate_limiter = build_rate_limiter(&config.virtual_keys);
             let jwks_cache = JwksCache::new(
                 config.trusted_issuers.clone(),
                 config.jwks_cache_ttl_secs,
@@ -536,13 +496,12 @@ mod tests {
                 )
                 .await;
             AppState {
-                rate_limiter: Arc::new(rate_limiter),
+                rate_limit_backend: Arc::new(MemoryBackend::new()),
                 router: Arc::new(router),
                 providers: Arc::new(registry),
                 metrics: Arc::new(Metrics::new()),
                 ready: Arc::new(AtomicBool::new(true)),
                 jwks_cache: Arc::new(jwks_cache),
-                jwt_rate_limiters: Arc::new(RwLock::new(HashMap::new())),
                 config: Arc::new(config),
             }
         }

@@ -24,6 +24,10 @@
       "items": { "$ref": "#/definitions/VirtualKeyConfig" },
       "default": []
     },
+    "rate_limiting": {
+      "$ref": "#/definitions/RateLimitingConfig",
+      "description": "Rate limiting backend configuration. Defaults to in-process memory backend."
+    },
     "trusted_issuers": {
       "type": "array",
       "items": { "$ref": "#/definitions/TrustedIssuerConfig" },
@@ -205,6 +209,38 @@
           "default": []
         },
         "rate_limit": { "$ref": "#/definitions/RateLimitConfig" }
+      }
+    },
+    "RateLimitingConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "backend": {
+          "type": "string",
+          "enum": ["memory", "redis"],
+          "default": "memory",
+          "description": "Rate limit storage backend. Use 'redis' for distributed enforcement across replicas."
+        },
+        "redis_url": {
+          "type": "string",
+          "description": "Redis connection URL. Required when backend is 'redis'."
+        },
+        "redis_key_prefix": {
+          "type": "string",
+          "default": "ferrox:rl:",
+          "description": "Prefix for all rate limit keys in Redis."
+        },
+        "redis_pool_size": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 10,
+          "description": "Redis connection pool size."
+        },
+        "redis_fail_open": {
+          "type": "boolean",
+          "default": true,
+          "description": "When true, requests are allowed if Redis is unavailable. When false, requests are denied."
+        }
       }
     },
     "TrustedIssuerConfig": {
