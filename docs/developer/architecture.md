@@ -43,6 +43,28 @@ This is a Cargo workspace with two crates:
 
 The control plane manages JWT signing keys, API clients, and token issuance. It is a separate binary in the workspace (`ferrox-cp/`) that connects to a PostgreSQL database.
 
+### Crypto core
+
+The crypto layer (`ferrox-cp/src/crypto/`) provides three capabilities:
+
+| Module | Responsibility |
+|---|---|
+| `keys` | Generate RSA-2048 keypairs; exports private key as PKCS#1 DER, public key as SubjectPublicKeyInfo DER |
+| `encrypt` | AES-256-GCM encrypt/decrypt; stored blob format is `[12-byte nonce][ciphertext+tag]` |
+| `jwks` | Convert a DER public key to a JWK object (RFC 7517) for the JWKS endpoint |
+| `jwt` | `JwtSigner` — signs JWTs for clients; claims include `ferrox.allowed_models`, `ferrox.rate_limit` |
+
+**Private key storage pipeline:**
+
+```
+generate_keypair()          → PKCS#1 DER (plaintext)
+  ↓ encrypt_private_key()   → [nonce][ciphertext]  stored in signing_keys.private_key (BYTEA)
+  ↓ decrypt_private_key()   → PKCS#1 DER (plaintext)
+  ↓ EncodingKey::from_rsa_der  → signs JWT
+```
+
+**Startup key seeding:** if `signing_keys` is empty at startup, one RSA-2048 keypair is generated and persisted automatically. Subsequent restarts detect the existing key and skip generation (idempotent).
+
 ### Data layer
 
 Three tables form the persistence model:
