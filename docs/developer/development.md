@@ -154,9 +154,16 @@ ferrox-cp/          control plane binary crate (Phase 3)
   migrations/
     20240001000000_initial_schema.sql
   src/
-    main.rs           entry point, MIGRATOR static
+    main.rs           entry point, MIGRATOR static, startup key seeding
     config.rs         CpConfig loaded from env vars
+    error.rs          CpError (top-level error enum)
     state.rs          CpState (db pool + config)
+    crypto/
+      mod.rs
+      keys.rs         RSA-2048 keypair generation (PKCS#1 DER output)
+      encrypt.rs      AES-256-GCM encrypt/decrypt for private keys at rest
+      jwks.rs         DER public key → JWK (RFC 7517)
+      jwt.rs          JwtSigner — sign JWTs for clients
     db/
       mod.rs
       models.rs       Client, SigningKey, AuditEntry, AuditEvent
