@@ -124,6 +124,8 @@ mod tests {
                 })
                 .collect(),
             virtual_keys: vec![],
+            trusted_issuers: vec![],
+            jwks_cache_ttl_secs: 300,
         }
     }
 

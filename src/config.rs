@@ -335,6 +335,14 @@ pub struct VirtualKeyConfig {
     pub rate_limit: Option<RateLimitConfig>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrustedIssuerConfig {
+    pub issuer: String,
+    pub jwks_uri: String,
+    #[serde(default)]
+    pub audience: Option<String>,
+}
+
 // ── Top-level config ─────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -347,7 +355,16 @@ pub struct Config {
     pub defaults: DefaultsConfig,
     pub providers: Vec<ProviderConfig>,
     pub models: Vec<ModelConfig>,
+    #[serde(default)]
     pub virtual_keys: Vec<VirtualKeyConfig>,
+    #[serde(default)]
+    pub trusted_issuers: Vec<TrustedIssuerConfig>,
+    #[serde(default = "default_jwks_cache_ttl_secs")]
+    pub jwks_cache_ttl_secs: u64,
+}
+
+fn default_jwks_cache_ttl_secs() -> u64 {
+    300
 }
 
 // ── Loading ──────────────────────────────────────────────────────────────────
@@ -585,6 +602,8 @@ mod tests {
                 },
             }],
             virtual_keys: vec![],
+            trusted_issuers: vec![],
+            jwks_cache_ttl_secs: default_jwks_cache_ttl_secs(),
         }
     }
 

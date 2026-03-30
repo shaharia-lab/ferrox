@@ -2,6 +2,7 @@ mod auth;
 mod config;
 mod error;
 mod handlers;
+mod jwks;
 mod lb;
 mod metrics;
 mod providers;
@@ -79,10 +80,23 @@ async fn main() -> Result<(), anyhow::Error> {
     let rate_limiter = build_rate_limiter(&config.virtual_keys);
     tracing::info!(count = rate_limiter.len(), "Rate limiters initialized");
 
-    // 8. Init metrics
+    // 8. Build JWKS cache and prefetch
+    let http_client = reqwest::Client::new();
+    let jwks_cache = Arc::new(jwks::JwksCache::new(
+        config.trusted_issuers.clone(),
+        config.jwks_cache_ttl_secs,
+        http_client,
+    ));
+    jwks_cache.prefetch_all().await;
+    if !config.trusted_issuers.is_empty() {
+        jwks_cache.clone().spawn_refresh_task();
+        tracing::info!(count = config.trusted_issuers.len(), "Trusted JWKS issuers configured");
+    }
+
+    // 9. Init metrics
     let metrics = Metrics::new();
 
-    // 9. Build AppState
+    // 10. Build AppState
     let ready = Arc::new(AtomicBool::new(false));
     let state = AppState {
         config: Arc::new(config),
@@ -91,20 +105,22 @@ async fn main() -> Result<(), anyhow::Error> {
         rate_limiter: Arc::new(rate_limiter),
         metrics: Arc::new(metrics),
         ready: ready.clone(),
+        jwks_cache,
+        jwt_rate_limiters: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
     };
 
-    // 10. Build axum router
+    // 11. Build axum router
     let app = server::build_router(state.clone());
 
-    // 11. Bind listener
+    // 12. Bind listener
     let addr = format!("{}:{}", state.config.server.host, state.config.server.port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     tracing::info!(addr = %addr, "Ferrox listening");
 
-    // 12. Mark ready
+    // 13. Mark ready
     ready.store(true, Ordering::Release);
 
-    // 13. Serve with graceful shutdown
+    // 14. Serve with graceful shutdown
     let graceful_timeout = state.config.server.graceful_shutdown_timeout_secs;
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal(ready, graceful_timeout))
