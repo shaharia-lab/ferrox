@@ -1,0 +1,29 @@
+# Minimal runtime image built from pre-compiled binaries.
+# Used by the CI release workflow — avoids slow QEMU ARM64 recompilation.
+# Both ferrox-cp-amd64 and ferrox-cp-arm64 must be present in the build context.
+# Docker Buildx sets TARGETARCH automatically (amd64 or arm64) per platform.
+FROM ubuntu:24.04
+
+ARG TARGETARCH
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    wget \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN groupadd -r ferrox && useradd -r -g ferrox ferrox
+
+WORKDIR /app
+
+COPY ferrox-cp-${TARGETARCH} ./ferrox-cp
+
+RUN chmod +x ./ferrox-cp
+
+USER ferrox
+
+EXPOSE 9090
+
+HEALTHCHECK --interval=10s --timeout=3s --start-period=15s --retries=3 \
+    CMD wget -qO- http://localhost:9090/healthz || exit 1
+
+ENTRYPOINT ["./ferrox-cp"]

@@ -1,4 +1,45 @@
 services:
+  # ── PostgreSQL (for ferrox-cp) ────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ferrox_cp
+      POSTGRES_USER: ferrox
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:-ferrox}"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ferrox"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # ── Ferrox control plane ──────────────────────────────────────────────────────
+  ferrox-cp:
+    build:
+      context: .
+      dockerfile: ferrox-cp/Dockerfile
+    image: ghcr.io/shaharia-lab/ferrox-cp:local
+    ports:
+      - "9090:9090"
+    environment:
+      DATABASE_URL: "postgres://ferrox:${POSTGRES_PASSWORD:-ferrox}@postgres:5432/ferrox_cp"
+      CP_ENCRYPTION_KEY: "${CP_ENCRYPTION_KEY}"
+      CP_ISSUER: "${CP_ISSUER:-http://localhost:9090}"
+      CP_ADMIN_KEY: "${CP_ADMIN_KEY}"
+      CP_PORT: "9090"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:9090/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 20s
+
   # ── Ferrox proxy ─────────────────────────────────────────────────────────────
   ferrox:
     build: .
@@ -50,4 +91,5 @@ services:
       start_period: 30s
 
 volumes:
+  postgres_data:
   lgtm-data:

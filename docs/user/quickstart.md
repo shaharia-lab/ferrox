@@ -182,6 +182,64 @@ curl http://localhost:8080/readyz    # -> "ready" when startup is complete
 curl http://localhost:8080/metrics   # -> Prometheus text format
 ```
 
+## Optional: Control plane (`ferrox-cp`)
+
+`ferrox-cp` lets you issue short-lived JWTs to client services instead of sharing long-lived static keys.  This step is entirely optional — the gateway works fine with virtual keys alone.
+
+### Start the control plane
+
+```bash
+# Generate secrets (add to .env)
+echo "CP_ENCRYPTION_KEY=$(openssl rand -hex 32)" >> .env
+echo "CP_ADMIN_KEY=$(openssl rand -hex 20)"      >> .env
+
+# Start postgres + control plane alongside the gateway
+docker compose up postgres ferrox-cp ferrox
+```
+
+### Create a client and exchange its key for a JWT
+
+```bash
+# Load the admin key from .env
+source .env
+
+# Create a client (api_key shown once)
+API_KEY=$(curl -s -X POST http://localhost:9090/api/clients \
+  -H "Authorization: Bearer $CP_ADMIN_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "my-service",
+    "allowed_models": ["claude-sonnet"],
+    "rpm": 60,
+    "burst": 10,
+    "token_ttl_seconds": 900
+  }' | jq -r .api_key)
+
+# Exchange for a JWT (valid for 15 minutes)
+JWT=$(curl -s -X POST http://localhost:9090/token \
+  -H "Authorization: Bearer $API_KEY" | jq -r .access_token)
+```
+
+### Enable JWT validation in the gateway
+
+Uncomment the `trusted_issuers` block in your gateway config:
+
+```yaml
+trusted_issuers:
+  - issuer: "http://localhost:9090"
+    jwks_uri: "http://ferrox-cp:9090/.well-known/jwks.json"
+    audience: "ferrox"
+```
+
+Then use the JWT to call the gateway:
+
+```bash
+curl http://localhost:8080/v1/chat/completions \
+  -H "Authorization: Bearer $JWT" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"claude-sonnet","messages":[{"role":"user","content":"Hello"}]}'
+```
+
 ## Next steps
 
 - [Configuration reference](configuration.md) — all config options
