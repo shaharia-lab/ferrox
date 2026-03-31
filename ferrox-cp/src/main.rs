@@ -1,25 +1,34 @@
 // ferrox-cp: control plane for the Ferrox LLM gateway
-// Phase 3 — public API implemented.
+// Phase 3 — public API + admin API implemented.
 #![allow(dead_code)]
 mod config;
 mod crypto;
 mod db;
 mod error;
 mod handlers;
+mod middleware;
 mod state;
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::routing::{get, post};
 use axum::Router;
 use tokio::net::TcpListener;
-use tracing::info;
+use tracing::{error, info};
 
 use config::CpConfig;
 use crypto::encrypt::encrypt_private_key;
 use crypto::keys::generate_keypair;
+use db::signing_key_repo::SigningKeyRepository;
 use error::CpError;
+use handlers::admin::audit::list_audit;
+use handlers::admin::clients::{
+    client_usage, create_client, get_client, list_clients, revoke_client,
+};
+use handlers::admin::signing_keys::{list_signing_keys, rotate_keys};
 use handlers::{health::health_handler, jwks::jwks_handler, token::token_handler};
+use middleware::admin_auth::require_admin_key;
 use state::CpState;
 
 /// Migrations bundled into the binary at compile time.
@@ -62,10 +71,47 @@ async fn main() -> anyhow::Result<()> {
         config: config.clone(),
     };
 
-    let app = Router::new()
+    // Spawn background task: retire signing keys whose scheduled retirement
+    // timestamp has passed.  Runs every 60 seconds.
+    {
+        let bg_db = state.db.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(60));
+            ticker.tick().await; // skip the immediate first tick
+            loop {
+                ticker.tick().await;
+                let repo = SigningKeyRepository::new(&bg_db);
+                match repo.retire_expired().await {
+                    Ok(0) => {}
+                    Ok(n) => info!(count = n, "background: retired expired signing keys"),
+                    Err(e) => error!(error = %e, "background: key retirement failed"),
+                }
+            }
+        });
+    }
+
+    // ── Public routes (no auth) ──────────────────────────────────────────────
+    let public_routes = Router::new()
         .route("/.well-known/jwks.json", get(jwks_handler))
         .route("/token", post(token_handler))
-        .route("/healthz", get(health_handler))
+        .route("/healthz", get(health_handler));
+
+    // ── Admin routes (CP_ADMIN_KEY required) ────────────────────────────────
+    let admin_routes = Router::new()
+        .route("/api/clients", post(create_client).get(list_clients))
+        .route("/api/clients/:id", get(get_client).delete(revoke_client))
+        .route("/api/clients/:id/usage", get(client_usage))
+        .route("/api/signing-keys", get(list_signing_keys))
+        .route("/api/signing-keys/rotate", post(rotate_keys))
+        .route("/api/audit", get(list_audit))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            require_admin_key,
+        ));
+
+    let app = Router::new()
+        .merge(public_routes)
+        .merge(admin_routes)
         .with_state(state);
 
     let addr = format!("0.0.0.0:{}", config.port);

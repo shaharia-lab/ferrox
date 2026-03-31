@@ -1,3 +1,5 @@
+use chrono::{DateTime, Utc};
+
 use crate::db::error::RepoError;
 use crate::db::models::SigningKey;
 
@@ -74,6 +76,72 @@ impl<'a> SigningKeyRepository<'a> {
         .fetch_optional(self.db)
         .await
         .map_err(RepoError::Database)
+    }
+
+    /// Return all signing keys (active and retired), ordered newest first.
+    ///
+    /// Used by the admin API to list all keys for inspection.
+    pub async fn get_all(&self) -> Result<Vec<SigningKey>, RepoError> {
+        sqlx::query_as::<_, SigningKey>(
+            r#"
+            SELECT kid, algorithm, private_key, public_key, active, created_at, retired_at
+            FROM signing_keys
+            ORDER BY created_at DESC
+            "#,
+        )
+        .fetch_all(self.db)
+        .await
+        .map_err(RepoError::Database)
+    }
+
+    /// Schedule a key for retirement at a future timestamp without immediately
+    /// deactivating it.  The key remains in the JWKS until the background task
+    /// calls [`retire_expired`] after `retire_at` passes, preserving the overlap
+    /// window so in-flight tokens stay verifiable.
+    pub async fn schedule_retirement(
+        &self,
+        kid: &str,
+        retire_at: DateTime<Utc>,
+    ) -> Result<(), RepoError> {
+        let rows = sqlx::query(
+            r#"
+            UPDATE signing_keys
+            SET retired_at = $1
+            WHERE kid = $2 AND active = true AND retired_at IS NULL
+            "#,
+        )
+        .bind(retire_at)
+        .bind(kid)
+        .execute(self.db)
+        .await
+        .map_err(RepoError::Database)?
+        .rows_affected();
+
+        if rows == 0 {
+            Err(RepoError::NotFound(format!("active signing key '{}'", kid)))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Deactivate all keys whose scheduled `retired_at` timestamp has passed.
+    ///
+    /// Called by the background key-retirement task every minute.
+    /// Returns the number of keys that were deactivated.
+    pub async fn retire_expired(&self) -> Result<u64, RepoError> {
+        let n = sqlx::query(
+            r#"
+            UPDATE signing_keys
+            SET active = false
+            WHERE active = true AND retired_at IS NOT NULL AND retired_at <= now()
+            "#,
+        )
+        .execute(self.db)
+        .await
+        .map_err(RepoError::Database)?
+        .rows_affected();
+
+        Ok(n)
     }
 
     /// Retire a signing key (sets `active = false`, stamps `retired_at`).

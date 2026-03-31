@@ -16,6 +16,8 @@ pub struct AuditFilter {
     pub since: Option<DateTime<Utc>>,
     /// Maximum number of rows to return (default: 100).
     pub limit: Option<i64>,
+    /// Number of rows to skip (for pagination).
+    pub offset: Option<i64>,
 }
 
 /// Typed repository for the `audit_log` table.
@@ -54,6 +56,7 @@ impl<'a> AuditRepository<'a> {
     /// Return audit entries matching the given filter, newest first.
     pub async fn list(&self, filter: AuditFilter) -> Result<Vec<AuditEntry>, RepoError> {
         let limit = filter.limit.unwrap_or(100);
+        let offset = filter.offset.unwrap_or(0);
         let event_str = filter.event.as_ref().map(|e| e.as_str().to_string());
 
         let rows = sqlx::query_as::<_, AuditEntry>(
@@ -66,12 +69,14 @@ impl<'a> AuditRepository<'a> {
                 AND ($3::timestamptz IS NULL OR created_at >= $3)
             ORDER BY created_at DESC
             LIMIT $4
+            OFFSET $5
             "#,
         )
         .bind(filter.client_id)
         .bind(event_str)
         .bind(filter.since)
         .bind(limit)
+        .bind(offset)
         .fetch_all(self.db)
         .await
         .map_err(RepoError::Database)?;

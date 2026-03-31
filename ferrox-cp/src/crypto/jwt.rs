@@ -112,7 +112,6 @@ mod tests {
     use super::*;
     use crate::crypto::encrypt::encrypt_private_key;
     use crate::crypto::keys::generate_keypair;
-    use chrono::DateTime;
     use jsonwebtoken::{decode, DecodingKey, Validation};
     use rsa::pkcs8::DecodePublicKey;
     use rsa::RsaPublicKey;

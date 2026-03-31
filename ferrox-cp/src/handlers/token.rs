@@ -412,6 +412,7 @@ mod tests {
                 event: Some(AuditEvent::TokenIssued),
                 since: None,
                 limit: Some(10),
+                offset: None,
             })
             .await
             .unwrap();
