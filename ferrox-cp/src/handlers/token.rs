@@ -15,6 +15,14 @@ use crate::state::CpState;
 
 const API_KEY_PREFIX: &str = "sk-cp-";
 
+/// A pre-computed bcrypt hash used as a dummy target when no client is found
+/// for a given key prefix.  Running bcrypt against it on every miss ensures
+/// the response time is indistinguishable from a genuine hash mismatch,
+/// preventing timing-based prefix enumeration.
+///
+/// This is the hash of the string "dummy" with cost 12.
+const DUMMY_HASH: &str = "$2b$12$Ei1YpGUfDLEH.8ZhFDcKMucYanSmS6.v.roB0DEjxFKnKhMBVFjFC";
+
 #[derive(Debug, Serialize)]
 pub struct TokenResponse {
     pub access_token: String,
@@ -55,9 +63,8 @@ pub async fn token_handler(
     let prefix = &key_body[..8];
 
     let client_repo = ClientRepository::new(&state.db);
-    let client = match client_repo.find_by_key_prefix(prefix).await {
-        Ok(Some(c)) => c,
-        Ok(None) => return Err(unauthorized("invalid API key")),
+    let maybe_client = match client_repo.find_by_key_prefix(prefix).await {
+        Ok(c) => c,
         Err(e) => {
             error!(error = %e, "database error looking up client by prefix");
             return Err(internal_error());
@@ -65,7 +72,13 @@ pub async fn token_handler(
     };
 
     // ── 3. Full bcrypt verification ─────────────────────────────────────────
-    let hash = client.api_key_hash.clone();
+    // Always run bcrypt — even when no client was found — to prevent a timing
+    // oracle that would let an attacker enumerate valid key prefixes by
+    // measuring whether the response took ~0 ms (miss) or ~100 ms (bcrypt).
+    let hash = maybe_client
+        .as_ref()
+        .map(|c| c.api_key_hash.clone())
+        .unwrap_or_else(|| DUMMY_HASH.to_string());
     let key_to_verify = full_key.clone();
     let valid = tokio::task::spawn_blocking(move || {
         bcrypt::verify(key_to_verify.as_bytes(), &hash).unwrap_or(false)
@@ -73,10 +86,13 @@ pub async fn token_handler(
     .await
     .map_err(|_| internal_error())?;
 
-    if !valid {
-        warn!(client = %client.name, "bcrypt verification failed");
-        return Err(unauthorized("invalid API key"));
-    }
+    let client = match maybe_client {
+        Some(c) if valid => c,
+        _ => {
+            warn!("bcrypt verification failed or client not found");
+            return Err(unauthorized("invalid API key"));
+        }
+    };
 
     // ── 4. Guard against revoked clients ───────────────────────────────────
     if !client.active || client.revoked_at.is_some() {
