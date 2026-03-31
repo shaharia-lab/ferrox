@@ -21,6 +21,8 @@ pub struct AuditQueryParams {
     pub offset: i64,
 }
 
+const MAX_LIMIT: i64 = 1000;
+
 fn default_limit() -> i64 {
     100
 }
@@ -47,7 +49,7 @@ pub async fn list_audit(
             client_id: params.client_id,
             event,
             since: params.since,
-            limit: Some(params.limit),
+            limit: Some(params.limit.min(MAX_LIMIT)),
             offset: Some(params.offset),
         })
         .await
@@ -173,5 +175,16 @@ mod tests {
             serde_json::from_slice(&axum::body::to_bytes(resp.into_body(), 4096).await.unwrap())
                 .unwrap();
         assert_eq!(body.as_array().unwrap().len(), 2);
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn list_audit_oversized_limit_is_clamped(pool: sqlx::PgPool) {
+        // An absurdly large limit must not cause an error — it is silently capped.
+        let app = make_app(make_state(pool));
+        let resp = app
+            .oneshot(admin_req("/api/audit?limit=2147483647"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 }

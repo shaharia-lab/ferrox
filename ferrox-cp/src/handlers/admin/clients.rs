@@ -15,6 +15,8 @@ use crate::state::CpState;
 
 // ── Request / response types ─────────────────────────────────────────────────
 
+const MAX_LIMIT: i64 = 1000;
+
 #[derive(Debug, Deserialize)]
 pub struct CreateClientRequest {
     pub name: String,
@@ -23,6 +25,28 @@ pub struct CreateClientRequest {
     pub rpm: i32,
     pub burst: i32,
     pub token_ttl_seconds: i32,
+}
+
+impl CreateClientRequest {
+    /// Validate the request fields.  Returns an error message if any field is invalid.
+    fn validate(&self) -> Result<(), &'static str> {
+        if self.name.trim().is_empty() {
+            return Err("name must not be empty");
+        }
+        if self.allowed_models.is_empty() {
+            return Err("allowed_models must contain at least one entry");
+        }
+        if self.rpm <= 0 {
+            return Err("rpm must be greater than zero");
+        }
+        if self.burst <= 0 {
+            return Err("burst must be greater than zero");
+        }
+        if self.token_ttl_seconds <= 0 {
+            return Err("token_ttl_seconds must be greater than zero");
+        }
+        Ok(())
+    }
 }
 
 /// Response for `POST /api/clients`.  Includes `api_key` which is shown **once**.
@@ -86,6 +110,8 @@ pub async fn create_client(
     State(state): State<CpState>,
     Json(req): Json<CreateClientRequest>,
 ) -> Result<(StatusCode, Json<CreateClientResponse>), (StatusCode, Json<serde_json::Value>)> {
+    req.validate()
+        .map_err(|msg| api_error(StatusCode::UNPROCESSABLE_ENTITY, msg))?;
     // Generate a 32-char base64url body → sk-cp-<32 chars>.
     let random_bytes: Vec<u8> = {
         use rand::RngCore;
@@ -168,8 +194,9 @@ pub async fn list_clients(
     State(state): State<CpState>,
     Query(params): Query<PaginationParams>,
 ) -> Result<Json<Vec<ClientResponse>>, (StatusCode, Json<serde_json::Value>)> {
+    let limit = params.limit.min(MAX_LIMIT);
     let repo = ClientRepository::new(&state.db);
-    let clients = repo.list(params.limit, params.offset).await.map_err(|e| {
+    let clients = repo.list(limit, params.offset).await.map_err(|e| {
         error!(error = %e, "db error listing clients");
         api_error(StatusCode::INTERNAL_SERVER_ERROR, "database error")
     })?;
@@ -584,5 +611,58 @@ mod tests {
         assert_eq!(body["last_24h"].as_i64().unwrap(), 3);
         assert_eq!(body["last_7d"].as_i64().unwrap(), 3);
         assert_eq!(body["last_30d"].as_i64().unwrap(), 3);
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn create_client_empty_name_returns_422(pool: sqlx::PgPool) {
+        let app = make_app(make_state(pool));
+        let resp = app
+            .oneshot(admin_request(
+                "POST",
+                "/api/clients",
+                Some(r#"{"name":"  ","allowed_models":["*"],"rpm":10,"burst":5,"token_ttl_seconds":900}"#),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn create_client_empty_models_returns_422(pool: sqlx::PgPool) {
+        let app = make_app(make_state(pool));
+        let resp = app
+            .oneshot(admin_request(
+                "POST",
+                "/api/clients",
+                Some(r#"{"name":"svc","allowed_models":[],"rpm":10,"burst":5,"token_ttl_seconds":900}"#),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn create_client_zero_rpm_returns_422(pool: sqlx::PgPool) {
+        let app = make_app(make_state(pool));
+        let resp = app
+            .oneshot(admin_request(
+                "POST",
+                "/api/clients",
+                Some(r#"{"name":"svc","allowed_models":["*"],"rpm":0,"burst":5,"token_ttl_seconds":900}"#),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn list_clients_clamps_oversized_limit(pool: sqlx::PgPool) {
+        let app = make_app(make_state(pool));
+        // A limit larger than MAX_LIMIT must not cause an error — it is silently capped.
+        let resp = app
+            .oneshot(admin_request("GET", "/api/clients?limit=2147483647", None))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 }
