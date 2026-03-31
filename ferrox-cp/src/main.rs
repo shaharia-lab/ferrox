@@ -1,20 +1,25 @@
 // ferrox-cp: control plane for the Ferrox LLM gateway
-// Phase 3 — crypto core implemented; HTTP endpoints in a later milestone.
+// Phase 3 — public API implemented.
 #![allow(dead_code)]
 mod config;
 mod crypto;
 mod db;
 mod error;
+mod handlers;
 mod state;
 
 use std::sync::Arc;
 
+use axum::routing::{get, post};
+use axum::Router;
+use tokio::net::TcpListener;
 use tracing::info;
 
 use config::CpConfig;
 use crypto::encrypt::encrypt_private_key;
 use crypto::keys::generate_keypair;
 use error::CpError;
+use handlers::{health::health_handler, jwks::jwks_handler, token::token_handler};
 use state::CpState;
 
 /// Migrations bundled into the binary at compile time.
@@ -52,10 +57,26 @@ async fn main() -> anyhow::Result<()> {
     // Ensure at least one active signing key exists.
     seed_signing_key(&db, &encryption_key).await?;
 
-    let _state = CpState { db, config };
+    let state = CpState {
+        db,
+        config: config.clone(),
+    };
 
-    info!("ferrox-cp control plane ready (HTTP endpoints in a future milestone)");
-    Ok(())
+    let app = Router::new()
+        .route("/.well-known/jwks.json", get(jwks_handler))
+        .route("/token", post(token_handler))
+        .route("/healthz", get(health_handler))
+        .with_state(state);
+
+    let addr = format!("0.0.0.0:{}", config.port);
+    let listener = TcpListener::bind(&addr)
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to bind {}: {}", addr, e))?;
+
+    info!(addr = %addr, "ferrox-cp listening");
+    axum::serve(listener, app)
+        .await
+        .map_err(|e| anyhow::anyhow!("server error: {}", e))
 }
 
 /// Parse the 64 hex-character `CP_ENCRYPTION_KEY` into a 32-byte array.

@@ -37,9 +37,15 @@ jsonwebtoken = "9"
 hex = "0.4"
 # Base64url for JWKS JWK encoding
 base64 = "0.22"
+# HTTP server
+axum = "0.7"
+tower = { version = "0.5", features = ["util"] }
+# bcrypt for API key verification
+bcrypt = "0.15"
 # Tracing
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
+axum-test = "15"

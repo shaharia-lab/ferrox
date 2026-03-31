@@ -164,6 +164,11 @@ ferrox-cp/          control plane binary crate (Phase 3)
       encrypt.rs      AES-256-GCM encrypt/decrypt for private keys at rest
       jwks.rs         DER public key → JWK (RFC 7517)
       jwt.rs          JwtSigner — sign JWTs for clients
+    handlers/
+      mod.rs
+      health.rs       GET /healthz
+      jwks.rs         GET /.well-known/jwks.json
+      token.rs        POST /token — API key → JWT exchange
     db/
       mod.rs
       models.rs       Client, SigningKey, AuditEntry, AuditEvent

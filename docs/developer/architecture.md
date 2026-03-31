@@ -43,6 +43,26 @@ This is a Cargo workspace with two crates:
 
 The control plane manages JWT signing keys, API clients, and token issuance. It is a separate binary in the workspace (`ferrox-cp/`) that connects to a PostgreSQL database.
 
+### Public API
+
+Three HTTP endpoints served by an axum router on `CP_PORT` (default `9090`):
+
+| Endpoint | Auth | Description |
+|---|---|---|
+| `GET /.well-known/jwks.json` | None | Active public keys in JWKS format; `Cache-Control: max-age=300` |
+| `POST /token` | Bearer `sk-cp-<key>` | Exchange API key for a signed JWT |
+| `GET /healthz` | None | DB connectivity probe; `503` if unreachable |
+
+**Token issuance flow (`POST /token`):**
+
+1. Extract `sk-cp-<key>` from `Authorization: Bearer`
+2. Look up client by 8-char key prefix (fast indexed lookup)
+3. `bcrypt::verify` the full key against stored hash (run on blocking thread)
+4. Check `client.active = true`
+5. Decrypt active signing key (AES-256-GCM), build `JwtSigner`, sign JWT
+6. Write `token_issued` audit log entry (non-fatal if this fails)
+7. Return `{access_token, token_type, expires_in}`
+
 ### Crypto core
 
 The crypto layer (`ferrox-cp/src/crypto/`) provides three capabilities:
