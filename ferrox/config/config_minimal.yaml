@@ -53,3 +53,12 @@ virtual_keys:
     rate_limit:
       requests_per_minute: 120
       burst: 20
+
+# ── Control plane JWT auth (optional) ─────────────────────────────────────────
+# Uncomment to accept JWTs issued by ferrox-cp alongside static virtual_keys.
+# Run `docker compose up ferrox-cp` first, then create a client via the admin API.
+#
+# trusted_issuers:
+#   - issuer: "${CP_ISSUER:-http://localhost:9090}"
+#     jwks_uri: "http://ferrox-cp:9090/.well-known/jwks.json"
+#     audience: "ferrox"
