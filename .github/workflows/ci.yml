@@ -90,6 +90,20 @@ jobs:
           # or any RSA operations through sqlx-mysql; no patch is available upstream.
           ignore: RUSTSEC-2023-0071
 
+  # ── UI build ─────────────────────────────────────────────────────────────────
+  ui:
+    name: UI build & type-check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: ferrox-cp/ui/package-lock.json
+      - run: cd ferrox-cp/ui && npm ci
+      - run: cd ferrox-cp/ui && npm run build
+
   # ── Config schema validation ──────────────────────────────────────────────────
   validate-config:
     name: Validate config schema
@@ -106,7 +120,7 @@ jobs:
   docker-cp:
     name: Docker image (ferrox-cp)
     runs-on: ubuntu-latest
-    needs: [fmt, clippy, test, build]
+    needs: [fmt, clippy, test, build, ui]
     permissions:
       contents: read
       packages: write

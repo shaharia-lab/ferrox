@@ -15,6 +15,12 @@ prometheus-data/
 grafana-data/
 lgtm-data/
 
+# Node / UI
+ferrox-cp/ui/node_modules/
+# Compiled UI assets (placeholder index.html is committed; real dist is built in CI/Docker)
+ferrox-cp/ui/dist/
+!ferrox-cp/ui/dist/index.html
+
 # OS
 .DS_Store
 Thumbs.db

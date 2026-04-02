@@ -1,5 +1,5 @@
 // ferrox-cp: control plane for the Ferrox LLM gateway
-// Phase 3 — public API + admin API implemented.
+// Phase 3 — public API + admin API + embedded admin UI.
 #![allow(dead_code)]
 mod config;
 mod crypto;
@@ -8,6 +8,7 @@ mod error;
 mod handlers;
 mod middleware;
 mod state;
+mod ui;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -112,6 +113,7 @@ async fn main() -> anyhow::Result<()> {
     let app = Router::new()
         .merge(public_routes)
         .merge(admin_routes)
+        .fallback(ui::serve_spa)
         .with_state(state);
 
     let addr = format!("0.0.0.0:{}", config.port);

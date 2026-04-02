@@ -47,6 +47,9 @@ bcrypt = "0.15"
 # Tracing
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Embed static UI assets into the binary at compile time
+include_dir = "0.7"
+mime_guess = "2"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }

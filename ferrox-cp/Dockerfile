@@ -1,4 +1,17 @@
-# ── Stage 1: Build ─────────────────────────────────────────────────────────────
+# ── Stage 1: Build UI ─────────────────────────────────────────────────────────
+FROM node:22-slim AS ui-builder
+
+WORKDIR /build/ferrox-cp/ui
+
+# Cache npm deps layer
+COPY ferrox-cp/ui/package.json ferrox-cp/ui/package-lock.json ./
+RUN npm ci
+
+# Build the SPA
+COPY ferrox-cp/ui .
+RUN npm run build
+
+# ── Stage 2: Build Rust ────────────────────────────────────────────────────────
 FROM rust:1.94-slim-bookworm AS builder
 
 # git required for workspace metadata; no protobuf needed by ferrox-cp
@@ -9,6 +22,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /build
 
 # Cache dependency compilation layer — copy workspace manifests first, stub src.
+# The stub build does NOT include include_dir! so ui/dist need not exist yet.
 COPY Cargo.toml Cargo.lock ./
 COPY ferrox/Cargo.toml ferrox/Cargo.toml
 COPY ferrox/build.rs ferrox/build.rs
@@ -19,13 +33,16 @@ RUN mkdir -p ferrox/src ferrox-cp/src \
     && cargo build --release -p ferrox-cp \
     && rm -rf ferrox/src ferrox-cp/src
 
+# Copy the built UI so include_dir! can embed it
+COPY --from=ui-builder /build/ferrox-cp/ui/dist ./ferrox-cp/ui/dist
+
 # Copy real source and rebuild only ferrox-cp (deps already cached above)
 COPY ferrox-cp/src ./ferrox-cp/src
 COPY ferrox-cp/migrations ./ferrox-cp/migrations
 RUN touch ferrox-cp/src/main.rs \
     && cargo build --release -p ferrox-cp
 
-# ── Stage 2: Runtime ──────────────────────────────────────────────────────────
+# ── Stage 3: Runtime ──────────────────────────────────────────────────────────
 FROM debian:bookworm-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
