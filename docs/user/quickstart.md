@@ -75,8 +75,9 @@ docker run -p 8080:8080 \
 
 ```bash
 git clone https://github.com/shaharia-lab/ferrox && cd ferrox
-cp config/config_minimal.yaml config/local.yaml
-# Set your keys in .env (cp .env.example .env)
+make setup                             # creates .env with generated secrets
+# Edit .env — set at least one provider key (ANTHROPIC_API_KEY etc.)
+cp ferrox/config/config_minimal.yaml ferrox/config/config.yaml
 docker compose up
 ```
 
@@ -119,19 +120,24 @@ curl -Lo local.yaml https://raw.githubusercontent.com/shaharia-lab/ferrox/main/c
 
 ## Set environment variables
 
-**Binary / Homebrew / build from source** — create a `.env` file:
+**Binary / Homebrew / build from source** — run the setup target, which copies
+`.env.example` and auto-generates the required control-plane secrets:
 
 ```bash
-cp .env.example .env
+make setup
 ```
 
-Then set at least one provider key:
+Then open `.env` and set at least one provider key:
 
 ```bash
 # .env
 ANTHROPIC_API_KEY=sk-ant-...
 PROXY_KEY=sk-local-dev       # your inbound virtual key
 ```
+
+`CP_ENCRYPTION_KEY` and `CP_ADMIN_KEY` are filled in automatically by `make setup`.
+If you prefer to set them manually: `CP_ENCRYPTION_KEY` must be exactly 64 hex chars
+(`openssl rand -hex 32`), and `CP_ADMIN_KEY` must be at least 32 chars.
 
 **Docker** — pass keys directly with `-e` flags (see the run command below). Keys for providers you don't use can be omitted — those providers will be skipped.
 

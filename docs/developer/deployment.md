@@ -21,12 +21,12 @@ The runtime image runs as a non-root user.
 # Clone the repo if you haven't already
 git clone https://github.com/shaharia-lab/ferrox && cd ferrox
 
-# Copy minimal config — Compose reads config/config.yaml by default
-cp config/config_minimal.yaml config/config.yaml   # or edit config/config.yaml directly
+# Generate .env with required secrets pre-filled
+make setup
+# Edit .env — set at least one provider key (ANTHROPIC_API_KEY etc.)
 
-# Set your provider API keys
-cp .env.example .env
-# Edit .env and fill in at least one provider key
+# Copy minimal config — Compose reads config/config.yaml by default
+cp ferrox/config/config_minimal.yaml ferrox/config/config.yaml
 
 # Start the full stack
 docker compose up

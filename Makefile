@@ -1,7 +1,7 @@
 .PHONY: build build-release test fmt lint check run run-release clean \
         docker-build docker-up docker-down docker-logs \
         ui-install ui-build ui-dev \
-        help
+        setup help
 
 # ── Build ──────────────────────────────────────────────────────────────────────
 
@@ -29,6 +29,24 @@ lint:
 check: fmt-check lint test
 
 # ── Run locally ────────────────────────────────────────────────────────────────
+
+## First-time setup: copy .env.example → .env and generate required secrets.
+## Safe to re-run — skips if .env already exists.
+setup:
+	@if [ -f .env ]; then \
+		echo ".env already exists, skipping."; \
+	else \
+		cp .env.example .env; \
+		ENC_KEY=$$(openssl rand -hex 32); \
+		ADMIN_KEY=$$(openssl rand -hex 20); \
+		sed -i "s|^CP_ENCRYPTION_KEY=$$|CP_ENCRYPTION_KEY=$$ENC_KEY|" .env; \
+		sed -i "s|^CP_ADMIN_KEY=$$|CP_ADMIN_KEY=$$ADMIN_KEY|" .env; \
+		echo "Created .env — fill in at least one provider API key before running."; \
+		echo ""; \
+		echo "  CP_ENCRYPTION_KEY  auto-generated ✓"; \
+		echo "  CP_ADMIN_KEY       auto-generated ✓"; \
+		echo "  ANTHROPIC_API_KEY  edit .env and set this"; \
+	fi
 
 ## Copy minimal config template if local config does not exist yet
 ferrox/config/local.yaml:
@@ -102,6 +120,8 @@ clean:
 help:
 	@echo ""
 	@echo "Usage: make <target>"
+	@echo ""
+	@echo "  setup              First-time setup: create .env with generated secrets"
 	@echo ""
 	@echo "  build              Debug build (all workspace members)"
 	@echo "  build-release      Release build (all workspace members)"
