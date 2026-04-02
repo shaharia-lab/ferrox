@@ -15,8 +15,7 @@ export default function Login({ onLogin }: { onLogin: () => void }) {
       setError('Admin key is required')
       return
     }
-    setAdminKey(key.trim())
-    // Verify by hitting the API
+    // Verify before persisting — avoids a stale invalid key in localStorage.
     try {
       const res = await fetch('/api/clients?limit=1', {
         headers: { Authorization: `Bearer ${key.trim()}` },
@@ -25,6 +24,7 @@ export default function Login({ onLogin }: { onLogin: () => void }) {
         setError('Invalid admin key')
         return
       }
+      setAdminKey(key.trim())
       onLogin()
     } catch {
       setError('Could not reach the control plane API')
