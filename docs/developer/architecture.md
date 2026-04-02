@@ -43,6 +43,31 @@ This is a Cargo workspace with two crates:
 
 The control plane manages JWT signing keys, API clients, and token issuance. It is a separate binary in the workspace (`ferrox-cp/`) that connects to a PostgreSQL database.
 
+The single binary exposes four concerns on the same port (`CP_PORT`, default `9090`):
+
+| Path prefix | Auth | Description |
+|---|---|---|
+| `/.well-known/`, `/token`, `/healthz` | none / client key | Public API |
+| `/api/*` | `CP_ADMIN_KEY` Bearer | Admin REST API |
+| `/` (everything else) | — | Embedded React SPA |
+
+### Admin UI
+
+A React + TypeScript SPA is embedded in the binary at compile time via `include_dir!`.
+Axum serves it through a `.fallback(serve_spa)` handler — API routes always take
+priority.  The SPA communicates exclusively with the admin REST API using the
+`CP_ADMIN_KEY` stored in `localStorage` after the login screen validates it.
+
+```
+GET /  →  serve_spa  →  index.html  →  React Router handles client-side navigation
+GET /assets/*.js  →  serve_spa  →  embedded JS bundle (MIME: application/javascript)
+```
+
+The UI is built with `npm run build` in `ferrox-cp/ui/` and outputs to `ferrox-cp/ui/dist/`.
+Docker builds this in a dedicated `node:22-slim` stage before the Rust builder.  A
+committed placeholder `dist/index.html` keeps `cargo build` working without a prior
+npm build.
+
 ### Public API
 
 Three HTTP endpoints served by an axum router on `CP_PORT` (default `9090`):
@@ -103,9 +128,22 @@ Each table has a typed repository struct (`ClientRepository`, `SigningKeyReposit
 
 ```
 ferrox-cp/src/
-  main.rs             startup, MIGRATOR static
+  main.rs             startup, MIGRATOR static, axum router wiring
   config.rs           CpConfig loaded from env vars
   state.rs            CpState (db pool + config, Arc-wrapped)
+  ui.rs               SPA handler: include_dir! embedding + MIME-typed serving
+
+  handlers/
+    health.rs         GET /healthz
+    jwks.rs           GET /.well-known/jwks.json
+    token.rs          POST /token
+    admin/
+      clients.rs      CRUD + revoke + usage
+      signing_keys.rs list + rotate
+      audit.rs        filterable list
+
+  middleware/
+    admin_auth.rs     Bearer token check (subtle::ConstantTimeEq)
 
   db/
     mod.rs            re-exports all repo types
@@ -117,6 +155,14 @@ ferrox-cp/src/
 
 ferrox-cp/migrations/
   20240001000000_initial_schema.sql
+
+ferrox-cp/ui/       React SPA (Vite + TypeScript + Tailwind)
+  src/
+    pages/          Dashboard, Clients, ClientDetail, SigningKeys, AuditLog, Login
+    components/     Layout sidebar, minimal Tailwind UI kit
+    api.ts          typed fetch wrapper, localStorage key storage
+  dist/
+    index.html      placeholder (real build output is git-ignored)
 ```
 
 ### Environment variables

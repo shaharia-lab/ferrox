@@ -83,13 +83,17 @@ brew install shaharia-lab/tap/ferrox@1.0.0
 docker pull ghcr.io/shaharia-lab/ferrox:latest
 ```
 
-Or with Docker Compose (includes full LGTM observability stack):
+Or with Docker Compose (includes full LGTM observability stack and control plane):
 
 ```bash
 docker compose up
 ```
 
-Starts Ferrox + Grafana (`:3000`), OTLP (`:4317`), and the full logging/tracing/metrics stack.
+| Service | URL |
+|---|---|
+| Ferrox gateway | `http://localhost:8080` |
+| Control plane admin UI | `http://localhost:9090` |
+| Grafana dashboards | `http://localhost:3000` (admin / admin) |
 
 ### Build from source
 
@@ -166,7 +170,7 @@ curl http://localhost:8080/v1/chat/completions \
 |---|---|
 | [Architecture](docs/developer/architecture.md) | System design and request flow |
 | [Development](docs/developer/development.md) | Build, test, contribute |
-| [Deployment](docs/developer/deployment.md) | Docker |
+| [Deployment](docs/developer/deployment.md) | Docker, control plane, admin UI |
 
 ## License
 

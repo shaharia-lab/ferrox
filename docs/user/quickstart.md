@@ -82,7 +82,8 @@ docker compose up
 
 | URL | Purpose |
 |---|---|
-| `http://localhost:8080` | Ferrox proxy |
+| `http://localhost:8080` | Ferrox gateway |
+| `http://localhost:9090` | Control plane admin UI |
 | `http://localhost:3000` | Grafana dashboards (admin / admin) |
 
 > **Note:** Docker Compose mounts the entire `config/` directory and reads `config/config.yaml` by default. The `local.yaml` copy is only needed if you want to customise settings without modifying the committed `config.yaml`.
@@ -197,7 +198,13 @@ echo "CP_ADMIN_KEY=$(openssl rand -hex 20)"      >> .env
 docker compose up postgres ferrox-cp ferrox
 ```
 
-### Create a client and exchange its key for a JWT
+### Access the admin UI
+
+Open `http://localhost:9090` in your browser and sign in with your `CP_ADMIN_KEY`.  The UI
+lets you create and revoke clients, view token usage, rotate signing keys, and browse the audit
+log — all without touching the REST API directly.
+
+### Create a client via the REST API (or use the UI above)
 
 ```bash
 # Load the admin key from .env
