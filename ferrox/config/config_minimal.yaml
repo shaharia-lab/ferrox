@@ -60,5 +60,6 @@ virtual_keys:
 #
 # trusted_issuers:
 #   - issuer: "${CP_ISSUER:-http://localhost:9090}"
-#     jwks_uri: "http://ferrox-cp:9090/.well-known/jwks.json"
+#     # Local (binary/source): use localhost.  Docker Compose: use http://ferrox-cp:9090/...
+#     jwks_uri: "${CP_JWKS_URI:-http://localhost:9090/.well-known/jwks.json}"
 #     audience: "ferrox"
