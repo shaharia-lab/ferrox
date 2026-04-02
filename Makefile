@@ -1,5 +1,7 @@
 .PHONY: build build-release test fmt lint check run run-release clean \
-        docker-build docker-up docker-down docker-logs help
+        docker-build docker-up docker-down docker-logs \
+        ui-install ui-build ui-dev \
+        help
 
 # ── Build ──────────────────────────────────────────────────────────────────────
 
@@ -48,6 +50,20 @@ run-release: ferrox/config/local.yaml build-release
 	else \
 		LLM_PROXY_CONFIG=ferrox/config/local.yaml ./target/release/ferrox; \
 	fi
+
+# ── Admin UI (ferrox-cp/ui) ────────────────────────────────────────────────────
+
+## Install npm dependencies for the admin UI
+ui-install:
+	cd ferrox-cp/ui && npm ci
+
+## Build the admin UI (embeds into the binary via include_dir!)
+ui-build: ui-install
+	cd ferrox-cp/ui && npm run build
+
+## Start the Vite dev server (proxies /api to localhost:9090)
+ui-dev:
+	cd ferrox-cp/ui && npm run dev
 
 # ── Health checks (requires a running instance) ───────────────────────────────
 
@@ -100,6 +116,10 @@ help:
 	@echo "  run-release        Run release binary"
 	@echo "  health             Check /healthz and /readyz"
 	@echo "  metrics            Print /metrics output"
+	@echo ""
+	@echo "  ui-install         npm ci for the ferrox-cp admin UI"
+	@echo "  ui-build           Build admin UI (outputs to ferrox-cp/ui/dist/)"
+	@echo "  ui-dev             Vite dev server (proxies /api to localhost:9090)"
 	@echo ""
 	@echo "  docker-build       Build Docker image"
 	@echo "  docker-up          Start full stack (foreground)"

@@ -39,7 +39,7 @@ Services:
 | Service | Port | URL |
 |---|---|---|
 | Ferrox | 8080 | `http://localhost:8080` |
-| ferrox-cp | 9090 | `http://localhost:9090` |
+| ferrox-cp (API + admin UI) | 9090 | `http://localhost:9090` |
 | PostgreSQL | — | internal only |
 | Grafana (LGTM) | 3000 | `http://localhost:3000` (admin/admin) |
 | OTLP gRPC | 4317 | gRPC ingestion |
@@ -81,6 +81,31 @@ docker compose up postgres ferrox-cp
 # Or start the full stack
 docker compose up
 ```
+
+### Admin UI
+
+The control plane serves a React single-page application at `/`.  After starting
+`ferrox-cp`, open `http://localhost:9090` in your browser and sign in with your
+`CP_ADMIN_KEY`.
+
+| Screen | Path | Purpose |
+|---|---|---|
+| Dashboard | `/` | Active client count, active key count, recent audit events |
+| Clients | `/clients` | Create clients, copy API key (shown once), revoke |
+| Client detail | `/clients/:id` | Token usage chart, per-client audit log |
+| Signing keys | `/signing-keys` | Rotate keys, view active/retiring/retired status |
+| Audit log | `/audit` | Filter by client, event type, date range |
+
+The UI is **embedded in the binary** at compile time — no separate static file serving
+or CDN is required.  All `/api/*`, `/token`, `/.well-known/*`, and `/healthz` routes
+take priority; everything else is handled by the SPA fallback.
+
+> **Building the UI locally:** the committed `ferrox-cp/ui/dist/index.html` is a
+> placeholder so `cargo build` always works.  For a full UI build run:
+> ```bash
+> cd ferrox-cp/ui && npm ci && npm run build
+> cargo build -p ferrox-cp   # now embeds the real UI
+> ```
 
 ### Enable JWT auth in the gateway
 
