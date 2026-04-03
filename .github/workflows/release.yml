@@ -108,19 +108,21 @@ jobs:
           VERSION="${{ github.ref_name }}"
           BASE="https://github.com/shaharia-lab/ferrox/releases/download/${VERSION}"
 
+          mkdir -p _bin
+
           # amd64 — download tarball + sha256 sidecar, verify, extract
           curl -fsSL "${BASE}/ferrox-x86_64-unknown-linux-gnu.tar.gz" -o ferrox-x86_64-unknown-linux-gnu.tar.gz
           curl -fsSL "${BASE}/ferrox-x86_64-unknown-linux-gnu.sha256" -o ferrox-x86_64-unknown-linux-gnu.sha256
           sha256sum --check ferrox-x86_64-unknown-linux-gnu.sha256
-          tar xzf ferrox-x86_64-unknown-linux-gnu.tar.gz
-          mv ferrox ferrox-amd64
+          tar xzf ferrox-x86_64-unknown-linux-gnu.tar.gz -C _bin
+          mv _bin/ferrox ferrox-amd64
 
           # arm64 — download tarball + sha256 sidecar, verify, extract
           curl -fsSL "${BASE}/ferrox-aarch64-unknown-linux-gnu.tar.gz" -o ferrox-aarch64-unknown-linux-gnu.tar.gz
           curl -fsSL "${BASE}/ferrox-aarch64-unknown-linux-gnu.sha256" -o ferrox-aarch64-unknown-linux-gnu.sha256
           sha256sum --check ferrox-aarch64-unknown-linux-gnu.sha256
-          tar xzf ferrox-aarch64-unknown-linux-gnu.tar.gz
-          mv ferrox ferrox-arm64
+          tar xzf ferrox-aarch64-unknown-linux-gnu.tar.gz -C _bin
+          mv _bin/ferrox ferrox-arm64
 
       - name: Set up QEMU (for multi-arch manifest only — no compilation)
         uses: docker/setup-qemu-action@v3
@@ -178,19 +180,21 @@ jobs:
           VERSION="${{ github.ref_name }}"
           BASE="https://github.com/shaharia-lab/ferrox/releases/download/${VERSION}"
 
+          mkdir -p _bin
+
           # amd64 — download tarball + sha256 sidecar, verify, extract
           curl -fsSL "${BASE}/ferrox-cp-x86_64-unknown-linux-gnu.tar.gz" -o ferrox-cp-x86_64-unknown-linux-gnu.tar.gz
           curl -fsSL "${BASE}/ferrox-cp-x86_64-unknown-linux-gnu.sha256" -o ferrox-cp-x86_64-unknown-linux-gnu.sha256
           sha256sum --check ferrox-cp-x86_64-unknown-linux-gnu.sha256
-          tar xzf ferrox-cp-x86_64-unknown-linux-gnu.tar.gz
-          mv ferrox-cp ferrox-cp-amd64
+          tar xzf ferrox-cp-x86_64-unknown-linux-gnu.tar.gz -C _bin
+          mv _bin/ferrox-cp ferrox-cp-amd64
 
           # arm64 — download tarball + sha256 sidecar, verify, extract
           curl -fsSL "${BASE}/ferrox-cp-aarch64-unknown-linux-gnu.tar.gz" -o ferrox-cp-aarch64-unknown-linux-gnu.tar.gz
           curl -fsSL "${BASE}/ferrox-cp-aarch64-unknown-linux-gnu.sha256" -o ferrox-cp-aarch64-unknown-linux-gnu.sha256
           sha256sum --check ferrox-cp-aarch64-unknown-linux-gnu.sha256
-          tar xzf ferrox-cp-aarch64-unknown-linux-gnu.tar.gz
-          mv ferrox-cp ferrox-cp-arm64
+          tar xzf ferrox-cp-aarch64-unknown-linux-gnu.tar.gz -C _bin
+          mv _bin/ferrox-cp ferrox-cp-arm64
 
       - name: Set up QEMU (for multi-arch manifest only — no compilation)
         uses: docker/setup-qemu-action@v3
