@@ -109,6 +109,7 @@ Project-scoped agents live in `.claude/agents/`. Invoke with `@<name>` in any Cl
 |-------|------|----------------|
 | `architecture-guardian` | `.claude/agents/architecture-guardian.md` | Reviews proposed designs and audits existing architecture for inconsistencies, non-optimal patterns, unnecessary complexity, and performance issues. Asks clarifying questions before acting. |
 | `security-reviewer` | `.claude/agents/security-reviewer.md` | Reviews PRs and audits the full codebase for security vulnerabilities, attack vectors, CVEs, cryptographic issues, auth flaws, and runtime risks. |
+| `documentation-reviewer` | `.claude/agents/documentation-reviewer.md` | Audits docs for staleness, gaps, inconsistencies, and duplication; analyzes recent code changes to identify which documentation needs updating. |
 
 ## Documentation Index
 

@@ -34,6 +34,7 @@ Other available sub-agents in this project (for cross-referencing or delegation)
 | Agent | Responsibility |
 |-------|----------------|
 | `@security-reviewer` | Security audits, PR security review, CVE checks, cryptographic analysis |
+| `@documentation-reviewer` | Documentation staleness, gap, inconsistency, and duplication audits; change-driven doc impact analysis |
 
 ---
 

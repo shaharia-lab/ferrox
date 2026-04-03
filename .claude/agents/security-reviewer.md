@@ -33,6 +33,7 @@ Other available sub-agents in this project (for cross-referencing or delegation)
 | Agent | Responsibility |
 |-------|----------------|
 | `@architecture-guardian` | Architectural design review, structural audits, performance and maintainability analysis |
+| `@documentation-reviewer` | Documentation staleness, gap, inconsistency, and duplication audits; change-driven doc impact analysis |
 
 ---
 
