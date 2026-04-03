@@ -9,11 +9,11 @@ use uuid::Uuid;
 
 use crate::config::{DefaultsConfig, ProviderConfig};
 use crate::error::ProxyError;
+use crate::providers::anthropic_events::AnthropicEventProcessor;
 use crate::providers::{parse_sse_stream, ProviderAdapter, ProviderStream};
 use crate::types::{
     ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, ChatMessage, Choice,
-    ChunkChoice, ChunkDelta, ContentPart, FunctionCall, MessageContent, StopSequences, ToolCall,
-    Usage,
+    ContentPart, FunctionCall, MessageContent, StopSequences, Usage,
 };
 
 const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
@@ -445,15 +445,7 @@ fn transform_stream(
     async_stream::stream! {
         futures::pin_mut!(sse_stream);
 
-        let mut message_id = Uuid::new_v4().to_string();
-        // Accumulated state for tool calls
-        let mut pending_tool_id = String::new();
-        let mut pending_tool_name = String::new();
-        let mut pending_tool_args = String::new();
-        let mut pending_tool_index: u32 = 0;
-
-        let mut final_stop_reason: Option<String> = None;
-        let mut final_usage: Option<Usage> = None;
+        let mut processor = AnthropicEventProcessor::new(Uuid::new_v4().to_string());
 
         while let Some(item) = sse_stream.next().await {
             let (event_type, data) = match item {
@@ -465,181 +457,19 @@ fn transform_stream(
             };
 
             let event = event_type.as_deref().unwrap_or("");
+            let done = event == "message_stop" || event == "error";
 
-            match event {
-                "message_start" => {
-                    // Extract message ID from the event
-                    if let Ok(v) = serde_json::from_str::<Value>(&data) {
-                        if let Some(id) = v.pointer("/message/id").and_then(|v| v.as_str()) {
-                            message_id = id.to_string();
-                        }
-                    }
-                }
-                "content_block_start" => {
-                    // Note block type; if tool_use, capture id/name
-                    if let Ok(v) = serde_json::from_str::<Value>(&data) {
-                        if v.pointer("/content_block/type").and_then(|t| t.as_str()) == Some("tool_use") {
-                            pending_tool_id = v.pointer("/content_block/id")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("")
-                                .to_string();
-                            pending_tool_name = v.pointer("/content_block/name")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("")
-                                .to_string();
-                            pending_tool_args.clear();
-                            pending_tool_index = v.pointer("/index")
-                                .and_then(|v| v.as_u64())
-                                .unwrap_or(0) as u32;
-                        }
-                    }
-                }
-                "content_block_delta" => {
-                    if let Ok(v) = serde_json::from_str::<Value>(&data) {
-                        let delta_type = v.pointer("/delta/type").and_then(|t| t.as_str()).unwrap_or("");
-                        match delta_type {
-                            "text_delta" => {
-                                let text = v.pointer("/delta/text")
-                                    .and_then(|t| t.as_str())
-                                    .unwrap_or("")
-                                    .to_string();
-                                if !text.is_empty() {
-                                    yield Ok(make_text_chunk(&message_id, &model_id, text));
-                                }
-                            }
-                            "input_json_delta" => {
-                                let partial = v.pointer("/delta/partial_json")
-                                    .and_then(|t| t.as_str())
-                                    .unwrap_or("");
-                                pending_tool_args.push_str(partial);
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-                "content_block_stop" => {
-                    // Emit tool call chunk if we were accumulating one
-                    if !pending_tool_id.is_empty() {
-                        let tool_call = crate::types::ToolCall {
-                            id: pending_tool_id.clone(),
-                            r#type: "function".to_string(),
-                            function: FunctionCall {
-                                name: pending_tool_name.clone(),
-                                arguments: pending_tool_args.clone(),
-                            },
-                        };
-                        yield Ok(make_tool_call_chunk(
-                            &message_id,
-                            &model_id,
-                            pending_tool_index,
-                            tool_call,
-                        ));
-                        pending_tool_id.clear();
-                        pending_tool_name.clear();
-                        pending_tool_args.clear();
-                    }
-                }
-                "message_delta" => {
-                    if let Ok(v) = serde_json::from_str::<Value>(&data) {
-                        final_stop_reason = v.pointer("/delta/stop_reason")
-                            .and_then(|r| r.as_str())
-                            .map(|r| match r {
-                                "end_turn" => "stop".to_string(),
-                                "max_tokens" => "length".to_string(),
-                                "tool_use" => "tool_calls".to_string(),
-                                other => other.to_string(),
-                            });
-                        final_usage = parse_usage_from_message_delta(&v);
-                    }
-                }
-                "message_stop" => {
-                    // Emit final chunk with finish_reason + usage
-                    let chunk = ChatCompletionChunk {
-                        id: message_id.clone(),
-                        object: "chat.completion.chunk".to_string(),
-                        created: chrono::Utc::now().timestamp() as u64,
-                        model: model_id.clone(),
-                        choices: vec![ChunkChoice {
-                            index: 0,
-                            delta: ChunkDelta {
-                                role: None,
-                                content: None,
-                                tool_calls: None,
-                            },
-                            finish_reason: final_stop_reason.take(),
-                        }],
-                        usage: final_usage.take(),
-                    };
-                    yield Ok(chunk);
+            for result in processor.process(event, &data, &model_id, &provider_name) {
+                let is_err = result.is_err();
+                yield result;
+                if is_err {
                     return;
                 }
-                "error" => {
-                    let msg = serde_json::from_str::<Value>(&data)
-                        .ok()
-                        .and_then(|v| v.pointer("/error/message").and_then(|m| m.as_str()).map(|s| s.to_string()))
-                        .unwrap_or_else(|| data.clone());
-                    yield Err(ProxyError::ProviderError {
-                        provider: provider_name.clone(),
-                        status: 500,
-                        message: msg,
-                    });
-                    return;
-                }
-                _ => {}
+            }
+
+            if done {
+                return;
             }
         }
     }
-}
-
-fn make_text_chunk(id: &str, model: &str, text: String) -> ChatCompletionChunk {
-    ChatCompletionChunk {
-        id: id.to_string(),
-        object: "chat.completion.chunk".to_string(),
-        created: chrono::Utc::now().timestamp() as u64,
-        model: model.to_string(),
-        choices: vec![ChunkChoice {
-            index: 0,
-            delta: ChunkDelta {
-                role: None,
-                content: Some(text),
-                tool_calls: None,
-            },
-            finish_reason: None,
-        }],
-        usage: None,
-    }
-}
-
-fn make_tool_call_chunk(
-    id: &str,
-    model: &str,
-    index: u32,
-    tool_call: ToolCall,
-) -> ChatCompletionChunk {
-    ChatCompletionChunk {
-        id: id.to_string(),
-        object: "chat.completion.chunk".to_string(),
-        created: chrono::Utc::now().timestamp() as u64,
-        model: model.to_string(),
-        choices: vec![ChunkChoice {
-            index,
-            delta: ChunkDelta {
-                role: None,
-                content: None,
-                tool_calls: Some(vec![tool_call]),
-            },
-            finish_reason: None,
-        }],
-        usage: None,
-    }
-}
-
-fn parse_usage_from_message_delta(v: &Value) -> Option<Usage> {
-    let output = v.pointer("/usage/output_tokens").and_then(|t| t.as_u64())? as u32;
-    // input_tokens not available in message_delta; set to 0 (full usage in non-stream response)
-    Some(Usage {
-        prompt_tokens: 0,
-        completion_tokens: output,
-        total_tokens: output,
-    })
 }
