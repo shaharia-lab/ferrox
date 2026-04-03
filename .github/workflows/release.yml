@@ -57,6 +57,7 @@ jobs:
           bin: ferrox
           manifest-path: ferrox/Cargo.toml
           target: ${{ matrix.target }}
+          checksum: sha256
           token: ${{ secrets.GITHUB_TOKEN }}
       - name: Upload ferrox-cp binary
         uses: taiki-e/upload-rust-binary-action@v1
@@ -64,6 +65,7 @@ jobs:
           bin: ferrox-cp
           manifest-path: ferrox-cp/Cargo.toml
           target: ${{ matrix.target }}
+          checksum: sha256
           token: ${{ secrets.GITHUB_TOKEN }}
 
   # ── Docker image — ferrox (gateway) ──────────────────────────────────────────
