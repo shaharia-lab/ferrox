@@ -93,6 +93,7 @@ impl ProviderAdapter for BedrockAdapter {
             .body;
 
         let model_id = model_id.to_string();
+        let provider_name = self.name.clone();
 
         let chunk_stream = async_stream::stream! {
             let mut processor = AnthropicEventProcessor::new(Uuid::new_v4().to_string());
@@ -125,7 +126,7 @@ impl ProviderAdapter for BedrockAdapter {
                                     event_type,
                                     &data,
                                     &model_id,
-                                    &model_id,
+                                    &provider_name,
                                 ) {
                                     yield chunk_result;
                                 }
