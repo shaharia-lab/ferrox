@@ -32,7 +32,7 @@ rsa = { version = "0.9", features = ["sha2", "pem"] }
 aes-gcm = "0.10"
 rand = "0.8"
 # JWT signing
-jsonwebtoken = "9"
+jsonwebtoken = { version = "10", features = ["rust_crypto"] }
 # Hex decoding for CP_ENCRYPTION_KEY
 hex = "0.4"
 # Constant-time comparisons to prevent timing side-channels
