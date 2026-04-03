@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use async_trait::async_trait;
+use eventsource_stream::Eventsource;
 use futures::stream::{BoxStream, StreamExt};
 use reqwest::Response;
 
@@ -76,66 +77,28 @@ pub async fn build_registry(
 // ── SSE parsing utility ──────────────────────────────────────────────────────
 
 /// Parse a raw byte stream from an HTTP response into `(event_type, data)` pairs.
-/// Handles multi-line accumulation and `event:` / `data:` fields per SSE spec.
+///
+/// Uses `eventsource-stream` for spec-compliant SSE parsing, including correct
+/// handling of chunk boundaries that span multi-byte UTF-8 characters.
+///
+/// The `event_type` is `Some(name)` when an explicit `event:` field was present
+/// in the SSE frame, or `None` when the default "message" type applies.
 pub fn parse_sse_stream(
     response: Response,
 ) -> impl futures::Stream<Item = Result<(Option<String>, String), ProxyError>> + Send + 'static {
-    let byte_stream = response.bytes_stream();
-
-    async_stream::stream! {
-        let mut buffer = String::new();
-        let mut current_event: Option<String> = None;
-        let mut current_data = String::new();
-
-        futures::pin_mut!(byte_stream);
-
-        while let Some(chunk) = byte_stream.next().await {
-            let chunk = match chunk {
-                Ok(b) => b,
-                Err(e) => {
-                    yield Err(ProxyError::StreamError(e.to_string()));
-                    return;
-                }
-            };
-
-            let text = match std::str::from_utf8(&chunk) {
-                Ok(s) => s.to_string(),
-                Err(e) => {
-                    yield Err(ProxyError::StreamError(format!("UTF-8 decode error: {e}")));
-                    return;
-                }
-            };
-
-            buffer.push_str(&text);
-
-            // Process complete lines
-            while let Some(newline_pos) = buffer.find('\n') {
-                let line = buffer[..newline_pos].trim_end_matches('\r').to_string();
-                buffer = buffer[newline_pos + 1..].to_string();
-
-                if line.is_empty() {
-                    // Empty line = dispatch event
-                    if !current_data.is_empty() {
-                        let data = current_data.trim_end_matches('\n').to_string();
-                        yield Ok((current_event.take(), data));
-                        current_data.clear();
-                    }
-                } else if let Some(val) = line.strip_prefix("event:") {
-                    current_event = Some(val.trim().to_string());
-                } else if let Some(val) = line.strip_prefix("data:") {
-                    if !current_data.is_empty() {
-                        current_data.push('\n');
-                    }
-                    current_data.push_str(val.trim());
-                }
-                // Ignore other fields (id:, retry:, comments)
-            }
-        }
-
-        // Flush any remaining data
-        if !current_data.is_empty() {
-            let data = current_data.trim_end_matches('\n').to_string();
-            yield Ok((current_event, data));
-        }
-    }
+    response.bytes_stream().eventsource().map(|result| {
+        result
+            .map(|event| {
+                // eventsource-stream uses "message" as the default event name
+                // (per the SSE spec) when no `event:` field is present.
+                // Normalise back to None to preserve the existing adapter API.
+                let event_type = if event.event == "message" {
+                    None
+                } else {
+                    Some(event.event)
+                };
+                (event_type, event.data)
+            })
+            .map_err(|e| ProxyError::StreamError(e.to_string()))
+    })
 }
