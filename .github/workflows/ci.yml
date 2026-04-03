@@ -1,3 +1,14 @@
+# CI — runs on every push to main and on every pull request targeting main.
+#
+# Responsibilities:
+#   - Validate code quality (fmt, clippy, tests, audit)
+#   - Build release binaries to catch compile errors early
+#   - Build Docker images to verify Dockerfiles are healthy
+#
+# What this workflow does NOT do:
+#   - Push Docker images to any registry  ← happens only in release.yml
+#   - Publish binaries or create releases ← happens only in release.yml
+
 name: CI
 
 on:
@@ -11,23 +22,26 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
-  # ── Format ───────────────────────────────────────────────────────────────────
+  # ── Format ────────────────────────────────────────────────────────────────────
+  # Ensures all Rust code is formatted with `cargo fmt`.
+  # Fails fast so contributors get feedback before heavier jobs run.
   fmt:
     name: Format
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
       - run: cargo fmt --all --check
 
-  # ── Lint ─────────────────────────────────────────────────────────────────────
+  # ── Lint ──────────────────────────────────────────────────────────────────────
+  # Runs clippy with -D warnings so any lint becomes a hard failure.
   clippy:
     name: Clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -36,7 +50,9 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - run: cargo clippy --workspace -- -D warnings
 
-  # ── Test ─────────────────────────────────────────────────────────────────────
+  # ── Test ──────────────────────────────────────────────────────────────────────
+  # Runs the full test suite including ferrox-cp integration tests which require
+  # a live Postgres instance. sqlx::test spins up isolated temp databases per test.
   test:
     name: Test
     runs-on: ubuntu-latest
@@ -57,19 +73,21 @@ jobs:
     env:
       DATABASE_URL: postgres://postgres:testpass@localhost:5432/postgres
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Install protobuf compiler
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - run: cargo test --workspace -- --test-threads=1
 
-  # ── Build release ─────────────────────────────────────────────────────────────
+  # ── Build ─────────────────────────────────────────────────────────────────────
+  # Release build for the whole workspace. Catches compile errors that only
+  # surface with optimisations or release-profile codegen (e.g. dead-code elim).
   build:
     name: Build (release)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Install protobuf compiler
@@ -77,11 +95,12 @@ jobs:
       - run: cargo build --release --workspace
 
   # ── Security audit ────────────────────────────────────────────────────────────
+  # Checks all dependencies against the RustSec advisory database.
   audit:
     name: Security audit
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: rustsec/audit-check@v1
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
@@ -90,12 +109,14 @@ jobs:
           # or any RSA operations through sqlx-mysql; no patch is available upstream.
           ignore: RUSTSEC-2023-0071
 
-  # ── UI build ─────────────────────────────────────────────────────────────────
+  # ── Admin UI ──────────────────────────────────────────────────────────────────
+  # Type-checks and builds the React + TypeScript SPA that is embedded into the
+  # ferrox-cp binary at compile time via include_dir!.
   ui:
     name: UI build & type-check
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
@@ -105,55 +126,60 @@ jobs:
       - run: cd ferrox-cp/ui && npm run build
 
   # ── Config schema validation ──────────────────────────────────────────────────
+  # Validates all committed YAML configs against the JSON Schema to catch
+  # configuration mistakes before they reach a running instance.
   validate-config:
     name: Validate config schema
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
       - run: pip install check-jsonschema
       - run: check-jsonschema --schemafile ferrox/config.schema.json ferrox/config/*.yaml
 
-  # ── Docker image — ferrox-cp (build only on PR; push on main) ────────────────
-  docker-cp:
-    name: Docker image (ferrox-cp)
+  # ── Docker build — ferrox (gateway) ──────────────────────────────────────────
+  # Builds the ferrox gateway Docker image to verify the Dockerfile is healthy.
+  # Image is NOT pushed here; pushing only happens in release.yml on a
+  # published GitHub release.
+  docker:
+    name: Docker build (ferrox)
     runs-on: ubuntu-latest
-    needs: [fmt, clippy, test, build, ui]
-    permissions:
-      contents: read
-      packages: write
+    needs: [fmt, clippy, test, build]
     steps:
-      - uses: actions/checkout@v4
-
+      - uses: actions/checkout@v6
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
-
-      - name: Log in to GitHub Container Registry
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        uses: docker/login-action@v3
+      - name: Build image (verify only — no push)
+        uses: docker/build-push-action@v6
         with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          context: .
+          file: Dockerfile
+          push: false
+          tags: ghcr.io/${{ github.repository_owner }}/ferrox:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
-      - name: Extract Docker metadata
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ghcr.io/${{ github.repository_owner }}/ferrox-cp
-          tags: |
-            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
-            type=sha,format=short,prefix=sha-
-
-      - name: Build (and push on main)
+  # ── Docker build — ferrox-cp (control plane) ─────────────────────────────────
+  # Builds the ferrox-cp Docker image (including the Node.js UI build stage) to
+  # verify the multi-stage Dockerfile is healthy.
+  # Image is NOT pushed here; pushing only happens in release.yml on a
+  # published GitHub release.
+  docker-cp:
+    name: Docker build (ferrox-cp)
+    runs-on: ubuntu-latest
+    needs: [fmt, clippy, test, build, ui]
+    steps:
+      - uses: actions/checkout@v6
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Build image (verify only — no push)
         uses: docker/build-push-action@v6
         with:
           context: .
           file: ferrox-cp/Dockerfile
-          push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          push: false
+          tags: ghcr.io/${{ github.repository_owner }}/ferrox-cp:ci
           cache-from: type=gha
           cache-to: type=gha,mode=max
