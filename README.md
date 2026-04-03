@@ -135,7 +135,7 @@ docker run -p 8080:8080 \
   -e ANTHROPIC_API_KEY=sk-ant-... \
   -v $(pwd)/local.yaml:/etc/ferrox/config.yaml \
   ghcr.io/shaharia-lab/ferrox:latest \
-  ferrox --config /etc/ferrox/config.yaml
+  --config /etc/ferrox/config.yaml
 ```
 
 Send a request:

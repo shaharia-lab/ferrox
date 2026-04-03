@@ -57,7 +57,7 @@ docker pull ghcr.io/shaharia-lab/ferrox:latest
 Download the minimal config:
 
 ```bash
-curl -Lo local.yaml https://raw.githubusercontent.com/shaharia-lab/ferrox/main/config/config_minimal.yaml
+curl -Lo local.yaml https://raw.githubusercontent.com/shaharia-lab/ferrox/main/ferrox/config/config_minimal.yaml
 ```
 
 Run with your API keys:
@@ -68,7 +68,7 @@ docker run -p 8080:8080 \
   -e OPENAI_API_KEY=sk-... \
   -v $(pwd)/local.yaml:/etc/ferrox/config.yaml \
   ghcr.io/shaharia-lab/ferrox:latest \
-  ferrox --config /etc/ferrox/config.yaml
+  --config /etc/ferrox/config.yaml
 ```
 
 **Docker Compose** (full observability stack — requires cloning the repo):
@@ -113,7 +113,7 @@ cp config/config_minimal.yaml config/local.yaml
 **Docker (no repo clone)** — download the minimal config directly:
 
 ```bash
-curl -Lo local.yaml https://raw.githubusercontent.com/shaharia-lab/ferrox/main/config/config_minimal.yaml
+curl -Lo local.yaml https://raw.githubusercontent.com/shaharia-lab/ferrox/main/ferrox/config/config_minimal.yaml
 ```
 
 `config_minimal.yaml` includes Anthropic, OpenAI, and Gemini providers and four ready-to-use model aliases (`claude-sonnet`, `claude-haiku`, `gpt-4o`, `gemini-flash`). All timeouts, retries, and circuit breaker settings use production-ready defaults — no changes needed unless you want to customise.
@@ -158,7 +158,7 @@ docker run -p 8080:8080 \
   -e PROXY_KEY=sk-local-dev \
   -v $(pwd)/local.yaml:/etc/ferrox/config.yaml \
   ghcr.io/shaharia-lab/ferrox:latest \
-  ferrox --config /etc/ferrox/config.yaml
+  --config /etc/ferrox/config.yaml
 ```
 
 **Build from source (Makefile):**
@@ -239,10 +239,15 @@ Uncomment the `trusted_issuers` block in your gateway config:
 
 ```yaml
 trusted_issuers:
-  - issuer: "http://localhost:9090"
-    jwks_uri: "http://ferrox-cp:9090/.well-known/jwks.json"
+  - issuer: "${CP_ISSUER:-http://localhost:9090}"
+    jwks_uri: "${CP_JWKS_URI:-http://localhost:9090/.well-known/jwks.json}"
     audience: "ferrox"
 ```
+
+> **Local vs Docker Compose:** when running from source, `CP_JWKS_URI` defaults to
+> `http://localhost:9090/...` which is correct.  Docker Compose sets
+> `CP_JWKS_URI=http://ferrox-cp:9090/.well-known/jwks.json` automatically via the
+> internal service hostname.
 
 Then use the JWT to call the gateway:
 
