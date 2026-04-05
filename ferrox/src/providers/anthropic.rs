@@ -76,8 +76,8 @@ impl ProviderAdapter for AnthropicAdapter {
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", ANTHROPIC_VERSION)
             .header("content-type", "application/json");
-        if let Some(beta) = &extras.beta_header {
-            builder = builder.header("anthropic-beta", beta.as_str());
+        for (k, v) in &req.extra_headers {
+            builder = builder.header(k.as_str(), v.as_str());
         }
         let resp = builder.json(&body).send().await.map_err(|e| {
             if e.is_timeout() {
@@ -117,8 +117,8 @@ impl ProviderAdapter for AnthropicAdapter {
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", ANTHROPIC_VERSION)
             .header("content-type", "application/json");
-        if let Some(beta) = &extras.beta_header {
-            builder = builder.header("anthropic-beta", beta.as_str());
+        for (k, v) in &req.extra_headers {
+            builder = builder.header(k.as_str(), v.as_str());
         }
         let resp = builder.json(&body).send().await.map_err(|e| {
             if e.is_timeout() {
@@ -176,8 +176,6 @@ struct AnthropicRequest {
 
 /// Anthropic-specific extras extracted from `ChatCompletionRequest`.
 struct AnthropicExtras {
-    /// Value of the `anthropic-beta` header to forward (may be empty).
-    beta_header: Option<String>,
     /// Extended thinking config from `_anthropic_thinking` extra key.
     thinking: Option<Value>,
 }
@@ -233,35 +231,8 @@ struct AnthropicTool {
 /// Extract Anthropic-specific extras that were injected into `ChatCompletionRequest`
 /// by the Anthropic-native handler.
 fn extract_anthropic_extras(req: &ChatCompletionRequest) -> AnthropicExtras {
-    // Merge beta strings from two sources:
-    // 1. `anthropic-beta` header forwarded via `extra_headers`
-    // 2. `_anthropic_betas` body field forwarded via `extra`
-    let mut betas: Vec<String> = Vec::new();
-
-    if let Some(h) = req.extra_headers.get("anthropic-beta") {
-        // Header may already contain comma-separated values — keep as-is.
-        betas.push(h.clone());
-    }
-    if let Some(Value::Array(arr)) = req.extra.get("_anthropic_betas") {
-        for v in arr {
-            if let Some(s) = v.as_str() {
-                betas.push(s.to_string());
-            }
-        }
-    }
-
-    let beta_header = if betas.is_empty() {
-        None
-    } else {
-        Some(betas.join(","))
-    };
-
     let thinking = req.extra.get("_anthropic_thinking").cloned();
-
-    AnthropicExtras {
-        beta_header,
-        thinking,
-    }
+    AnthropicExtras { thinking }
 }
 
 /// Return the body to send to the Anthropic API.

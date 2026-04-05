@@ -129,16 +129,38 @@ pub async fn anthropic_messages(
         "Dispatching Anthropic-format request"
     );
 
+    // Forward the `anthropic-beta` header — the only user-controllable Anthropic
+    // header documented in the official API reference.  Merge any `betas` array
+    // from the request body with the header value into a single comma-separated
+    // string (the Anthropic SDK sometimes sends betas via the body field).
+    let beta_header_value: Option<String> = {
+        let mut betas: Vec<String> = Vec::new();
+        if let Some(v) = headers.get("anthropic-beta").and_then(|v| v.to_str().ok()) {
+            betas.push(v.to_string());
+        }
+        if let Some(arr) = raw.get("betas").and_then(|v| v.as_array()) {
+            for b in arr {
+                if let Some(s) = b.as_str() {
+                    betas.push(s.to_string());
+                }
+            }
+        }
+        if betas.is_empty() {
+            None
+        } else {
+            Some(betas.join(","))
+        }
+    };
+
     let mut internal_req = to_chat_completion_request(req);
 
     // Attach the original body so the Anthropic provider can forward it verbatim.
     internal_req.raw_anthropic_body = Some(raw);
 
-    // Forward the anthropic-beta header so the provider includes it upstream.
-    if let Some(beta) = headers.get("anthropic-beta").and_then(|v| v.to_str().ok()) {
+    if let Some(beta) = beta_header_value {
         internal_req
             .extra_headers
-            .insert("anthropic-beta".to_string(), beta.to_string());
+            .insert("anthropic-beta".to_string(), beta);
     }
 
     if is_streaming {
