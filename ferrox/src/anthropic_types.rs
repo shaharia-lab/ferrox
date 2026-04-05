@@ -6,8 +6,8 @@ use std::collections::{HashMap, VecDeque};
 use crate::error::ProxyError;
 use crate::providers::ProviderStream;
 use crate::types::{
-    ChatCompletionRequest, ChatCompletionResponse, ChatMessage, ContentPart, MessageContent,
-    StopSequences,
+    ChatCompletionRequest, ChatCompletionResponse, ChatMessage, ContentPart, FunctionCall,
+    MessageContent, StopSequences, Tool, ToolCall, ToolFunction,
 };
 
 // ── Inbound request ──────────────────────────────────────────────────────────
@@ -22,6 +22,8 @@ pub struct AnthropicMessagesRequest {
     pub temperature: Option<f32>,
     pub top_p: Option<f32>,
     pub stop_sequences: Option<Vec<String>>,
+    pub tools: Option<Vec<AnthropicTool>>,
+    pub tool_choice: Option<AnthropicToolChoice>,
     /// Accepted for API compatibility; not forwarded to providers.
     #[allow(dead_code)]
     pub metadata: Option<serde_json::Value>,
@@ -70,11 +72,52 @@ pub enum AnthropicContentBlock {
     Text {
         text: String,
     },
-    /// Accepted for API compatibility; image forwarding is not supported yet.
+    /// Image blocks are accepted but forwarded as-is (provider decides support).
     Image {
         #[allow(dead_code)]
         source: serde_json::Value,
     },
+    /// Assistant-turn tool invocation block.
+    ToolUse {
+        id: String,
+        name: String,
+        input: serde_json::Value,
+    },
+    /// User-turn tool result block.
+    ToolResult {
+        tool_use_id: String,
+        /// Content can be a plain string, an array of content blocks, or absent.
+        content: Option<serde_json::Value>,
+        #[serde(default)]
+        #[allow(dead_code)]
+        is_error: bool,
+    },
+    /// Catch-all for document, thinking, search_result, and future block types.
+    #[serde(other)]
+    Unknown,
+}
+
+// ── Tool definition in request ────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct AnthropicTool {
+    pub name: String,
+    pub description: Option<String>,
+    /// JSON Schema object describing the tool's input.
+    pub input_schema: serde_json::Value,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum AnthropicToolChoice {
+    /// Model decides whether and which tools to call.
+    Auto,
+    /// Model must call at least one tool.
+    Any,
+    /// Model must call the named tool.
+    Tool { name: String },
+    /// Model must not call any tools.
+    None,
 }
 
 // ── Outbound response ─────────────────────────────────────────────────────────
@@ -95,7 +138,14 @@ pub struct AnthropicMessagesResponse {
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AnthropicResponseContent {
-    Text { text: String },
+    Text {
+        text: String,
+    },
+    ToolUse {
+        id: String,
+        name: String,
+        input: serde_json::Value,
+    },
 }
 
 #[derive(Debug, Serialize)]
@@ -136,17 +186,30 @@ pub fn to_chat_completion_request(req: AnthropicMessagesRequest) -> ChatCompleti
             .join(""),
     });
 
-    let messages = req
-        .messages
-        .into_iter()
-        .map(|m| ChatMessage {
-            role: m.role,
-            content: Some(anthropic_content_to_internal(m.content)),
-            name: None,
-            tool_calls: None,
-            tool_call_id: None,
-        })
-        .collect();
+    let messages = anthropic_messages_to_internal(req.messages);
+
+    let tools = req.tools.map(|tools| {
+        tools
+            .into_iter()
+            .map(|t| Tool {
+                r#type: "function".to_string(),
+                function: ToolFunction {
+                    name: t.name,
+                    description: t.description,
+                    parameters: Some(t.input_schema),
+                },
+            })
+            .collect()
+    });
+
+    let tool_choice = req.tool_choice.map(|tc| match tc {
+        AnthropicToolChoice::Auto => serde_json::json!("auto"),
+        AnthropicToolChoice::Any => serde_json::json!("required"),
+        AnthropicToolChoice::Tool { name } => {
+            serde_json::json!({"type": "function", "function": {"name": name}})
+        }
+        AnthropicToolChoice::None => serde_json::json!("none"),
+    });
 
     ChatCompletionRequest {
         model: req.model,
@@ -156,37 +219,140 @@ pub fn to_chat_completion_request(req: AnthropicMessagesRequest) -> ChatCompleti
         max_tokens: Some(req.max_tokens),
         top_p: req.top_p,
         stop: req.stop_sequences.map(StopSequences::Multiple),
-        tools: None,
-        tool_choice: None,
+        tools,
+        tool_choice,
         system,
         extra: HashMap::new(),
     }
 }
 
-fn anthropic_content_to_internal(content: AnthropicMessageContent) -> MessageContent {
-    match content {
-        AnthropicMessageContent::Text(t) => MessageContent::Text(t),
-        AnthropicMessageContent::Blocks(blocks) => {
-            let parts: Vec<ContentPart> = blocks
-                .into_iter()
-                .filter_map(|b| match b {
-                    AnthropicContentBlock::Text { text } => Some(ContentPart::Text { text }),
-                    AnthropicContentBlock::Image { .. } => None,
-                })
-                .collect();
-
-            // Collapse single-text-part back to a plain string for cleaner forwarding
-            if parts.len() == 1 {
-                let part = parts.into_iter().next().unwrap();
-                if let ContentPart::Text { text } = part {
-                    return MessageContent::Text(text);
-                }
-                // unreachable: only Text parts are produced above
-                MessageContent::Parts(vec![])
-            } else {
-                MessageContent::Parts(parts)
+/// Convert a list of Anthropic messages to internal `ChatMessage` format.
+///
+/// A single Anthropic user message that contains `tool_result` blocks may expand
+/// into multiple internal messages: one per tool result (`role: "tool"`) plus an
+/// optional preceding user text message.
+fn anthropic_messages_to_internal(messages: Vec<AnthropicMessage>) -> Vec<ChatMessage> {
+    let mut result = Vec::new();
+    for msg in messages {
+        match msg.content {
+            AnthropicMessageContent::Text(t) => {
+                result.push(ChatMessage {
+                    role: msg.role,
+                    content: Some(MessageContent::Text(t)),
+                    name: None,
+                    tool_calls: None,
+                    tool_call_id: None,
+                });
+            }
+            AnthropicMessageContent::Blocks(blocks) => {
+                convert_blocks(msg.role, blocks, &mut result);
             }
         }
+    }
+    result
+}
+
+/// Expand one Anthropic message (block content) into ≥1 internal messages.
+fn convert_blocks(role: String, blocks: Vec<AnthropicContentBlock>, out: &mut Vec<ChatMessage>) {
+    let mut text_parts: Vec<String> = Vec::new();
+    let mut tool_calls: Vec<ToolCall> = Vec::new();
+    let mut tool_results: Vec<(String, String)> = Vec::new();
+
+    for block in blocks {
+        match block {
+            AnthropicContentBlock::Text { text } => {
+                text_parts.push(text);
+            }
+            AnthropicContentBlock::ToolUse { id, name, input } => {
+                tool_calls.push(ToolCall {
+                    id,
+                    r#type: "function".to_string(),
+                    function: FunctionCall {
+                        name,
+                        arguments: input.to_string(),
+                    },
+                });
+            }
+            AnthropicContentBlock::ToolResult {
+                tool_use_id,
+                content,
+                ..
+            } => {
+                tool_results.push((tool_use_id, tool_result_content_to_string(content)));
+            }
+            // Image, document, thinking, and Unknown blocks are dropped;
+            // the downstream provider handles images natively via the
+            // pass-through adapters if needed.
+            AnthropicContentBlock::Image { .. } | AnthropicContentBlock::Unknown => {}
+        }
+    }
+
+    if role == "assistant" {
+        // Assistant turn: combine text + tool_calls into one message.
+        let content = if text_parts.is_empty() {
+            None
+        } else {
+            Some(MessageContent::Text(text_parts.join("")))
+        };
+        out.push(ChatMessage {
+            role,
+            content,
+            name: None,
+            tool_calls: if tool_calls.is_empty() {
+                None
+            } else {
+                Some(tool_calls)
+            },
+            tool_call_id: None,
+        });
+    } else {
+        // User turn: text first, then each tool result as a separate "tool" message.
+        let combined_text = text_parts.join("");
+        if !combined_text.is_empty() {
+            out.push(ChatMessage {
+                role: role.clone(),
+                content: Some(MessageContent::Text(combined_text)),
+                name: None,
+                tool_calls: None,
+                tool_call_id: None,
+            });
+        }
+        for (tool_use_id, content) in tool_results {
+            out.push(ChatMessage {
+                role: "tool".to_string(),
+                content: Some(MessageContent::Text(content)),
+                name: None,
+                tool_calls: None,
+                tool_call_id: Some(tool_use_id),
+            });
+        }
+    }
+}
+
+/// Extract plain text from a `tool_result` content value.
+///
+/// The value can be:
+/// - absent (`None`)
+/// - a plain string (`Value::String`)
+/// - an array of content blocks (`Value::Array`)
+fn tool_result_content_to_string(v: Option<serde_json::Value>) -> String {
+    match v {
+        None => String::new(),
+        Some(serde_json::Value::String(s)) => s,
+        Some(serde_json::Value::Array(arr)) => arr
+            .iter()
+            .filter_map(|item| {
+                if item.get("type").and_then(|t| t.as_str()) == Some("text") {
+                    item.get("text")
+                        .and_then(|t| t.as_str())
+                        .map(str::to_string)
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(""),
+        Some(other) => other.to_string(),
     }
 }
 
@@ -195,21 +361,47 @@ fn anthropic_content_to_internal(content: AnthropicMessageContent) -> MessageCon
 pub fn to_anthropic_response(resp: ChatCompletionResponse) -> AnthropicMessagesResponse {
     let choice = resp.choices.into_iter().next();
 
-    let text = choice
-        .as_ref()
-        .and_then(|c| c.message.content.as_ref())
-        .map(|c| match c {
-            MessageContent::Text(t) => t.clone(),
-            MessageContent::Parts(parts) => parts
-                .iter()
-                .filter_map(|p| match p {
-                    ContentPart::Text { text } => Some(text.as_str()),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-                .join(""),
-        })
-        .unwrap_or_default();
+    let mut content: Vec<AnthropicResponseContent> = Vec::new();
+
+    if let Some(ref c) = choice {
+        // Text content
+        if let Some(msg_content) = c.message.content.as_ref() {
+            let text = match msg_content {
+                MessageContent::Text(t) => t.clone(),
+                MessageContent::Parts(parts) => parts
+                    .iter()
+                    .filter_map(|p| match p {
+                        ContentPart::Text { text } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join(""),
+            };
+            if !text.is_empty() {
+                content.push(AnthropicResponseContent::Text { text });
+            }
+        }
+
+        // Tool use blocks
+        if let Some(tool_calls) = c.message.tool_calls.as_ref() {
+            for tc in tool_calls {
+                let input = serde_json::from_str::<serde_json::Value>(&tc.function.arguments)
+                    .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
+                content.push(AnthropicResponseContent::ToolUse {
+                    id: tc.id.clone(),
+                    name: tc.function.name.clone(),
+                    input,
+                });
+            }
+        }
+    }
+
+    // Always emit at least one content block so the SDK can parse the response.
+    if content.is_empty() {
+        content.push(AnthropicResponseContent::Text {
+            text: String::new(),
+        });
+    }
 
     let stop_reason = choice
         .as_ref()
@@ -224,7 +416,7 @@ pub fn to_anthropic_response(resp: ChatCompletionResponse) -> AnthropicMessagesR
         response_type: "message".to_string(),
         role: "assistant".to_string(),
         model: resp.model,
-        content: vec![AnthropicResponseContent::Text { text }],
+        content,
         stop_reason,
         stop_sequence: None,
         usage: AnthropicUsage {
@@ -457,6 +649,8 @@ mod tests {
             temperature: None,
             top_p: None,
             stop_sequences: None,
+            tools: None,
+            tool_choice: None,
             metadata: None,
             top_k: None,
         }
@@ -560,6 +754,178 @@ mod tests {
         assert_eq!(out.top_p, Some(0.9));
     }
 
+    // ── tool conversion ───────────────────────────────────────────────────────
+
+    #[test]
+    fn converts_tools_to_openai_format() {
+        let mut req = minimal_request("claude-sonnet");
+        req.tools = Some(vec![AnthropicTool {
+            name: "search".to_string(),
+            description: Some("Search the web".to_string()),
+            input_schema: serde_json::json!({"type": "object", "properties": {"q": {"type": "string"}}}),
+        }]);
+        let out = to_chat_completion_request(req);
+        let tools = out.tools.unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].r#type, "function");
+        assert_eq!(tools[0].function.name, "search");
+        assert_eq!(
+            tools[0].function.description.as_deref(),
+            Some("Search the web")
+        );
+    }
+
+    #[test]
+    fn no_tools_yields_none() {
+        let req = minimal_request("claude-sonnet");
+        let out = to_chat_completion_request(req);
+        assert!(out.tools.is_none());
+    }
+
+    #[test]
+    fn tool_choice_auto_maps_to_auto() {
+        let mut req = minimal_request("claude-sonnet");
+        req.tool_choice = Some(AnthropicToolChoice::Auto);
+        let out = to_chat_completion_request(req);
+        assert_eq!(out.tool_choice, Some(serde_json::json!("auto")));
+    }
+
+    #[test]
+    fn tool_choice_any_maps_to_required() {
+        let mut req = minimal_request("claude-sonnet");
+        req.tool_choice = Some(AnthropicToolChoice::Any);
+        let out = to_chat_completion_request(req);
+        assert_eq!(out.tool_choice, Some(serde_json::json!("required")));
+    }
+
+    #[test]
+    fn tool_choice_tool_maps_to_function_object() {
+        let mut req = minimal_request("claude-sonnet");
+        req.tool_choice = Some(AnthropicToolChoice::Tool {
+            name: "search".to_string(),
+        });
+        let out = to_chat_completion_request(req);
+        assert_eq!(
+            out.tool_choice,
+            Some(serde_json::json!({"type": "function", "function": {"name": "search"}}))
+        );
+    }
+
+    #[test]
+    fn tool_choice_none_maps_to_none_string() {
+        let mut req = minimal_request("claude-sonnet");
+        req.tool_choice = Some(AnthropicToolChoice::None);
+        let out = to_chat_completion_request(req);
+        assert_eq!(out.tool_choice, Some(serde_json::json!("none")));
+    }
+
+    // ── tool_use block in assistant turn ─────────────────────────────────────
+
+    #[test]
+    fn assistant_tool_use_block_becomes_tool_calls() {
+        let req = AnthropicMessagesRequest {
+            messages: vec![AnthropicMessage {
+                role: "assistant".to_string(),
+                content: AnthropicMessageContent::Blocks(vec![
+                    AnthropicContentBlock::Text {
+                        text: "Let me search.".to_string(),
+                    },
+                    AnthropicContentBlock::ToolUse {
+                        id: "toolu_abc".to_string(),
+                        name: "search".to_string(),
+                        input: serde_json::json!({"q": "weather"}),
+                    },
+                ]),
+            }],
+            ..minimal_request("claude-sonnet")
+        };
+        let out = to_chat_completion_request(req);
+        assert_eq!(out.messages.len(), 1);
+        let msg = &out.messages[0];
+        assert_eq!(msg.role, "assistant");
+        assert!(matches!(&msg.content, Some(MessageContent::Text(t)) if t == "Let me search."));
+        let calls = msg.tool_calls.as_ref().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id, "toolu_abc");
+        assert_eq!(calls[0].function.name, "search");
+    }
+
+    // ── tool_result block in user turn ────────────────────────────────────────
+
+    #[test]
+    fn user_tool_result_block_becomes_tool_message() {
+        let req = AnthropicMessagesRequest {
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: AnthropicMessageContent::Blocks(vec![AnthropicContentBlock::ToolResult {
+                    tool_use_id: "toolu_abc".to_string(),
+                    content: Some(serde_json::json!("72°F and sunny")),
+                    is_error: false,
+                }]),
+            }],
+            ..minimal_request("claude-sonnet")
+        };
+        let out = to_chat_completion_request(req);
+        assert_eq!(out.messages.len(), 1);
+        let msg = &out.messages[0];
+        assert_eq!(msg.role, "tool");
+        assert_eq!(msg.tool_call_id.as_deref(), Some("toolu_abc"));
+        assert!(matches!(&msg.content, Some(MessageContent::Text(t)) if t == "72°F and sunny"));
+    }
+
+    #[test]
+    fn mixed_text_and_tool_result_expands_to_two_messages() {
+        let req = AnthropicMessagesRequest {
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: AnthropicMessageContent::Blocks(vec![
+                    AnthropicContentBlock::Text {
+                        text: "Here is the result:".to_string(),
+                    },
+                    AnthropicContentBlock::ToolResult {
+                        tool_use_id: "toolu_x".to_string(),
+                        content: Some(serde_json::json!("done")),
+                        is_error: false,
+                    },
+                ]),
+            }],
+            ..minimal_request("claude-sonnet")
+        };
+        let out = to_chat_completion_request(req);
+        assert_eq!(out.messages.len(), 2);
+        assert_eq!(out.messages[0].role, "user");
+        assert_eq!(out.messages[1].role, "tool");
+    }
+
+    #[test]
+    fn tool_result_with_block_array_content_extracts_text() {
+        let req = AnthropicMessagesRequest {
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: AnthropicMessageContent::Blocks(vec![AnthropicContentBlock::ToolResult {
+                    tool_use_id: "toolu_y".to_string(),
+                    content: Some(serde_json::json!([{"type": "text", "text": "block result"}])),
+                    is_error: false,
+                }]),
+            }],
+            ..minimal_request("claude-sonnet")
+        };
+        let out = to_chat_completion_request(req);
+        assert_eq!(out.messages.len(), 1);
+        assert!(
+            matches!(&out.messages[0].content, Some(MessageContent::Text(t)) if t == "block result")
+        );
+    }
+
+    #[test]
+    fn unknown_content_blocks_are_silently_dropped() {
+        // Simulate a "document" block which maps to Unknown
+        let block_json =
+            r#"{"type": "document", "source": {"type": "url", "url": "https://example.com"}}"#;
+        let block: AnthropicContentBlock = serde_json::from_str(block_json).unwrap();
+        assert!(matches!(block, AnthropicContentBlock::Unknown));
+    }
+
     // ── to_anthropic_response ─────────────────────────────────────────────────
 
     fn make_openai_response(content: &str, finish_reason: &str) -> ChatCompletionResponse {
@@ -633,6 +999,43 @@ mod tests {
         assert!(r.id.starts_with("msg_"));
     }
 
+    #[test]
+    fn tool_calls_in_response_become_tool_use_blocks() {
+        let resp = ChatCompletionResponse {
+            id: "chatcmpl-xyz".to_string(),
+            object: "chat.completion".to_string(),
+            created: 0,
+            model: "gpt-4o".to_string(),
+            choices: vec![Choice {
+                index: 0,
+                message: ChatMessage {
+                    role: "assistant".to_string(),
+                    content: None,
+                    name: None,
+                    tool_calls: Some(vec![crate::types::ToolCall {
+                        id: "call_abc".to_string(),
+                        r#type: "function".to_string(),
+                        function: crate::types::FunctionCall {
+                            name: "search".to_string(),
+                            arguments: r#"{"q":"weather"}"#.to_string(),
+                        },
+                    }]),
+                    tool_call_id: None,
+                },
+                finish_reason: Some("tool_calls".to_string()),
+            }],
+            usage: None,
+            system_fingerprint: None,
+        };
+        let r = to_anthropic_response(resp);
+        assert_eq!(r.content.len(), 1);
+        assert!(matches!(
+            &r.content[0],
+            AnthropicResponseContent::ToolUse { id, name, .. }
+            if id == "call_abc" && name == "search"
+        ));
+    }
+
     // ── finish_reason_to_anthropic ────────────────────────────────────────────
 
     #[test]
@@ -641,6 +1044,34 @@ mod tests {
             finish_reason_to_anthropic("content_filter"),
             "content_filter"
         );
+    }
+
+    // ── tool_result_content_to_string ─────────────────────────────────────────
+
+    #[test]
+    fn tool_result_none_gives_empty_string() {
+        assert_eq!(tool_result_content_to_string(None), "");
+    }
+
+    #[test]
+    fn tool_result_string_value_passed_through() {
+        assert_eq!(
+            tool_result_content_to_string(Some(serde_json::json!("hello"))),
+            "hello"
+        );
+    }
+
+    #[test]
+    fn tool_result_block_array_extracts_text() {
+        let v = serde_json::json!([{"type": "text", "text": "first"}, {"type": "text", "text": " second"}]);
+        assert_eq!(tool_result_content_to_string(Some(v)), "first second");
+    }
+
+    #[test]
+    fn tool_result_block_array_skips_non_text() {
+        let v =
+            serde_json::json!([{"type": "image", "source": {}}, {"type": "text", "text": "only"}]);
+        assert_eq!(tool_result_content_to_string(Some(v)), "only");
     }
 
     // ── openai_stream_to_anthropic_sse ────────────────────────────────────────

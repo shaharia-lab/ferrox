@@ -2,6 +2,7 @@ use std::time::Instant;
 
 use axum::{
     extract::{Extension, State},
+    http::StatusCode,
     response::{sse::KeepAlive, IntoResponse, Response, Sse},
     Json,
 };
@@ -19,6 +20,60 @@ use crate::telemetry::metrics::{
     self, ACTIVE_STREAMS, ERRORS_TOTAL, REQUESTS_TOTAL, REQUEST_DURATION_SECONDS,
 };
 use crate::types::RequestContext;
+
+// ── Anthropic-format error responses ─────────────────────────────────────────
+
+/// Map a `ProxyError` to an Anthropic API error response.
+///
+/// The Anthropic SDK expects errors in the format:
+/// ```json
+/// { "type": "error", "error": { "type": "<error_type>", "message": "..." } }
+/// ```
+fn proxy_error_to_anthropic_response(e: &ProxyError) -> Response {
+    let (status, error_type, message) = match e {
+        ProxyError::Unauthorized(msg) => (
+            StatusCode::UNAUTHORIZED,
+            "authentication_error",
+            msg.clone(),
+        ),
+        ProxyError::Forbidden(msg) => (StatusCode::FORBIDDEN, "permission_error", msg.clone()),
+        ProxyError::ModelNotFound(msg) => (StatusCode::NOT_FOUND, "not_found_error", msg.clone()),
+        ProxyError::RateLimited(msg) => (
+            StatusCode::TOO_MANY_REQUESTS,
+            "rate_limit_error",
+            msg.clone(),
+        ),
+        ProxyError::CircuitOpen(msg) => {
+            // 529 is Anthropic's "overloaded" status; use BAD_GATEWAY as the closest standard code.
+            (StatusCode::BAD_GATEWAY, "overloaded_error", msg.clone())
+        }
+        ProxyError::ProviderError {
+            status, message, ..
+        } => {
+            let http_status = StatusCode::from_u16(*status).unwrap_or(StatusCode::BAD_GATEWAY);
+            (http_status, "api_error", message.clone())
+        }
+        ProxyError::UpstreamTimeout(msg) => (StatusCode::GATEWAY_TIMEOUT, "api_error", msg.clone()),
+        ProxyError::StreamError(msg) => {
+            (StatusCode::INTERNAL_SERVER_ERROR, "api_error", msg.clone())
+        }
+        other => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "api_error",
+            other.to_string(),
+        ),
+    };
+
+    let body = serde_json::json!({
+        "type": "error",
+        "error": {
+            "type": error_type,
+            "message": message
+        }
+    });
+
+    (status, Json(body)).into_response()
+}
 
 pub async fn anthropic_messages(
     State(state): State<AppState>,
@@ -118,7 +173,7 @@ pub async fn anthropic_messages(
                 ERRORS_TOTAL
                     .with_label_values(&["", error_type_label(&e)])
                     .inc();
-                Err(e)
+                Ok(proxy_error_to_anthropic_response(&e))
             }
         }
     } else {
@@ -178,7 +233,7 @@ pub async fn anthropic_messages(
                 REQUEST_DURATION_SECONDS
                     .with_label_values(&["", &model_alias, &http_status_for_error(&e).to_string()])
                     .observe(latency);
-                Err(e)
+                Ok(proxy_error_to_anthropic_response(&e))
             }
         }
     }
