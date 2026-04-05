@@ -16,6 +16,10 @@ pub struct ChatCompletionRequest {
     pub tool_choice: Option<serde_json::Value>,
     /// Convenience field — system prompt (alternative to a system message)
     pub system: Option<String>,
+    /// Extra HTTP headers to forward to the upstream provider (e.g. `anthropic-beta`).
+    /// Never serialised — carried out-of-band through the pipeline.
+    #[serde(skip)]
+    pub extra_headers: HashMap<String, String>,
     /// Catch-all for unknown fields (pass-through)
     #[serde(flatten)]
     pub extra: HashMap<String, serde_json::Value>,
@@ -209,6 +213,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             system: None,
+            extra_headers: HashMap::new(),
             extra: HashMap::new(),
         }
     }

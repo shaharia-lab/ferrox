@@ -24,6 +24,10 @@ pub struct AnthropicMessagesRequest {
     pub stop_sequences: Option<Vec<String>>,
     pub tools: Option<Vec<AnthropicTool>>,
     pub tool_choice: Option<AnthropicToolChoice>,
+    /// Extended thinking configuration — forwarded to Anthropic provider.
+    pub thinking: Option<serde_json::Value>,
+    /// Beta feature strings (body alternative to `anthropic-beta` header) — forwarded.
+    pub betas: Option<Vec<String>>,
     /// Accepted for API compatibility; not forwarded to providers.
     #[allow(dead_code)]
     pub metadata: Option<serde_json::Value>,
@@ -211,6 +215,19 @@ pub fn to_chat_completion_request(req: AnthropicMessagesRequest) -> ChatCompleti
         AnthropicToolChoice::None => serde_json::json!("none"),
     });
 
+    // Carry Anthropic-specific body fields that have no OpenAI equivalent in the
+    // `extra` map using private keys; the Anthropic provider adapter reads them back.
+    let mut extra: HashMap<String, serde_json::Value> = HashMap::new();
+    if let Some(thinking) = req.thinking {
+        extra.insert("_anthropic_thinking".to_string(), thinking);
+    }
+    if let Some(betas) = req.betas {
+        extra.insert(
+            "_anthropic_betas".to_string(),
+            serde_json::Value::Array(betas.into_iter().map(serde_json::Value::String).collect()),
+        );
+    }
+
     ChatCompletionRequest {
         model: req.model,
         messages,
@@ -222,7 +239,8 @@ pub fn to_chat_completion_request(req: AnthropicMessagesRequest) -> ChatCompleti
         tools,
         tool_choice,
         system,
-        extra: HashMap::new(),
+        extra_headers: HashMap::new(),
+        extra,
     }
 }
 
@@ -713,6 +731,8 @@ mod tests {
             stop_sequences: None,
             tools: None,
             tool_choice: None,
+            thinking: None,
+            betas: None,
             metadata: None,
             top_k: None,
         }

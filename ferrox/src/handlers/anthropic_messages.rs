@@ -78,20 +78,26 @@ fn proxy_error_to_anthropic_response(e: &ProxyError) -> Response {
 pub async fn anthropic_messages(
     State(state): State<AppState>,
     Extension(ctx): Extension<RequestContext>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<AnthropicMessagesRequest>,
 ) -> Result<Response, ProxyError> {
     let start = Instant::now();
 
     if !is_model_allowed(&req.model, &ctx.allowed_models) {
-        return Err(ProxyError::Forbidden(format!(
-            "Key '{}' is not authorized to use model '{}'",
-            ctx.key_name, req.model
+        return Ok(proxy_error_to_anthropic_response(&ProxyError::Forbidden(
+            format!(
+                "Key '{}' is not authorized to use model '{}'",
+                ctx.key_name, req.model
+            ),
         )));
     }
 
     let is_streaming = req.is_streaming();
     let model_alias = req.model.clone();
-    let pool = state.router.resolve(&req.model)?;
+    let pool = match state.router.resolve(&req.model) {
+        Ok(p) => p,
+        Err(e) => return Ok(proxy_error_to_anthropic_response(&e)),
+    };
     let retry_config = &state.config.defaults.retry;
 
     tracing::info!(
@@ -102,7 +108,14 @@ pub async fn anthropic_messages(
         "Dispatching Anthropic-format request"
     );
 
-    let internal_req = to_chat_completion_request(req);
+    let mut internal_req = to_chat_completion_request(req);
+
+    // Forward Anthropic-specific headers so provider adapters can use them.
+    if let Some(beta) = headers.get("anthropic-beta").and_then(|v| v.to_str().ok()) {
+        internal_req
+            .extra_headers
+            .insert("anthropic-beta".to_string(), beta.to_string());
+    }
 
     if is_streaming {
         let msg_id = format!("msg_{}", Uuid::new_v4().simple());

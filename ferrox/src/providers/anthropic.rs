@@ -66,25 +66,26 @@ impl ProviderAdapter for AnthropicAdapter {
         req: &ChatCompletionRequest,
         model_id: &str,
     ) -> Result<ChatCompletionResponse, ProxyError> {
-        let body = build_request_body(req, model_id, false);
+        let extras = extract_anthropic_extras(req);
+        let body = build_request_body(req, model_id, false, &extras);
         let url = format!("{}/v1/messages", self.base_url);
 
-        let resp = self
+        let mut builder = self
             .client
             .post(&url)
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", ANTHROPIC_VERSION)
-            .header("content-type", "application/json")
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| {
-                if e.is_timeout() {
-                    ProxyError::UpstreamTimeout(e.to_string())
-                } else {
-                    ProxyError::HttpClientError(e)
-                }
-            })?;
+            .header("content-type", "application/json");
+        if let Some(beta) = &extras.beta_header {
+            builder = builder.header("anthropic-beta", beta.as_str());
+        }
+        let resp = builder.json(&body).send().await.map_err(|e| {
+            if e.is_timeout() {
+                ProxyError::UpstreamTimeout(e.to_string())
+            } else {
+                ProxyError::HttpClientError(e)
+            }
+        })?;
 
         let status = resp.status().as_u16();
         if status >= 400 {
@@ -106,25 +107,26 @@ impl ProviderAdapter for AnthropicAdapter {
         req: &ChatCompletionRequest,
         model_id: &str,
     ) -> Result<ProviderStream, ProxyError> {
-        let body = build_request_body(req, model_id, true);
+        let extras = extract_anthropic_extras(req);
+        let body = build_request_body(req, model_id, true, &extras);
         let url = format!("{}/v1/messages", self.base_url);
 
-        let resp = self
+        let mut builder = self
             .client
             .post(&url)
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", ANTHROPIC_VERSION)
-            .header("content-type", "application/json")
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| {
-                if e.is_timeout() {
-                    ProxyError::UpstreamTimeout(e.to_string())
-                } else {
-                    ProxyError::HttpClientError(e)
-                }
-            })?;
+            .header("content-type", "application/json");
+        if let Some(beta) = &extras.beta_header {
+            builder = builder.header("anthropic-beta", beta.as_str());
+        }
+        let resp = builder.json(&body).send().await.map_err(|e| {
+            if e.is_timeout() {
+                ProxyError::UpstreamTimeout(e.to_string())
+            } else {
+                ProxyError::HttpClientError(e)
+            }
+        })?;
 
         let status = resp.status().as_u16();
         if status >= 400 {
@@ -167,6 +169,17 @@ struct AnthropicRequest {
     tools: Option<Vec<AnthropicTool>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_choice: Option<Value>,
+    /// Extended thinking configuration (Anthropic-native only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking: Option<Value>,
+}
+
+/// Anthropic-specific extras extracted from `ChatCompletionRequest`.
+struct AnthropicExtras {
+    /// Value of the `anthropic-beta` header to forward (may be empty).
+    beta_header: Option<String>,
+    /// Extended thinking config from `_anthropic_thinking` extra key.
+    thinking: Option<Value>,
 }
 
 #[derive(Serialize, Clone)]
@@ -217,10 +230,45 @@ struct AnthropicTool {
     input_schema: Value,
 }
 
+/// Extract Anthropic-specific extras that were injected into `ChatCompletionRequest`
+/// by the Anthropic-native handler.
+fn extract_anthropic_extras(req: &ChatCompletionRequest) -> AnthropicExtras {
+    // Merge beta strings from two sources:
+    // 1. `anthropic-beta` header forwarded via `extra_headers`
+    // 2. `_anthropic_betas` body field forwarded via `extra`
+    let mut betas: Vec<String> = Vec::new();
+
+    if let Some(h) = req.extra_headers.get("anthropic-beta") {
+        // Header may already contain comma-separated values — keep as-is.
+        betas.push(h.clone());
+    }
+    if let Some(Value::Array(arr)) = req.extra.get("_anthropic_betas") {
+        for v in arr {
+            if let Some(s) = v.as_str() {
+                betas.push(s.to_string());
+            }
+        }
+    }
+
+    let beta_header = if betas.is_empty() {
+        None
+    } else {
+        Some(betas.join(","))
+    };
+
+    let thinking = req.extra.get("_anthropic_thinking").cloned();
+
+    AnthropicExtras {
+        beta_header,
+        thinking,
+    }
+}
+
 fn build_request_body(
     req: &ChatCompletionRequest,
     model_id: &str,
     stream: bool,
+    extras: &AnthropicExtras,
 ) -> AnthropicRequest {
     let system = req.system_message();
 
@@ -266,6 +314,7 @@ fn build_request_body(
             .tool_choice
             .as_ref()
             .map(openai_tool_choice_to_anthropic),
+        thinking: extras.thinking.clone(),
     }
 }
 
