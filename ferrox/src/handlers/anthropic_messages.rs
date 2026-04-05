@@ -1,6 +1,7 @@
 use std::time::Instant;
 
 use axum::{
+    body::Bytes,
     extract::{Extension, State},
     http::StatusCode,
     response::{sse::KeepAlive, IntoResponse, Response, Sse},
@@ -79,9 +80,29 @@ pub async fn anthropic_messages(
     State(state): State<AppState>,
     Extension(ctx): Extension<RequestContext>,
     headers: axum::http::HeaderMap,
-    Json(req): Json<AnthropicMessagesRequest>,
+    body: Bytes,
 ) -> Result<Response, ProxyError> {
     let start = Instant::now();
+
+    // Parse the raw body once, keeping the original JSON value so provider
+    // adapters can forward it verbatim (preserving every Anthropic-specific
+    // field the client sent).
+    let raw: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => {
+            return Ok(proxy_error_to_anthropic_response(
+                &ProxyError::SerializationError(e),
+            ));
+        }
+    };
+    let req: AnthropicMessagesRequest = match serde_json::from_value(raw.clone()) {
+        Ok(r) => r,
+        Err(e) => {
+            return Ok(proxy_error_to_anthropic_response(
+                &ProxyError::SerializationError(e),
+            ));
+        }
+    };
 
     if !is_model_allowed(&req.model, &ctx.allowed_models) {
         return Ok(proxy_error_to_anthropic_response(&ProxyError::Forbidden(
@@ -110,7 +131,10 @@ pub async fn anthropic_messages(
 
     let mut internal_req = to_chat_completion_request(req);
 
-    // Forward Anthropic-specific headers so provider adapters can use them.
+    // Attach the original body so the Anthropic provider can forward it verbatim.
+    internal_req.raw_anthropic_body = Some(raw);
+
+    // Forward the anthropic-beta header so the provider includes it upstream.
     if let Some(beta) = headers.get("anthropic-beta").and_then(|v| v.to_str().ok()) {
         internal_req
             .extra_headers

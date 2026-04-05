@@ -240,6 +240,7 @@ pub fn to_chat_completion_request(req: AnthropicMessagesRequest) -> ChatCompleti
         tool_choice,
         system,
         extra_headers: HashMap::new(),
+        raw_anthropic_body: None,
         extra,
     }
 }

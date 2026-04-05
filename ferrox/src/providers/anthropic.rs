@@ -67,7 +67,7 @@ impl ProviderAdapter for AnthropicAdapter {
         model_id: &str,
     ) -> Result<ChatCompletionResponse, ProxyError> {
         let extras = extract_anthropic_extras(req);
-        let body = build_request_body(req, model_id, false, &extras);
+        let body = prepare_body(req, model_id, false, &extras);
         let url = format!("{}/v1/messages", self.base_url);
 
         let mut builder = self
@@ -108,7 +108,7 @@ impl ProviderAdapter for AnthropicAdapter {
         model_id: &str,
     ) -> Result<ProviderStream, ProxyError> {
         let extras = extract_anthropic_extras(req);
-        let body = build_request_body(req, model_id, true, &extras);
+        let body = prepare_body(req, model_id, true, &extras);
         let url = format!("{}/v1/messages", self.base_url);
 
         let mut builder = self
@@ -262,6 +262,45 @@ fn extract_anthropic_extras(req: &ChatCompletionRequest) -> AnthropicExtras {
         beta_header,
         thinking,
     }
+}
+
+/// Return the body to send to the Anthropic API.
+///
+/// If the request originated from the Anthropic-native endpoint
+/// (`raw_anthropic_body` is set), forward it verbatim — only `model` and
+/// `stream` are overridden so the gateway's alias resolution and streaming
+/// decision are respected.  This preserves every field the client sent:
+/// `cache_control`, `thinking`, `service_tier`, `output_config`, tool
+/// attributes (`eager_input_streaming`, `strict`, `defer_loading`), etc.
+///
+/// Otherwise (request came through the OpenAI-compatible endpoint and was
+/// routed to the Anthropic provider) fall back to the field-by-field
+/// conversion.
+fn prepare_body(
+    req: &ChatCompletionRequest,
+    model_id: &str,
+    stream: bool,
+    extras: &AnthropicExtras,
+) -> serde_json::Value {
+    if let Some(raw) = &req.raw_anthropic_body {
+        let mut body = raw.clone();
+        if let Some(obj) = body.as_object_mut() {
+            // Override model alias with the resolved provider model ID.
+            obj.insert("model".to_string(), serde_json::json!(model_id));
+            // Set stream flag from the gateway's decision (not the client's raw value).
+            if stream {
+                obj.insert("stream".to_string(), serde_json::json!(true));
+            } else {
+                obj.remove("stream");
+            }
+            // Remove internal-only keys that were injected for pipeline carry-through.
+            obj.remove("betas"); // forwarded as header, not body
+        }
+        return body;
+    }
+
+    // Fallback: convert from internal OpenAI format.
+    serde_json::to_value(build_request_body(req, model_id, stream, extras)).unwrap_or_default()
 }
 
 fn build_request_body(
