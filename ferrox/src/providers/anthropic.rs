@@ -262,7 +262,36 @@ fn build_request_body(
         top_p: req.top_p,
         stop_sequences,
         tools,
-        tool_choice: req.tool_choice.clone(),
+        tool_choice: req
+            .tool_choice
+            .as_ref()
+            .map(openai_tool_choice_to_anthropic),
+    }
+}
+
+/// Convert an OpenAI-format `tool_choice` value to the Anthropic format.
+///
+/// OpenAI strings: `"auto"` → `{"type":"auto"}`, `"required"` → `{"type":"any"}`,
+/// `"none"` → `{"type":"none"}`.
+/// OpenAI object: `{"type":"function","function":{"name":"foo"}}` → `{"type":"tool","name":"foo"}`.
+fn openai_tool_choice_to_anthropic(tc: &Value) -> Value {
+    match tc {
+        Value::String(s) => match s.as_str() {
+            "auto" => serde_json::json!({"type": "auto"}),
+            "required" => serde_json::json!({"type": "any"}),
+            "none" => serde_json::json!({"type": "none"}),
+            other => serde_json::json!({"type": other}),
+        },
+        Value::Object(_) => {
+            // OpenAI: {"type": "function", "function": {"name": "foo"}}
+            // Anthropic: {"type": "tool", "name": "foo"}
+            if let Some(name) = tc.pointer("/function/name").and_then(|v| v.as_str()) {
+                serde_json::json!({"type": "tool", "name": name})
+            } else {
+                tc.clone()
+            }
+        }
+        other => other.clone(),
     }
 }
 
@@ -273,16 +302,39 @@ fn convert_message(msg: &ChatMessage) -> AnthropicMessage {
     };
 
     let content = if let Some(tool_calls) = &msg.tool_calls {
-        // Assistant message with tool calls
-        let parts: Vec<AnthropicPart> = tool_calls
-            .iter()
-            .map(|tc| AnthropicPart::ToolUse {
+        // Assistant message with tool calls — include any text content first,
+        // then one ToolUse block per tool call.
+        let mut parts: Vec<AnthropicPart> = Vec::new();
+
+        // Prepend text content if present
+        if let Some(msg_content) = &msg.content {
+            let text = match msg_content {
+                MessageContent::Text(t) => t.clone(),
+                MessageContent::Parts(ps) => ps
+                    .iter()
+                    .filter_map(|p| {
+                        if let ContentPart::Text { text } = p {
+                            Some(text.as_str())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(""),
+            };
+            if !text.is_empty() {
+                parts.push(AnthropicPart::Text { text });
+            }
+        }
+
+        for tc in tool_calls {
+            parts.push(AnthropicPart::ToolUse {
                 id: tc.id.clone(),
                 name: tc.function.name.clone(),
                 input: serde_json::from_str(&tc.function.arguments)
                     .unwrap_or(serde_json::json!({})),
-            })
-            .collect();
+            });
+        }
         AnthropicContent::Parts(parts)
     } else if let Some(tool_call_id) = &msg.tool_call_id {
         // Tool result message

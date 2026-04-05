@@ -450,6 +450,10 @@ struct StreamState {
     output_tokens: u32,
     stop_reason: String,
     stream_done: bool,
+    /// Whether the text content_block (index 0) has already been closed.
+    text_block_closed: bool,
+    /// Running count of content blocks emitted so far (used as the next index).
+    next_block_index: u32,
 }
 
 /// Wraps a `ProviderStream` (OpenAI chunk format) and re-emits events in the
@@ -473,6 +477,8 @@ pub fn openai_stream_to_anthropic_sse(
         output_tokens: 0,
         stop_reason: "end_turn".to_string(),
         stream_done: false,
+        text_block_closed: false,
+        next_block_index: 0,
     };
 
     futures::stream::unfold(state, |mut s| async move {
@@ -494,10 +500,15 @@ pub fn openai_stream_to_anthropic_sse(
                         s.is_first = false;
                         s.pending
                             .push_back(Ok(make_message_start_event(&s.msg_id, &s.model, 0)));
-                        s.pending.push_back(Ok(make_content_block_start_event()));
+                        s.pending.push_back(Ok(make_content_block_start_event(0)));
                         s.pending.push_back(Ok(make_ping_event()));
+                        s.next_block_index = 1;
                     }
-                    s.pending.push_back(Ok(make_content_block_stop_event()));
+                    // Close the text block if it hasn't been closed yet
+                    if !s.text_block_closed {
+                        s.text_block_closed = true;
+                        s.pending.push_back(Ok(make_content_block_stop_event(0)));
+                    }
                     s.pending.push_back(Ok(make_message_delta_event(
                         &s.stop_reason,
                         s.output_tokens,
@@ -523,6 +534,12 @@ pub fn openai_stream_to_anthropic_sse(
                         .and_then(|c| c.delta.content.clone())
                         .unwrap_or_default();
 
+                    let tool_calls = chunk
+                        .choices
+                        .first()
+                        .and_then(|c| c.delta.tool_calls.clone())
+                        .unwrap_or_default();
+
                     if s.is_first {
                         s.is_first = false;
                         let input_tokens =
@@ -532,13 +549,36 @@ pub fn openai_stream_to_anthropic_sse(
                             &s.model,
                             input_tokens,
                         )));
-                        s.pending.push_back(Ok(make_content_block_start_event()));
+                        s.pending.push_back(Ok(make_content_block_start_event(0)));
                         s.pending.push_back(Ok(make_ping_event()));
+                        s.next_block_index = 1;
                     }
 
                     if !text.is_empty() {
                         s.pending
-                            .push_back(Ok(make_content_block_delta_event(&text)));
+                            .push_back(Ok(make_content_block_delta_event(0, &text)));
+                    }
+
+                    // Emit tool_use blocks for each tool call
+                    for tc in &tool_calls {
+                        // Close the text block before starting tool_use blocks
+                        if !s.text_block_closed {
+                            s.text_block_closed = true;
+                            s.pending.push_back(Ok(make_content_block_stop_event(0)));
+                        }
+                        let block_index = s.next_block_index;
+                        s.next_block_index += 1;
+                        s.pending.push_back(Ok(make_tool_use_block_start_event(
+                            block_index,
+                            &tc.id,
+                            &tc.function.name,
+                        )));
+                        s.pending.push_back(Ok(make_input_json_delta_event(
+                            block_index,
+                            &tc.function.arguments,
+                        )));
+                        s.pending
+                            .push_back(Ok(make_content_block_stop_event(block_index)));
                     }
                     // Loop back to drain pending or fetch the next chunk
                 }
@@ -571,14 +611,36 @@ fn make_message_start_event(msg_id: &str, model: &str, input_tokens: u32) -> Eve
         .data(data.to_string())
 }
 
-fn make_content_block_start_event() -> Event {
+fn make_content_block_start_event(index: u32) -> Event {
     let data = serde_json::json!({
         "type": "content_block_start",
-        "index": 0,
+        "index": index,
         "content_block": {"type": "text", "text": ""}
     });
     Event::default()
         .event("content_block_start")
+        .data(data.to_string())
+}
+
+fn make_tool_use_block_start_event(index: u32, id: &str, name: &str) -> Event {
+    let data = serde_json::json!({
+        "type": "content_block_start",
+        "index": index,
+        "content_block": {"type": "tool_use", "id": id, "name": name, "input": {}}
+    });
+    Event::default()
+        .event("content_block_start")
+        .data(data.to_string())
+}
+
+fn make_input_json_delta_event(index: u32, partial_json: &str) -> Event {
+    let data = serde_json::json!({
+        "type": "content_block_delta",
+        "index": index,
+        "delta": {"type": "input_json_delta", "partial_json": partial_json}
+    });
+    Event::default()
+        .event("content_block_delta")
         .data(data.to_string())
 }
 
@@ -588,10 +650,10 @@ fn make_ping_event() -> Event {
         .data(serde_json::json!({"type": "ping"}).to_string())
 }
 
-fn make_content_block_delta_event(text: &str) -> Event {
+fn make_content_block_delta_event(index: u32, text: &str) -> Event {
     let data = serde_json::json!({
         "type": "content_block_delta",
-        "index": 0,
+        "index": index,
         "delta": {"type": "text_delta", "text": text}
     });
     Event::default()
@@ -599,10 +661,10 @@ fn make_content_block_delta_event(text: &str) -> Event {
         .data(data.to_string())
 }
 
-fn make_content_block_stop_event() -> Event {
+fn make_content_block_stop_event(index: u32) -> Event {
     Event::default()
         .event("content_block_stop")
-        .data(serde_json::json!({"type": "content_block_stop", "index": 0}).to_string())
+        .data(serde_json::json!({"type": "content_block_stop", "index": index}).to_string())
 }
 
 fn make_message_delta_event(stop_reason: &str, output_tokens: u32) -> Event {
