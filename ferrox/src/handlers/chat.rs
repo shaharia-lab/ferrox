@@ -218,7 +218,7 @@ fn error_type_label(e: &ProxyError) -> &'static str {
 // ── Non-streaming dispatch ────────────────────────────────────────────────────
 
 /// Returns `(response, provider_name, model_id)` on success.
-async fn dispatch_non_stream(
+pub(crate) async fn dispatch_non_stream(
     pool: &RoutePool,
     req: &ChatCompletionRequest,
     retry_config: &RetryConfig,
@@ -299,7 +299,7 @@ async fn try_non_stream(
 // ── Streaming dispatch ────────────────────────────────────────────────────────
 
 /// Returns `(stream, provider_name, model_id)` on success.
-async fn dispatch_stream(
+pub(crate) async fn dispatch_stream(
     pool: &RoutePool,
     req: &ChatCompletionRequest,
     retry_config: &RetryConfig,

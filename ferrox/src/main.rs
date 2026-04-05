@@ -1,3 +1,4 @@
+mod anthropic_types;
 mod auth;
 mod config;
 mod error;

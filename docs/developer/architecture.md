@@ -6,18 +6,21 @@ Ferrox is a stateless HTTP proxy. Every request is self-contained; no session st
 
 ```mermaid
 flowchart TD
-    Client -->|POST /v1/chat/completions| Axum
+    OAI[OpenAI SDK / Codex CLI]  -->|POST /v1/chat/completions\nAuthorization: Bearer| Axum
+    ANT[Anthropic SDK / Claude Code CLI] -->|POST /anthropic/v1/messages\nx-api-key| Axum
 
     subgraph Ferrox["Ferrox (single binary)"]
         Axum[axum HTTP server]
-        Auth[auth middleware\nBearer token — static key or JWT]
+        Auth[auth middleware\nBearer token or x-api-key — static key or JWT]
+        Translate[format translation\nAnthropic ↔ internal OpenAI format]
         Router[ModelRouter\nalias -> RoutePool]
         Dispatch[dispatch\nprimary targets + fallback chain]
         CB[CircuitBreaker\nper provider+model]
         Retry[execute_with_retry\nexponential backoff + jitter]
 
         Axum --> Auth
-        Auth --> Router
+        Auth --> Translate
+        Translate --> Router
         Router --> Dispatch
         Dispatch --> CB
         CB --> Retry

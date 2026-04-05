@@ -209,6 +209,17 @@ async fn validate_jwt(token: &str, state: &AppState) -> Result<AuthOutcome, Prox
 // ── Token extraction ──────────────────────────────────────────────────────────
 
 fn extract_bearer_token(req: &Request) -> Result<String, ProxyError> {
+    // Accept `x-api-key` first (Anthropic SDK style).
+    if let Some(header) = req.headers().get("x-api-key") {
+        let token = header
+            .to_str()
+            .map_err(|_| ProxyError::Unauthorized("Invalid x-api-key encoding".to_string()))?;
+        if !token.is_empty() {
+            return Ok(token.to_string());
+        }
+    }
+
+    // Fall back to `Authorization: Bearer <token>` (OpenAI SDK style).
     let header = req
         .headers()
         .get("Authorization")
@@ -242,6 +253,56 @@ mod tests {
         }
         builder.body(Body::empty()).unwrap()
     }
+
+    fn build_request_with_api_key(api_key: Option<&str>) -> HttpRequest<Body> {
+        let mut builder = HttpRequest::builder().uri("/");
+        if let Some(value) = api_key {
+            builder = builder.header("x-api-key", value);
+        }
+        builder.body(Body::empty()).unwrap()
+    }
+
+    // ── x-api-key header ──────────────────────────────────────────────────────
+
+    #[test]
+    fn x_api_key_header_is_accepted() {
+        let req = build_request_with_api_key(Some("sk-ant-my-key"));
+        let token = extract_bearer_token(&req).unwrap();
+        assert_eq!(token, "sk-ant-my-key");
+    }
+
+    #[test]
+    fn x_api_key_takes_precedence_over_authorization() {
+        let req = HttpRequest::builder()
+            .uri("/")
+            .header("x-api-key", "key-from-x-api-key")
+            .header("Authorization", "Bearer key-from-bearer")
+            .body(Body::empty())
+            .unwrap();
+        let token = extract_bearer_token(&req).unwrap();
+        assert_eq!(token, "key-from-x-api-key");
+    }
+
+    #[test]
+    fn empty_x_api_key_falls_through_to_authorization() {
+        let req = HttpRequest::builder()
+            .uri("/")
+            .header("x-api-key", "")
+            .header("Authorization", "Bearer fallback-key")
+            .body(Body::empty())
+            .unwrap();
+        let token = extract_bearer_token(&req).unwrap();
+        assert_eq!(token, "fallback-key");
+    }
+
+    #[test]
+    fn missing_both_headers_returns_unauthorized() {
+        let req = build_request_with_api_key(None);
+        let err = extract_bearer_token(&req).unwrap_err();
+        assert!(matches!(err, ProxyError::Unauthorized(_)));
+    }
+
+    // ── Authorization: Bearer header ──────────────────────────────────────────
 
     #[test]
     fn missing_auth_header_returns_unauthorized() {

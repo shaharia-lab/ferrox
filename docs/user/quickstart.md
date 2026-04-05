@@ -258,6 +258,24 @@ curl http://localhost:8080/v1/chat/completions \
   -d '{"model":"claude-sonnet","messages":[{"role":"user","content":"Hello"}]}'
 ```
 
+## Use with Claude Code CLI
+
+Claude Code CLI uses the Anthropic SDK, which sends requests to `/v1/messages`. Point it at Ferrox's Anthropic-native endpoint and it will route to **any model alias configured in your gateway** — not just Anthropic models.
+
+```bash
+export ANTHROPIC_BASE_URL=http://localhost:8080/anthropic
+export ANTHROPIC_API_KEY=sk-local-dev   # your Ferrox virtual key
+
+claude                              # uses default model alias
+claude --model gpt-4o               # routes to OpenAI via Ferrox
+claude --model gemini-flash         # routes to Gemini via Ferrox
+claude --model claude-sonnet        # routes to Anthropic via Ferrox
+```
+
+The `ANTHROPIC_BASE_URL` must end at the `/anthropic` prefix — the SDK appends `/v1/messages` automatically.
+
+> **Note:** The same virtual key used for `/v1/chat/completions` works here. The `x-api-key` header sent by the Anthropic SDK is accepted alongside the standard `Authorization: Bearer` header.
+
 ## Next steps
 
 - [Configuration reference](configuration.md) — all config options
