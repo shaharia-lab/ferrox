@@ -51,6 +51,14 @@ jobs:
       - name: Install protobuf compiler (macOS)
         if: runner.os == 'macOS'
         run: brew install protobuf
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: ferrox-cp/ui/package-lock.json
+      - name: Build admin UI
+        run: cd ferrox-cp/ui && npm ci && npm run build
       - name: Upload ferrox binary
         uses: taiki-e/upload-rust-binary-action@v1
         with:
