@@ -469,7 +469,11 @@ struct StreamState {
     output_tokens: u32,
     stop_reason: String,
     stream_done: bool,
-    /// Whether the text content_block (index 0) has already been closed.
+    /// Whether the text content_block (index 0) has been opened.
+    /// We defer opening it until actual text arrives so tool-only responses
+    /// never produce an empty `{"type":"text","text":""}` block.
+    text_block_started: bool,
+    /// Whether the text content_block (index 0) has been closed.
     text_block_closed: bool,
     /// Running count of content blocks emitted so far (used as the next index).
     next_block_index: u32,
@@ -496,6 +500,7 @@ pub fn openai_stream_to_anthropic_sse(
         output_tokens: 0,
         stop_reason: "end_turn".to_string(),
         stream_done: false,
+        text_block_started: false,
         text_block_closed: false,
         next_block_index: 0,
     };
@@ -515,16 +520,14 @@ pub fn openai_stream_to_anthropic_sse(
                 None => {
                     s.stream_done = true;
                     if s.is_first {
-                        // Empty upstream — still emit a valid Anthropic sequence
+                        // Empty upstream — emit a minimal valid Anthropic sequence
                         s.is_first = false;
                         s.pending
                             .push_back(Ok(make_message_start_event(&s.msg_id, &s.model, 0)));
-                        s.pending.push_back(Ok(make_content_block_start_event(0)));
                         s.pending.push_back(Ok(make_ping_event()));
-                        s.next_block_index = 1;
                     }
-                    // Close the text block if it hasn't been closed yet
-                    if !s.text_block_closed {
+                    // Close the text block only if it was actually opened
+                    if s.text_block_started && !s.text_block_closed {
                         s.text_block_closed = true;
                         s.pending.push_back(Ok(make_content_block_stop_event(0)));
                     }
@@ -568,20 +571,27 @@ pub fn openai_stream_to_anthropic_sse(
                             &s.model,
                             input_tokens,
                         )));
-                        s.pending.push_back(Ok(make_content_block_start_event(0)));
                         s.pending.push_back(Ok(make_ping_event()));
-                        s.next_block_index = 1;
+                        // Do NOT open the text block here; defer until text actually arrives
+                        // so tool-only responses never produce an empty text block.
                     }
 
                     if !text.is_empty() {
+                        // Open the text block on first actual text content.
+                        if !s.text_block_started {
+                            s.text_block_started = true;
+                            s.pending.push_back(Ok(make_content_block_start_event(0)));
+                            s.next_block_index = 1;
+                        }
                         s.pending
                             .push_back(Ok(make_content_block_delta_event(0, &text)));
                     }
 
                     // Emit tool_use blocks for each tool call
                     for tc in &tool_calls {
-                        // Close the text block before starting tool_use blocks
-                        if !s.text_block_closed {
+                        // Close the text block before starting tool_use blocks,
+                        // but only if it was actually opened.
+                        if s.text_block_started && !s.text_block_closed {
                             s.text_block_closed = true;
                             s.pending.push_back(Ok(make_content_block_stop_event(0)));
                         }
@@ -1181,6 +1191,70 @@ mod tests {
         }
     }
 
+    fn make_tool_call_chunk(
+        id: &str,
+        name: &str,
+        args: &str,
+        finish_reason: Option<&str>,
+    ) -> ChatCompletionChunk {
+        ChatCompletionChunk {
+            id: "chatcmpl-1".to_string(),
+            object: "chat.completion.chunk".to_string(),
+            created: 0,
+            model: "gpt-4o".to_string(),
+            choices: vec![ChunkChoice {
+                index: 0,
+                delta: ChunkDelta {
+                    role: None,
+                    content: None,
+                    tool_calls: Some(vec![crate::types::ToolCall {
+                        id: id.to_string(),
+                        r#type: "function".to_string(),
+                        function: crate::types::FunctionCall {
+                            name: name.to_string(),
+                            arguments: args.to_string(),
+                        },
+                    }]),
+                },
+                finish_reason: finish_reason.map(str::to_string),
+            }],
+            usage: None,
+        }
+    }
+
+    /// Tool-only stream must NOT produce an empty text block.
+    /// If it did, Anthropic would reject the next request with
+    /// "messages: text content blocks must be non-empty".
+    #[tokio::test]
+    async fn tool_only_stream_emits_no_empty_text_block() {
+        let chunks: Vec<Result<ChatCompletionChunk, ProxyError>> = vec![Ok(make_tool_call_chunk(
+            "call_abc",
+            "bash",
+            r#"{"cmd":"ls"}"#,
+            Some("tool_calls"),
+        ))];
+        let inner: ProviderStream = Box::pin(futures::stream::iter(chunks));
+        let events: Vec<_> =
+            openai_stream_to_anthropic_sse("m".to_string(), "msg_tool".to_string(), inner)
+                .collect()
+                .await;
+
+        assert!(events.iter().all(|e| e.is_ok()));
+
+        // Verify no content_block_start with type "text" appears
+        for ev in &events {
+            if let Ok(sse) = ev {
+                let data = format!("{:?}", sse);
+                if data.contains("content_block_start") {
+                    assert!(
+                        !data.contains(r#""type":"text""#),
+                        "tool-only response must not emit a text content block: {data}"
+                    );
+                }
+            }
+        }
+    }
+
     #[tokio::test]
     async fn stream_emits_correct_event_sequence() {
         let chunks: Vec<Result<ChatCompletionChunk, ProxyError>> = vec![
@@ -1216,9 +1290,9 @@ mod tests {
                 .collect()
                 .await;
 
-        // message_start, content_block_start, ping, content_block_stop,
-        // message_delta, message_stop = 6 events
-        assert_eq!(events.len(), 6);
+        // message_start, ping, message_delta, message_stop = 4 events
+        // No text block emitted — empty response has no content blocks.
+        assert_eq!(events.len(), 4);
         assert!(events.iter().all(|e| e.is_ok()));
     }
 
