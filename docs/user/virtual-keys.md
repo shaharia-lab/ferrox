@@ -149,20 +149,26 @@ Ferrox reads the following optional custom claims from the JWT payload to contro
   "iss": "https://your-okta-domain.okta.com/oauth2/default",
   "sub": "service-account-123",
   "ferrox/tenant_id": "team-backend",
+  "ferrox/client_id": "550e8400-e29b-41d4-a716-446655440000",
   "ferrox/allowed_models": ["claude-sonnet", "gpt-4o"],
   "ferrox/rate_limit": {
     "requests_per_minute": 120,
     "burst": 20
-  }
+  },
+  "ferrox/token_budget": 500000,
+  "ferrox/budget_period": "monthly"
 }
 ```
 
 | Claim | Type | Default if absent |
 |---|---|---|
 | `ferrox/tenant_id` | string | Uses `sub` as bucket key |
+| `ferrox/client_id` | string (UUID) | None — usage not attributed to a CP client |
 | `ferrox/allowed_models` | list or `["*"]` | All aliases allowed |
 | `ferrox/rate_limit.requests_per_minute` | integer | No rate limit |
 | `ferrox/rate_limit.burst` | integer | No rate limit |
+| `ferrox/token_budget` | integer | No budget enforcement |
+| `ferrox/budget_period` | string (`"daily"` or `"monthly"`) | No budget enforcement |
 
 ### Key rotation
 

@@ -53,6 +53,7 @@ services:
       AWS_ACCESS_KEY_ID: "${AWS_ACCESS_KEY_ID:-}"
       AWS_SECRET_ACCESS_KEY: "${AWS_SECRET_ACCESS_KEY:-}"
       AWS_DEFAULT_REGION: "${AWS_DEFAULT_REGION:-us-east-1}"
+      USAGE_DATABASE_URL: "postgres://ferrox:${POSTGRES_PASSWORD:-ferrox}@postgres:5432/ferrox_cp"
       LLM_PROXY_CONFIG: /app/config/config.yaml
     volumes:
       - ./ferrox/config:/app/config:ro

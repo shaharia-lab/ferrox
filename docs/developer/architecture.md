@@ -100,7 +100,7 @@ The crypto layer (`ferrox-cp/src/crypto/`) provides three capabilities:
 | `keys` | Generate RSA-2048 keypairs; exports private key as PKCS#1 DER, public key as SubjectPublicKeyInfo DER |
 | `encrypt` | AES-256-GCM encrypt/decrypt; stored blob format is `[12-byte nonce][ciphertext+tag]` |
 | `jwks` | Convert a DER public key to a JWK object (RFC 7517) for the JWKS endpoint |
-| `jwt` | `JwtSigner` — signs JWTs for clients; claims include `ferrox.allowed_models`, `ferrox.rate_limit` |
+| `jwt` | `JwtSigner` — signs JWTs for clients; claims include `ferrox.allowed_models`, `ferrox.rate_limit`, `ferrox.client_id`, `ferrox.token_budget`, `ferrox.budget_period` |
 
 **Private key storage pipeline:**
 
@@ -115,13 +115,14 @@ generate_keypair()          → PKCS#1 DER (plaintext)
 
 ### Data layer
 
-Three tables form the persistence model:
+Four tables form the persistence model:
 
 | Table | Purpose |
 |---|---|
-| `clients` | API client registrations — name, bcrypt-hashed key, allowed models, rate-limit settings |
+| `clients` | API client registrations — name, bcrypt-hashed key, allowed models, rate-limit settings, token budget |
 | `signing_keys` | RS256 keypairs — private key is AES-256-GCM encrypted at rest; public key is DER-encoded SubjectPublicKeyInfo |
-| `audit_log` | Append-only event log — `client_created`, `token_issued`, `key_rotated`, `client_revoked` |
+| `audit_log` | Append-only event log — `client_created`, `token_issued`, `key_rotated`, `client_revoked`, `budget_exceeded` |
+| `usage_log` | Per-request token usage records written by the gateway — client, model, provider, prompt/completion tokens, latency |
 
 Migrations are embedded in the binary at compile time via `sqlx::migrate!("./migrations")` and applied at startup. The `MIGRATOR` static is `pub` so integration tests can reference it with `#[sqlx::test(migrator = "crate::MIGRATOR")]`.
 
@@ -131,7 +132,8 @@ Each table has a typed repository struct (`ClientRepository`, `SigningKeyReposit
 
 ```
 ferrox-cp/src/
-  main.rs             startup, MIGRATOR static, axum router wiring
+  main.rs             startup, MIGRATOR static, axum router wiring, background tasks
+  budget.rs           periodic budget checker (revokes over-budget clients every 60s)
   config.rs           CpConfig loaded from env vars
   state.rs            CpState (db pool + config, Arc-wrapped)
   ui.rs               SPA handler: include_dir! embedding + MIME-typed serving
@@ -141,7 +143,7 @@ ferrox-cp/src/
     jwks.rs           GET /.well-known/jwks.json
     token.rs          POST /token
     admin/
-      clients.rs      CRUD + revoke + usage
+      clients.rs      CRUD + revoke + usage + budget + reactivate
       signing_keys.rs list + rotate
       audit.rs        filterable list
 
@@ -150,14 +152,17 @@ ferrox-cp/src/
 
   db/
     mod.rs            re-exports all repo types
-    models.rs         Client, SigningKey, AuditEntry, AuditEvent
+    models.rs         Client, SigningKey, AuditEntry, AuditEvent, UsageRecord, UsageSummary
     error.rs          RepoError (Conflict / NotFound / Database)
-    client_repo.rs    CRUD + revoke + paginate for clients
+    client_repo.rs    CRUD + revoke + paginate + budget + reactivate + find_over_budget
     signing_key_repo.rs  create / get_active / retire for signing keys
     audit_repo.rs     record / list / count_tokens_issued
+    usage_repo.rs     batch insert + summarize + paginated list for usage records
 
 ferrox-cp/migrations/
   20240001000000_initial_schema.sql
+  20240002000000_usage_log.sql
+  20240003000000_client_budgets.sql
 
 ferrox-cp/ui/       React SPA (Vite + TypeScript + Tailwind)
   src/
@@ -188,7 +193,9 @@ ferrox/src/
   server.rs           axum router, middleware stack
   config.rs           YAML loading, env var interpolation, validation
   state.rs            AppState (shared, Arc-wrapped)
-  auth.rs             Bearer token auth: static virtual key or JWKS-validated JWT
+  auth.rs             Bearer token auth: static virtual key or JWKS-validated JWT + budget reservation
+  budget_enforcer.rs  BudgetEnforcer trait, RedisBudgetEnforcer (Lua scripts), NoopBudgetEnforcer
+  usage_writer.rs     async batched writer: mpsc channel → background flush to usage_log table
   jwks.rs             JWKS cache: fetch, TTL refresh, stale fallback, background task
   router.rs           ModelRouter: alias -> Arc<RoutePool>
   error.rs            ProxyError enum, OpenAI-format HTTP responses

@@ -53,6 +53,9 @@ export interface Client {
   active: boolean
   created_at: string
   revoked_at?: string
+  token_budget?: number
+  budget_period?: string
+  budget_reset_at?: string
 }
 
 export interface CreateClientRequest {
@@ -62,10 +65,28 @@ export interface CreateClientRequest {
   rpm: number
   burst: number
   token_ttl_seconds: number
+  token_budget?: number
+  budget_period?: string
+}
+
+export interface UpdateBudgetRequest {
+  token_budget?: number
+  budget_period?: string
 }
 
 export interface CreateClientResponse extends Client {
   api_key: string
+}
+
+export interface UsageDetailRecord {
+  request_id: string
+  model: string
+  provider: string
+  prompt_tokens: number
+  completion_tokens: number
+  total_tokens: number
+  latency_ms?: number
+  created_at: string
 }
 
 export interface UsageSummary {
@@ -113,6 +134,22 @@ export const api = {
       request<void>(`/api/clients/${id}`, { method: 'DELETE' }),
     usage: (id: string) =>
       request<UsageStats>(`/api/clients/${id}/usage`),
+    usageDetails: (id: string, params?: { from?: string; to?: string; model?: string; limit?: number; offset?: number }) => {
+      const q = new URLSearchParams()
+      if (params?.from) q.set('from', params.from)
+      if (params?.to) q.set('to', params.to)
+      if (params?.model) q.set('model', params.model)
+      if (params?.limit != null) q.set('limit', String(params.limit))
+      if (params?.offset != null) q.set('offset', String(params.offset))
+      return request<UsageDetailRecord[]>(`/api/clients/${id}/usage/details?${q}`)
+    },
+    updateBudget: (id: string, body: UpdateBudgetRequest) =>
+      request<Client>(`/api/clients/${id}/budget`, {
+        method: 'PATCH',
+        body: JSON.stringify(body),
+      }),
+    reactivate: (id: string) =>
+      request<void>(`/api/clients/${id}/reactivate`, { method: 'POST' }),
   },
   signingKeys: {
     list: () => request<SigningKey[]>('/api/signing-keys'),

@@ -97,9 +97,11 @@ Client → [auth middleware] → [rate limiter] → ModelRouter
 
 ## Configuration
 
-**Gateway config** is YAML, validated against `ferrox/config.schema.json`. Key sections: `server`, `telemetry`, `defaults` (retry/circuit breaker/timeout defaults), `providers`, `models` (aliases → routing strategies), `rate_limiting`, `trusted_issuers`, `virtual_keys`.
+**Gateway config** is YAML, validated against `ferrox/config.schema.json`. Key sections: `server`, `telemetry`, `defaults` (retry/circuit breaker/timeout defaults), `providers`, `models` (aliases → routing strategies), `rate_limiting`, `trusted_issuers`, `virtual_keys`, `usage_database_url`.
 
 **Control plane** is configured entirely via environment variables (see `.env.example`): `DATABASE_URL`, `CP_ENCRYPTION_KEY` (64 hex chars), `CP_ADMIN_KEY`, `CP_ISSUER`, `CP_PORT`.
+
+**Usage tracking**: Set `usage_database_url` in the gateway config to persist per-request token usage to the control plane's PostgreSQL. Budget enforcement uses Redis (same instance as rate limiting) for real-time pre-request checks, with periodic soft enforcement as a fallback.
 
 ## Available Sub-Agents
 
@@ -131,4 +133,6 @@ Project-scoped agents live in `.claude/agents/`. Invoke with `@<name>` in any Cl
 | Minimal config template | `ferrox/config/config_minimal.yaml` |
 | Config JSON Schema | `ferrox/config.schema.json` |
 | Environment variable template | `.env.example` |
-| PostgreSQL schema migration | `ferrox-cp/migrations/20240001000000_initial_schema.sql` |
+| PostgreSQL schema — initial | `ferrox-cp/migrations/20240001000000_initial_schema.sql` |
+| PostgreSQL schema — usage log | `ferrox-cp/migrations/20240002000000_usage_log.sql` |
+| PostgreSQL schema — client budgets | `ferrox-cp/migrations/20240003000000_client_budgets.sql` |

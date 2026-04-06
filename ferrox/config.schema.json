@@ -39,6 +39,10 @@
       "minimum": 10,
       "default": 300,
       "description": "How long to cache JWKS public keys (seconds). Keys are proactively refreshed at 80% of this TTL."
+    },
+    "usage_database_url": {
+      "type": "string",
+      "description": "PostgreSQL connection URL for persisting per-request token usage. Points to the same database as ferrox-cp (usage_log table). When absent, usage recording is disabled."
     }
   },
   "definitions": {

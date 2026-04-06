@@ -161,6 +161,14 @@ models:
           model_id: "GLM-4.7"
 
 # ─────────────────────────────────────────
+# Usage tracking (optional)
+# Persist per-request token usage to PostgreSQL.
+# Points to the same database as ferrox-cp (usage_log table).
+# When absent, usage recording is disabled.
+# ─────────────────────────────────────────
+# usage_database_url: "${USAGE_DATABASE_URL:-postgres://ferrox:ferrox@localhost:5432/ferrox_cp}"
+
+# ─────────────────────────────────────────
 # Rate limiting backend (optional — default: memory)
 # Set backend: redis for distributed enforcement across replicas.
 # ─────────────────────────────────────────

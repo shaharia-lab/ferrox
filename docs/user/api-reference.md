@@ -131,6 +131,7 @@ All errors use OpenAI error format:
 | 403 | `forbidden` | Key not allowed to use this model |
 | 404 | `model_not_found` | Model alias not in config |
 | 429 | `rate_limited` | Per-key rate limit exceeded |
+| 429 | `budget_exceeded` | Client's token budget exhausted |
 | 500 | `stream_error` | Upstream streaming failure |
 | 502 | `circuit_open` | Circuit breaker open; all targets unavailable |
 | 502 | `provider_error` | Provider returned an error |
@@ -401,3 +402,64 @@ const response = await client.chat.completions.create({
   messages: [{ role: "user", content: "Hello" }],
 });
 ```
+
+---
+
+## Control Plane API (ferrox-cp)
+
+The control plane runs on port 9090 and manages clients, signing keys, and usage data. All admin endpoints require `Authorization: Bearer <CP_ADMIN_KEY>`.
+
+### GET /api/clients/:id/usage
+
+Returns aggregated token usage for a client over the last 24h, 7d, and 30d.
+
+```json
+{
+  "last_24h": { "total_prompt_tokens": 1200, "total_completion_tokens": 800, "total_tokens": 2000, "request_count": 15 },
+  "last_7d":  { "total_prompt_tokens": 8000, "total_completion_tokens": 4000, "total_tokens": 12000, "request_count": 95 },
+  "last_30d": { "total_prompt_tokens": 30000, "total_completion_tokens": 15000, "total_tokens": 45000, "request_count": 350 }
+}
+```
+
+### GET /api/clients/:id/usage/details
+
+Returns paginated per-request usage records.
+
+| Param | Type | Default | Description |
+|---|---|---|---|
+| `from` | ISO 8601 timestamp | — | Filter: created_at >= from |
+| `to` | ISO 8601 timestamp | — | Filter: created_at < to |
+| `model` | string | — | Filter by model alias |
+| `limit` | integer | 50 | Max records per page (max 1000) |
+| `offset` | integer | 0 | Skip records for pagination |
+
+```json
+[
+  {
+    "request_id": "550e8400-e29b-41d4-a716-446655440000",
+    "model": "claude-sonnet",
+    "provider": "anthropic-primary",
+    "prompt_tokens": 120,
+    "completion_tokens": 80,
+    "total_tokens": 200,
+    "latency_ms": 843,
+    "created_at": "2026-04-06T10:30:00Z"
+  }
+]
+```
+
+### PATCH /api/clients/:id/budget
+
+Update token budget settings for a client. Both fields must be set together, or both null to remove the budget.
+
+```json
+{ "token_budget": 500000, "budget_period": "monthly" }
+```
+
+Returns the updated client object. `budget_period` must be `"daily"` or `"monthly"`.
+
+### POST /api/clients/:id/reactivate
+
+Re-activate a revoked client and reset its budget period. Returns `204 No Content`.
+
+Use this after a client was revoked for exceeding its token budget. The budget counter resets to zero for the new period.

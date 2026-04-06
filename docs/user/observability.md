@@ -45,7 +45,7 @@ Metrics are available at `GET /metrics`. All metric names are prefixed `ferrox_`
 | `ferrox_requests_total` | Counter | `provider`, `model_alias`, `model_id`, `status`, `key_name` | Total requests dispatched |
 | `ferrox_request_duration_seconds` | Histogram | `provider`, `model_alias`, `status` | End-to-end latency |
 | `ferrox_ttfb_seconds` | Histogram | `provider`, `model_alias` | Time to first byte |
-| `ferrox_tokens_total` | Counter | `provider`, `model_alias`, `type` | Tokens processed (`type`: `prompt` or `completion`) |
+| `ferrox_tokens_total` | Counter | `provider`, `model_alias`, `key_name`, `type` | Tokens processed per client (`type`: `prompt` or `completion`) |
 | `ferrox_active_streams` | Gauge | `provider`, `model_alias` | Active SSE connections |
 | `ferrox_errors_total` | Counter | `provider`, `error_type` | Errors by type |
 

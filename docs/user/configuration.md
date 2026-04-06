@@ -20,6 +20,7 @@ virtual_keys:         [ ... ]   # optional; static Bearer keys
 trusted_issuers:      [ ... ]   # optional; JWKS-based JWT auth
 jwks_cache_ttl_secs:  300       # optional; default 300
 rate_limiting:        { ... }   # optional; default: memory backend
+usage_database_url:   "..."     # optional; PostgreSQL URL for usage tracking
 ```
 
 `virtual_keys` and `trusted_issuers` are both optional. You can use one, the other, or both simultaneously.
@@ -264,13 +265,37 @@ Clients pass a JWT as the Bearer token. Ferrox reads the following custom claims
 | Claim | Type | Description |
 |---|---|---|
 | `ferrox/tenant_id` | string | Used as the rate limit bucket key |
+| `ferrox/client_id` | string (UUID) | Client UUID from the control plane `clients` table |
 | `ferrox/allowed_models` | `["*"]` or list | Models the token is permitted to use |
 | `ferrox/rate_limit.requests_per_minute` | integer | Sustained rate limit |
 | `ferrox/rate_limit.burst` | integer | Burst capacity |
+| `ferrox/token_budget` | integer | Max tokens per budget period (omitted if unlimited) |
+| `ferrox/budget_period` | string | `"daily"` or `"monthly"` (omitted if unlimited) |
 
-All Ferrox-specific claims are optional. If `ferrox/allowed_models` is absent, the token may access all aliases.
+All Ferrox-specific claims are optional. If `ferrox/allowed_models` is absent, the token may access all aliases. Budget claims are set automatically when a client has a token budget configured in the control plane.
 
 See [Virtual Keys](virtual-keys.md) for a comparison of static keys vs JWT auth.
+
+---
+
+## usage_database_url
+
+PostgreSQL connection URL for persisting per-request token usage to the `usage_log` table. This should point to the same database used by ferrox-cp.
+
+```yaml
+usage_database_url: "${USAGE_DATABASE_URL}"
+```
+
+When set, the gateway writes usage records (client, model, provider, prompt/completion tokens, latency) to PostgreSQL via an async batched writer. Records are flushed every 5 seconds or every 100 records, whichever comes first.
+
+When absent, usage recording is silently disabled with zero overhead.
+
+| Feature | Requires `usage_database_url` |
+|---|---|
+| Per-client usage dashboards in admin UI | yes |
+| `GET /api/clients/:id/usage` endpoint | yes |
+| Soft budget enforcement (periodic revocation) | yes |
+| Real-time budget enforcement (Redis) | no (uses Redis counters) |
 
 ---
 
