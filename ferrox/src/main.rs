@@ -1,5 +1,6 @@
 mod anthropic_types;
 mod auth;
+mod budget_enforcer;
 mod config;
 mod error;
 mod handlers;
@@ -134,10 +135,35 @@ async fn main() -> Result<(), anyhow::Error> {
         usage_writer::noop_writer()
     };
 
-    // 10. Init metrics
+    // 10. Budget enforcer (reuses Redis pool if rate limiting is Redis-backed)
+    let budget_enforcer: Arc<dyn budget_enforcer::BudgetEnforcer> =
+        match &config.rate_limiting.backend {
+            config::RateLimitBackendType::Redis => {
+                let url = config.rate_limiting.redis_url.as_deref().unwrap();
+                let mut cfg = deadpool_redis::Config::from_url(url);
+                cfg.pool = Some(deadpool_redis::PoolConfig::new(
+                    config.rate_limiting.redis_pool_size,
+                ));
+                let pool = cfg
+                    .create_pool(Some(deadpool_redis::Runtime::Tokio1))
+                    .map_err(|e| anyhow::anyhow!("Budget enforcer Redis pool: {e}"))?;
+                tracing::info!("Budget enforcer: Redis");
+                Arc::new(budget_enforcer::RedisBudgetEnforcer::new(
+                    pool,
+                    config.rate_limiting.redis_key_prefix.clone(),
+                    config.rate_limiting.redis_fail_open,
+                ))
+            }
+            config::RateLimitBackendType::Memory => {
+                tracing::info!("Budget enforcer: disabled (no Redis backend)");
+                Arc::new(budget_enforcer::NoopBudgetEnforcer)
+            }
+        };
+
+    // 11. Init metrics
     let metrics = Metrics::new();
 
-    // 11. Build AppState
+    // 12. Build AppState
     let ready = Arc::new(AtomicBool::new(false));
     let state = AppState {
         config: Arc::new(config),
@@ -148,6 +174,7 @@ async fn main() -> Result<(), anyhow::Error> {
         ready: ready.clone(),
         jwks_cache,
         usage_writer,
+        budget_enforcer,
     };
 
     // 11. Build axum router

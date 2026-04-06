@@ -21,6 +21,9 @@ pub enum ProxyError {
     #[error("Rate limited: {0}")]
     RateLimited(String),
 
+    #[error("Budget exceeded: {0}")]
+    BudgetExceeded(String),
+
     #[error("Circuit open: {0}")]
     CircuitOpen(String),
 
@@ -63,6 +66,11 @@ impl IntoResponse for ProxyError {
             ProxyError::RateLimited(msg) => {
                 (StatusCode::TOO_MANY_REQUESTS, "rate_limited", msg.clone())
             }
+            ProxyError::BudgetExceeded(msg) => (
+                StatusCode::TOO_MANY_REQUESTS,
+                "budget_exceeded",
+                msg.clone(),
+            ),
             ProxyError::CircuitOpen(msg) => (StatusCode::BAD_GATEWAY, "circuit_open", msg.clone()),
             ProxyError::ProviderError {
                 status, message, ..

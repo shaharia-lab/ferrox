@@ -64,7 +64,9 @@ pub async fn chat_completions(
                 let a1 = alias.clone();
                 let k1 = key_name.clone();
                 let usage_writer = state.usage_writer.clone();
+                let budget_enforcer = state.budget_enforcer.clone();
                 let stream_client_id = ctx.client_id;
+                let stream_budget_period = ctx.budget_period.clone();
                 let stream_request_id = ctx.request_id.clone();
                 let stream_model = alias.clone();
                 let stream_provider = provider_name.clone();
@@ -135,6 +137,15 @@ pub async fn chat_completions(
                                 completion_tokens: completion,
                                 latency_ms: Some((latency * 1000.0) as u64),
                             });
+
+                            // Record tokens in Redis budget counter
+                            if let (Some(ref cid), Some(ref period)) =
+                                (&stream_client_id, &stream_budget_period)
+                            {
+                                budget_enforcer
+                                    .record_tokens(&cid.to_string(), period, prompt + completion)
+                                    .await;
+                            }
                         }
 
                         tracing::info!(
@@ -184,6 +195,19 @@ pub async fn chat_completions(
                         completion_tokens: usage.completion_tokens,
                         latency_ms: Some((latency * 1000.0) as u64),
                     });
+
+                    // Record tokens in Redis budget counter
+                    if let (Some(ref cid), Some(ref period)) = (&ctx.client_id, &ctx.budget_period)
+                    {
+                        state
+                            .budget_enforcer
+                            .record_tokens(
+                                &cid.to_string(),
+                                period,
+                                usage.prompt_tokens + usage.completion_tokens,
+                            )
+                            .await;
+                    }
                 }
                 REQUESTS_TOTAL
                     .with_label_values(&[
@@ -243,7 +267,7 @@ fn http_status_for_error(e: &ProxyError) -> u16 {
         ProxyError::Unauthorized(_) => 401,
         ProxyError::Forbidden(_) => 403,
         ProxyError::ModelNotFound(_) => 404,
-        ProxyError::RateLimited(_) => 429,
+        ProxyError::RateLimited(_) | ProxyError::BudgetExceeded(_) => 429,
         ProxyError::CircuitOpen(_) | ProxyError::ProviderError { .. } => 502,
         ProxyError::UpstreamTimeout(_) => 504,
         _ => 500,
@@ -256,6 +280,7 @@ fn error_type_label(e: &ProxyError) -> &'static str {
         ProxyError::Forbidden(_) => "forbidden",
         ProxyError::ModelNotFound(_) => "model_not_found",
         ProxyError::RateLimited(_) => "rate_limited",
+        ProxyError::BudgetExceeded(_) => "budget_exceeded",
         ProxyError::CircuitOpen(_) => "circuit_open",
         ProxyError::ProviderError { .. } => "provider_error",
         ProxyError::UpstreamTimeout(_) => "upstream_timeout",

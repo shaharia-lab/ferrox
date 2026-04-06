@@ -31,6 +31,12 @@ struct FerroxClaim {
     client_id: String,
     allowed_models: Vec<String>,
     rate_limit: RateLimitClaim,
+    /// Maximum tokens allowed per budget period.  `None` means unlimited.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    token_budget: Option<i64>,
+    /// Budget period: "daily" or "monthly".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    budget_period: Option<String>,
 }
 
 /// Full JWT claims payload.
@@ -93,6 +99,8 @@ impl JwtSigner {
                     requests_per_minute: client.rpm,
                     burst: client.burst,
                 },
+                token_budget: client.token_budget,
+                budget_period: client.budget_period.clone(),
             },
         };
 

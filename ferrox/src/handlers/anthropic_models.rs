@@ -82,6 +82,7 @@ mod tests {
             jwks_cache: Arc::new(jwks_cache),
             config: Arc::new(config),
             usage_writer: crate::usage_writer::noop_writer(),
+            budget_enforcer: Arc::new(crate::budget_enforcer::NoopBudgetEnforcer),
         }
     }
 

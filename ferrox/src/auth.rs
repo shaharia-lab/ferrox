@@ -33,6 +33,8 @@ struct FerroxCustomClaims {
     client_id: Option<String>,
     allowed_models: Option<Vec<String>>,
     rate_limit: Option<JwtRateLimitClaims>,
+    token_budget: Option<i64>,
+    budget_period: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -48,6 +50,8 @@ struct AuthOutcome {
     key_name: String,
     allowed_models: Vec<String>,
     client_id: Option<uuid::Uuid>,
+    token_budget: Option<i64>,
+    budget_period: Option<String>,
 }
 
 // ── Middleware ────────────────────────────────────────────────────────────────
@@ -72,11 +76,31 @@ pub async fn auth_middleware(
         .map(|s| s.to_string())
         .unwrap_or_else(|| Uuid::new_v4().to_string());
 
+    // Pre-request budget check (Redis-backed, if configured)
+    if let (Some(ref client_id), Some(budget), Some(ref period)) = (
+        &outcome.client_id,
+        outcome.token_budget,
+        &outcome.budget_period,
+    ) {
+        if let Err(()) = state
+            .budget_enforcer
+            .check_budget(&client_id.to_string(), period, budget)
+            .await
+        {
+            return Err(ProxyError::BudgetExceeded(format!(
+                "Token budget exceeded for '{}'",
+                outcome.key_name
+            )));
+        }
+    }
+
     let ctx = RequestContext {
         request_id,
         key_name: outcome.key_name,
         allowed_models: outcome.allowed_models,
         client_id: outcome.client_id,
+        token_budget: outcome.token_budget,
+        budget_period: outcome.budget_period,
     };
 
     req.extensions_mut().insert(ctx);
@@ -115,6 +139,8 @@ async fn validate_static_key(token: &str, state: &AppState) -> Result<AuthOutcom
         key_name: key_config.name.clone(),
         allowed_models: key_config.allowed_models.clone(),
         client_id: None, // Static keys have no control-plane identity
+        token_budget: None,
+        budget_period: None,
     })
 }
 
@@ -209,10 +235,15 @@ async fn validate_jwt(token: &str, state: &AppState) -> Result<AuthOutcome, Prox
         .and_then(|f| f.client_id.as_deref())
         .and_then(|id| uuid::Uuid::parse_str(id).ok());
 
+    let token_budget = ferrox.and_then(|f| f.token_budget);
+    let budget_period = ferrox.and_then(|f| f.budget_period.clone());
+
     Ok(AuthOutcome {
         key_name,
         allowed_models,
         client_id,
+        token_budget,
+        budget_period,
     })
 }
 
@@ -458,6 +489,7 @@ mod tests {
                 jwks_cache: Arc::new(jwks_cache),
                 config: Arc::new(config),
                 usage_writer: crate::usage_writer::noop_writer(),
+                budget_enforcer: Arc::new(crate::budget_enforcer::NoopBudgetEnforcer),
             }
         }
 
@@ -578,6 +610,7 @@ mod tests {
                 jwks_cache: Arc::new(jwks_cache),
                 config: Arc::new(config),
                 usage_writer: crate::usage_writer::noop_writer(),
+                budget_enforcer: Arc::new(crate::budget_enforcer::NoopBudgetEnforcer),
             }
         }
 

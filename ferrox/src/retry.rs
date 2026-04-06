@@ -25,6 +25,7 @@ pub fn is_retryable(e: &ProxyError) -> bool {
         ProxyError::ConfigError(_) => false,
         ProxyError::SerializationError(_) => false,
         ProxyError::AwsError(_) => false,
+        ProxyError::BudgetExceeded(_) => false,
     }
 }
 

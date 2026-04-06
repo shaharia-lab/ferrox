@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use crate::budget_enforcer::BudgetEnforcer;
 use crate::config::Config;
 use crate::jwks::JwksCache;
 use crate::metrics::Metrics;
@@ -23,4 +24,6 @@ pub struct AppState {
     pub jwks_cache: Arc<JwksCache>,
     /// Async batched writer for persisting per-request token usage to Postgres.
     pub usage_writer: UsageWriter,
+    /// Redis-backed real-time budget enforcement.  No-op when Redis is not configured.
+    pub budget_enforcer: Arc<dyn BudgetEnforcer>,
 }
