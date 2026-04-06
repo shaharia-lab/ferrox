@@ -101,6 +101,8 @@ cargo test --workspace -- --test-threads=1
 
 ## Run locally
 
+### Gateway only (quickest start)
+
 ```bash
 # 1. Copy the example env file and fill in your API keys
 cp .env.example .env
@@ -116,13 +118,100 @@ set -a && . ./.env && set +a
 LLM_PROXY_CONFIG=ferrox/config/local.yaml cargo run -p ferrox
 ```
 
-Or with the full observability stack (Grafana + Loki + Tempo + Prometheus + OTEL Collector bundled in one container):
+The gateway runs standalone — it only needs provider API keys. Control plane, usage tracking, and budget enforcement are all optional.
+
+### Control plane (ferrox-cp)
+
+The control plane requires PostgreSQL and a few environment variables.
+
+```bash
+# 1. Start a local Postgres instance
+docker run --name ferrox-cp-pg \
+  -e POSTGRES_DB=ferrox_cp \
+  -e POSTGRES_USER=ferrox \
+  -e POSTGRES_PASSWORD=ferrox \
+  -p 5432:5432 \
+  -d postgres:16-alpine
+
+# 2. Generate required secrets (one-time)
+CP_ENCRYPTION_KEY=$(openssl rand -hex 32)   # 64 hex chars, encrypts private keys at rest
+CP_ADMIN_KEY=$(openssl rand -hex 20)        # admin API bearer token
+
+# 3. Run the control plane
+DATABASE_URL="postgres://ferrox:ferrox@localhost:5432/ferrox_cp" \
+  CP_ENCRYPTION_KEY="$CP_ENCRYPTION_KEY" \
+  CP_ADMIN_KEY="$CP_ADMIN_KEY" \
+  CP_ISSUER="http://localhost:9090" \
+  cargo run -p ferrox-cp
+```
+
+The control plane runs on port 9090 by default. On startup it:
+- Runs database migrations automatically
+- Generates an RSA-2048 signing key (if none exist)
+- Starts background tasks (key retirement, budget enforcement)
+
+**Admin UI:** Open http://localhost:9090 and enter the `CP_ADMIN_KEY` to log in.
+
+### Gateway + control plane together
+
+To connect the gateway to the control plane for JWT-based auth and usage tracking:
+
+```bash
+# In your .env or local.yaml, uncomment the trusted_issuers section:
+trusted_issuers:
+  - issuer: "http://localhost:9090"
+    jwks_uri: "http://localhost:9090/.well-known/jwks.json"
+    audience: "ferrox"
+
+# Enable usage tracking (optional — points to the same database):
+usage_database_url: "postgres://ferrox:ferrox@localhost:5432/ferrox_cp"
+```
+
+Then start both services (in separate terminals):
+
+```bash
+# Terminal 1: control plane (no Makefile target — run manually)
+DATABASE_URL="postgres://ferrox:ferrox@localhost:5432/ferrox_cp" \
+  CP_ENCRYPTION_KEY="$CP_ENCRYPTION_KEY" \
+  CP_ADMIN_KEY="$CP_ADMIN_KEY" \
+  CP_ISSUER="http://localhost:9090" \
+  cargo run -p ferrox-cp
+
+# Terminal 2: gateway
+make run
+```
+
+Create a client and obtain a JWT:
+
+```bash
+# Create an API client
+curl -s -X POST http://localhost:9090/api/clients \
+  -H "Authorization: Bearer $CP_ADMIN_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"name":"my-app","allowed_models":["*"],"rpm":100,"burst":10,"token_ttl_seconds":900}' \
+  | jq .
+
+# Exchange the API key for a JWT (use the api_key from the response above)
+curl -s -X POST http://localhost:9090/token \
+  -H "Authorization: Bearer sk-cp-<key-from-above>" \
+  | jq .
+
+# Use the JWT with the gateway
+curl http://localhost:8080/v1/models \
+  -H "Authorization: Bearer <jwt-from-above>"
+```
+
+### Full stack (Docker Compose)
+
+Runs everything together — gateway, control plane, PostgreSQL, and the observability stack:
 
 ```bash
 make docker-up
-# Grafana UI: http://localhost:3000  (admin / admin)
-# OTLP gRPC:  localhost:4317
-# OTLP HTTP:  localhost:4318
+# Gateway:    http://localhost:8080
+# Control plane: http://localhost:9090  (Admin UI)
+# Grafana:    http://localhost:3000  (admin / admin)
+# OTLP gRPC: localhost:4317
+# OTLP HTTP: localhost:4318
 ```
 
 ## Project structure
@@ -141,12 +230,14 @@ ferrox/             gateway binary crate
     server.rs         HTTP router construction
     config.rs         config loading and validation
     state.rs          shared application state
-    auth.rs           auth middleware
+    auth.rs           auth middleware + budget reservation
     router.rs         model alias resolution
     error.rs          error types and HTTP responses
     types.rs          OpenAI wire types
     retry.rs          retry logic with backoff
     metrics.rs        startup metrics shim
+    usage_writer.rs   async batched writer (mpsc → PostgreSQL usage_log)
+    budget_enforcer.rs  Redis-backed budget check + reconciliation (Lua scripts)
 
     providers/        one file per provider
     lb/               load balancing and circuit breakers
@@ -164,8 +255,11 @@ ferrox-cp/          control plane binary crate
   Dockerfile        multi-stage: node:22-slim UI build → rust builder → debian slim
   migrations/
     20240001000000_initial_schema.sql
+    20240002000000_usage_log.sql
+    20240003000000_client_budgets.sql
   src/
-    main.rs           entry point, MIGRATOR static, startup key seeding
+    main.rs           entry point, MIGRATOR static, startup key seeding, background tasks
+    budget.rs         periodic budget checker (revokes over-budget clients)
     config.rs         CpConfig loaded from env vars
     error.rs          CpError (top-level error enum)
     state.rs          CpState (db pool + config)
@@ -176,7 +270,7 @@ ferrox-cp/          control plane binary crate
       keys.rs         RSA-2048 keypair generation (PKCS#1 DER output)
       encrypt.rs      AES-256-GCM encrypt/decrypt for private keys at rest
       jwks.rs         DER public key → JWK (RFC 7517)
-      jwt.rs          JwtSigner — sign JWTs for clients
+      jwt.rs          JwtSigner — sign JWTs (includes budget claims)
     handlers/
       mod.rs
       health.rs       GET /healthz
@@ -184,18 +278,19 @@ ferrox-cp/          control plane binary crate
       token.rs        POST /token — API key → JWT exchange
       admin/
         mod.rs
-        clients.rs    CRUD for API clients (create, list, get, revoke, usage)
+        clients.rs    CRUD + revoke + usage + budget + reactivate
         signing_keys.rs  list + rotate signing keys
         audit.rs      filterable audit log
     middleware/
       admin_auth.rs   Bearer token check (subtle::ConstantTimeEq)
     db/
       mod.rs
-      models.rs       Client, SigningKey, AuditEntry, AuditEvent
+      models.rs       Client, SigningKey, AuditEntry, AuditEvent, UsageRecord, UsageSummary
       error.rs        RepoError
-      client_repo.rs
+      client_repo.rs  CRUD + budget + reactivate + find_over_budget
       signing_key_repo.rs
       audit_repo.rs
+      usage_repo.rs   batch insert + summarize + paginated list
   ui/               React + TypeScript admin SPA
     package.json
     vite.config.ts  proxies /api → localhost:9090 in dev mode
