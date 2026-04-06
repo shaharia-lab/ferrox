@@ -181,16 +181,56 @@ pub async fn anthropic_messages(
                     .with_label_values(&[provider_name.as_str(), alias.as_str()])
                     .inc();
 
+                let p1 = provider_name.clone();
+                let a1 = alias.clone();
+                let k1 = ctx.key_name.clone();
+                let accumulated_prompt = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+                let accumulated_completion =
+                    std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+                let acc_p = accumulated_prompt.clone();
+                let acc_c = accumulated_completion.clone();
+
+                // Wrap the OpenAI-format stream to capture token usage before
+                // converting to Anthropic SSE format.
+                let metered_stream = stream.map(move |chunk_result| {
+                    chunk_result.inspect(|chunk| {
+                        if let Some(usage) = &chunk.usage {
+                            metrics::record_tokens(
+                                &p1,
+                                &a1,
+                                &k1,
+                                usage.prompt_tokens,
+                                usage.completion_tokens,
+                            );
+                            acc_p.store(usage.prompt_tokens, std::sync::atomic::Ordering::Relaxed);
+                            acc_c.store(
+                                usage.completion_tokens,
+                                std::sync::atomic::Ordering::Relaxed,
+                            );
+                        }
+                    })
+                });
+
                 let p2 = provider_name.clone();
                 let a2 = alias.clone();
                 let k2 = ctx.key_name.clone();
                 let m2 = model_id.clone();
+                let usage_writer = state.usage_writer.clone();
+                let budget_enforcer = state.budget_enforcer.clone();
+                let stream_client_id = ctx.client_id;
+                let stream_budget_period = ctx.budget_period.clone();
+                let stream_budget_reserved = ctx.budget_reserved_tokens;
+                let stream_request_id = ctx.request_id.clone();
+                let stream_model = alias.clone();
+                let stream_provider = provider_name.clone();
 
-                let anthropic_stream =
-                    openai_stream_to_anthropic_sse(internal_req.model.clone(), msg_id, stream);
+                let anthropic_stream = openai_stream_to_anthropic_sse(
+                    internal_req.model.clone(),
+                    msg_id,
+                    metered_stream.boxed(),
+                );
 
-                // Chain a finalizer that records metrics and decrements the
-                // active-streams counter once the client has consumed all events.
+                // Chain a finalizer that records metrics, usage, and budget.
                 let sse_stream = anthropic_stream.chain(futures::stream::once(async move {
                     let latency = start.elapsed().as_secs_f64();
                     REQUESTS_TOTAL
@@ -208,6 +248,37 @@ pub async fn anthropic_messages(
                     ACTIVE_STREAMS
                         .with_label_values(&[p2.as_str(), a2.as_str()])
                         .dec();
+
+                    // Persist accumulated usage
+                    let prompt = accumulated_prompt.load(std::sync::atomic::Ordering::Relaxed);
+                    let completion =
+                        accumulated_completion.load(std::sync::atomic::Ordering::Relaxed);
+                    if prompt > 0 || completion > 0 {
+                        usage_writer.record(UsageEvent {
+                            client_id: stream_client_id,
+                            request_id: stream_request_id,
+                            model: stream_model,
+                            provider: stream_provider,
+                            prompt_tokens: prompt,
+                            completion_tokens: completion,
+                            latency_ms: Some((latency * 1000.0) as u64),
+                        });
+
+                        // Reconcile budget reservation with actual usage
+                        if let (Some(ref cid), Some(ref period)) =
+                            (&stream_client_id, &stream_budget_period)
+                        {
+                            budget_enforcer
+                                .reconcile_tokens(
+                                    &cid.to_string(),
+                                    period,
+                                    stream_budget_reserved,
+                                    prompt + completion,
+                                )
+                                .await;
+                        }
+                    }
+
                     tracing::info!(
                         model_alias = %a2,
                         provider   = %p2,
@@ -215,6 +286,8 @@ pub async fn anthropic_messages(
                         streaming  = true,
                         status     = 200,
                         latency_ms = (latency * 1000.0) as u64,
+                        prompt_tokens = prompt,
+                        completion_tokens = completion,
                         "anthropic_request_completed"
                     );
                     // Return a silent SSE comment; Anthropic SDK ignores it.
