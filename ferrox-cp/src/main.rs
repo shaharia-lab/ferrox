@@ -25,7 +25,7 @@ use db::signing_key_repo::SigningKeyRepository;
 use error::CpError;
 use handlers::admin::audit::list_audit;
 use handlers::admin::clients::{
-    client_usage, create_client, get_client, list_clients, revoke_client,
+    client_usage, client_usage_details, create_client, get_client, list_clients, revoke_client,
 };
 use handlers::admin::signing_keys::{list_signing_keys, rotate_keys};
 use handlers::{health::health_handler, jwks::jwks_handler, token::token_handler};
@@ -102,6 +102,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/clients", post(create_client).get(list_clients))
         .route("/api/clients/:id", get(get_client).delete(revoke_client))
         .route("/api/clients/:id/usage", get(client_usage))
+        .route("/api/clients/:id/usage/details", get(client_usage_details))
         .route("/api/signing-keys", get(list_signing_keys))
         .route("/api/signing-keys/rotate", post(rotate_keys))
         .route("/api/audit", get(list_audit))

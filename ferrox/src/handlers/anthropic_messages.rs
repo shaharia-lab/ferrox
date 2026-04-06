@@ -246,6 +246,7 @@ pub async fn anthropic_messages(
                     metrics::record_tokens(
                         &provider_name,
                         &model_alias,
+                        &ctx.key_name,
                         usage.prompt_tokens,
                         usage.completion_tokens,
                     );

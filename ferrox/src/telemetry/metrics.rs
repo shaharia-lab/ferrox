@@ -42,12 +42,17 @@ pub static TTFB_SECONDS: Lazy<HistogramVec> = Lazy::new(|| {
 });
 
 /// Token counts.
-/// Labels: provider, model_alias, type (prompt|completion)
+/// Labels: provider, model_alias, key_name, type (prompt|completion)
+///
+/// The `key_name` label enables per-client token usage dashboards and alerting.
+/// Cardinality note: this is safe when the number of API clients is bounded
+/// (typical for an API gateway). If unbounded client creation is expected,
+/// consider dropping this label or using a recording rule.
 pub static TOKENS_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
     register_counter_vec!(
         "ferrox_tokens_total",
         "Total tokens processed",
-        &["provider", "model_alias", "type"]
+        &["provider", "model_alias", "key_name", "type"]
     )
     .expect("register ferrox_tokens_total")
 });
@@ -203,12 +208,18 @@ pub fn gather() -> String {
     encoder.encode_to_string(&families).unwrap_or_default()
 }
 
-/// Record an observed token usage from a completed (non-streaming) request.
-pub fn record_tokens(provider: &str, model_alias: &str, prompt: u32, completion: u32) {
+/// Record an observed token usage from a completed request.
+pub fn record_tokens(
+    provider: &str,
+    model_alias: &str,
+    key_name: &str,
+    prompt: u32,
+    completion: u32,
+) {
     TOKENS_TOTAL
-        .with_label_values(&[provider, model_alias, "prompt"])
+        .with_label_values(&[provider, model_alias, key_name, "prompt"])
         .inc_by(prompt as f64);
     TOKENS_TOTAL
-        .with_label_values(&[provider, model_alias, "completion"])
+        .with_label_values(&[provider, model_alias, key_name, "completion"])
         .inc_by(completion as f64);
 }

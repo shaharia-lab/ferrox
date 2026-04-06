@@ -11,7 +11,7 @@ use uuid::Uuid;
 use crate::db::audit_repo::AuditRepository;
 use crate::db::client_repo::ClientRepository;
 use crate::db::models::{AuditEvent, UsageSummary};
-use crate::db::usage_repo::UsageRepository;
+use crate::db::usage_repo::{UsageFilter, UsageRepository};
 use crate::state::CpState;
 
 // ── Request / response types ─────────────────────────────────────────────────
@@ -86,6 +86,29 @@ pub struct UsageResponse {
     pub last_24h: UsageSummary,
     pub last_7d: UsageSummary,
     pub last_30d: UsageSummary,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UsageDetailsParams {
+    pub from: Option<DateTime<Utc>>,
+    pub to: Option<DateTime<Utc>>,
+    pub model: Option<String>,
+    #[serde(default = "default_limit")]
+    pub limit: i64,
+    #[serde(default)]
+    pub offset: i64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct UsageDetailRecord {
+    pub request_id: String,
+    pub model: String,
+    pub provider: String,
+    pub prompt_tokens: i32,
+    pub completion_tokens: i32,
+    pub total_tokens: i32,
+    pub latency_ms: Option<i32>,
+    pub created_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -305,6 +328,62 @@ pub async fn client_usage(
     }))
 }
 
+/// `GET /api/clients/:id/usage/details`
+///
+/// Returns paginated per-request usage records from `usage_log`.
+pub async fn client_usage_details(
+    State(state): State<CpState>,
+    Path(id): Path<Uuid>,
+    Query(params): Query<UsageDetailsParams>,
+) -> Result<Json<Vec<UsageDetailRecord>>, (StatusCode, Json<serde_json::Value>)> {
+    // Verify client exists first.
+    let repo = ClientRepository::new(&state.db);
+    if repo
+        .find_by_id(id)
+        .await
+        .map_err(|e| {
+            error!(error = %e, "db error checking client");
+            api_error(StatusCode::INTERNAL_SERVER_ERROR, "database error")
+        })?
+        .is_none()
+    {
+        return Err(api_error(StatusCode::NOT_FOUND, "client not found"));
+    }
+
+    let usage_repo = UsageRepository::new(&state.db);
+    let limit = params.limit.min(MAX_LIMIT);
+    let records = usage_repo
+        .list(UsageFilter {
+            client_id: id,
+            from: params.from,
+            to: params.to,
+            model: params.model,
+            limit: Some(limit),
+            offset: Some(params.offset),
+        })
+        .await
+        .map_err(|e| {
+            error!(error = %e, "db error listing usage details");
+            api_error(StatusCode::INTERNAL_SERVER_ERROR, "database error")
+        })?;
+
+    let response: Vec<UsageDetailRecord> = records
+        .into_iter()
+        .map(|r| UsageDetailRecord {
+            request_id: r.request_id,
+            model: r.model,
+            provider: r.provider,
+            prompt_tokens: r.prompt_tokens,
+            completion_tokens: r.completion_tokens,
+            total_tokens: r.total_tokens,
+            latency_ms: r.latency_ms,
+            created_at: r.created_at,
+        })
+        .collect();
+
+    Ok(Json(response))
+}
+
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 fn client_to_response(c: crate::db::models::Client) -> ClientResponse {
@@ -376,6 +455,7 @@ mod tests {
             .route("/api/clients", post(create_client).get(list_clients))
             .route("/api/clients/:id", get(get_client).delete(revoke_client))
             .route("/api/clients/:id/usage", get(client_usage))
+            .route("/api/clients/:id/usage/details", get(client_usage_details))
             .layer(axum::middleware::from_fn_with_state(
                 state.clone(),
                 require_admin_key,
@@ -675,5 +755,118 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn client_usage_details_returns_paginated_records(pool: sqlx::PgPool) {
+        let state = make_state(pool.clone());
+        let app = make_app(state);
+
+        // Create a client.
+        let resp = app
+            .clone()
+            .oneshot(admin_request(
+                "POST",
+                "/api/clients",
+                Some(r#"{"name":"details-svc","allowed_models":["*"],"rpm":10,"burst":5,"token_ttl_seconds":900}"#),
+            ))
+            .await
+            .unwrap();
+        let created: serde_json::Value =
+            serde_json::from_slice(&axum::body::to_bytes(resp.into_body(), 4096).await.unwrap())
+                .unwrap();
+        let id: Uuid = created["id"].as_str().unwrap().parse().unwrap();
+
+        // Insert usage records.
+        let usage_repo = crate::db::usage_repo::UsageRepository::new(&pool);
+        let records: Vec<crate::db::usage_repo::UsageInsert> = (0..5)
+            .map(|i| crate::db::usage_repo::UsageInsert {
+                client_id: id,
+                request_id: format!("req-{i}"),
+                model: if i < 3 {
+                    "gpt-4".to_string()
+                } else {
+                    "claude-3".to_string()
+                },
+                provider: "openai".to_string(),
+                prompt_tokens: 100,
+                completion_tokens: 50,
+                total_tokens: 150,
+                latency_ms: Some(200),
+            })
+            .collect();
+        usage_repo.insert_batch(&records).await.unwrap();
+
+        // Fetch all details.
+        let resp = app
+            .clone()
+            .oneshot(admin_request(
+                "GET",
+                &format!("/api/clients/{id}/usage/details"),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: serde_json::Value =
+            serde_json::from_slice(&axum::body::to_bytes(resp.into_body(), 8192).await.unwrap())
+                .unwrap();
+        assert_eq!(body.as_array().unwrap().len(), 5);
+
+        // Filter by model.
+        let resp = app
+            .clone()
+            .oneshot(admin_request(
+                "GET",
+                &format!("/api/clients/{id}/usage/details?model=gpt-4"),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: serde_json::Value =
+            serde_json::from_slice(&axum::body::to_bytes(resp.into_body(), 8192).await.unwrap())
+                .unwrap();
+        assert_eq!(body.as_array().unwrap().len(), 3);
+
+        // Pagination: limit=2, offset=0.
+        let resp = app
+            .clone()
+            .oneshot(admin_request(
+                "GET",
+                &format!("/api/clients/{id}/usage/details?limit=2&offset=0"),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: serde_json::Value =
+            serde_json::from_slice(&axum::body::to_bytes(resp.into_body(), 8192).await.unwrap())
+                .unwrap();
+        assert_eq!(body.as_array().unwrap().len(), 2);
+
+        // Verify response shape has expected fields.
+        let first = &body.as_array().unwrap()[0];
+        assert!(first["request_id"].is_string());
+        assert!(first["model"].is_string());
+        assert!(first["provider"].is_string());
+        assert!(first["prompt_tokens"].is_number());
+        assert!(first["completion_tokens"].is_number());
+        assert!(first["total_tokens"].is_number());
+        assert!(first["created_at"].is_string());
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn client_usage_details_returns_404_for_unknown_client(pool: sqlx::PgPool) {
+        let app = make_app(make_state(pool));
+        let resp = app
+            .oneshot(admin_request(
+                "GET",
+                &format!("/api/clients/{}/usage/details", Uuid::new_v4()),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 }

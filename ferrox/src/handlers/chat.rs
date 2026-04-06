@@ -62,6 +62,7 @@ pub async fn chat_completions(
                 // Clone all labels needed by the two closures (map + chain)
                 let p1 = provider_name.clone();
                 let a1 = alias.clone();
+                let k1 = key_name.clone();
                 let usage_writer = state.usage_writer.clone();
                 let stream_client_id = ctx.client_id;
                 let stream_request_id = ctx.request_id.clone();
@@ -85,6 +86,7 @@ pub async fn chat_completions(
                                 metrics::record_tokens(
                                     &p1,
                                     &a1,
+                                    &k1,
                                     usage.prompt_tokens,
                                     usage.completion_tokens,
                                 );
@@ -167,6 +169,7 @@ pub async fn chat_completions(
                     metrics::record_tokens(
                         &provider_name,
                         &req.model,
+                        &ctx.key_name,
                         usage.prompt_tokens,
                         usage.completion_tokens,
                     );
