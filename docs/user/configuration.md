@@ -21,6 +21,7 @@ trusted_issuers:      [ ... ]   # optional; JWKS-based JWT auth
 jwks_cache_ttl_secs:  300       # optional; default 300
 rate_limiting:        { ... }   # optional; default: memory backend
 usage_database_url:   "..."     # optional; PostgreSQL URL for usage tracking
+event_endpoints:      [ ... ]   # optional; webhook push notifications
 ```
 
 `virtual_keys` and `trusted_issuers` are both optional. You can use one, the other, or both simultaneously.
@@ -296,6 +297,66 @@ When absent, usage recording is silently disabled with zero overhead.
 | `GET /api/clients/:id/usage` endpoint | yes |
 | Soft budget enforcement (periodic revocation) | yes |
 | Real-time budget enforcement (Redis) | no (uses Redis counters) |
+
+---
+
+## event_endpoints
+
+Webhook endpoints that receive async push notifications for per-request token usage. Use this to integrate real-time billing, analytics, or monitoring systems without polling.
+
+```yaml
+event_endpoints:
+  - name: "billing-webhook"
+    url: "${BILLING_WEBHOOK_URL}"
+    token: "${BILLING_WEBHOOK_TOKEN}"
+    events: ["token_usage"]
+
+  - name: "analytics"
+    url: "https://analytics.internal/ingest"
+    token: "${ANALYTICS_TOKEN}"
+    events: ["token_usage"]
+```
+
+| Field | Required | Description |
+|---|---|---|
+| `name` | yes | Unique identifier (used in logs and Prometheus metrics) |
+| `url` | yes | HTTP(S) URL to POST events to |
+| `token` | yes | Bearer token sent in the `Authorization` header |
+| `events` | yes | Event types to subscribe to (currently: `token_usage`) |
+
+### Delivery behaviour
+
+- **Fully async** — events flow through an internal buffer to a background task. Zero latency added to the request path.
+- **Per-endpoint isolation** — each delivery runs independently. A slow or failing endpoint does not block others.
+- **Retry with backoff** — 3 attempts (1s → 2s → 4s). On persistent failure, the event is dropped and `ferrox_webhook_errors_total{endpoint}` is incremented.
+- **Bounded concurrency** — at most 256 concurrent delivery tasks to prevent resource exhaustion under load.
+- **Non-blocking buffer** — if the internal event buffer (10,000 slots) is full, new events are dropped with a warning log.
+
+### Event payload
+
+Each event is sent as an HTTP POST with `Content-Type: application/json` and `Authorization: Bearer <token>`:
+
+```json
+{
+  "event": "token_usage",
+  "request_id": "550e8400-e29b-41d4-a716-446655440000",
+  "client_id": "2a2bfb93-99af-414f-99cb-1891435c0806",
+  "key_name": "my-app",
+  "model": "claude-sonnet",
+  "provider": "anthropic-primary",
+  "prompt_tokens": 120,
+  "completion_tokens": 80,
+  "total_tokens": 200,
+  "latency_ms": 843,
+  "timestamp": "2026-04-06T15:36:12.471Z"
+}
+```
+
+The `request_id` field is unique per request and can be used for idempotent processing on the receiver side.
+
+### Reliability
+
+Webhooks are best-effort. The `usage_log` database (when `usage_database_url` is configured) remains the durable source of truth. Receivers can reconcile against the usage API for any missed webhook events.
 
 ---
 

@@ -243,6 +243,7 @@ ferrox/             gateway binary crate
     metrics.rs        startup metrics shim
     usage_writer.rs   async batched writer (mpsc → PostgreSQL usage_log)
     budget_enforcer.rs  Redis-backed budget check + reconciliation (Lua scripts)
+    event_dispatcher.rs async webhook dispatcher (mpsc → HTTP POST with retry)
 
     providers/        one file per provider
     lb/               load balancing and circuit breakers

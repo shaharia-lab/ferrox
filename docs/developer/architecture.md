@@ -195,6 +195,7 @@ ferrox/src/
   state.rs            AppState (shared, Arc-wrapped)
   auth.rs             Bearer token auth: static virtual key or JWKS-validated JWT + budget reservation
   budget_enforcer.rs  BudgetEnforcer trait, RedisBudgetEnforcer (Lua scripts), NoopBudgetEnforcer
+  event_dispatcher.rs async webhook dispatcher: mpsc channel → per-endpoint delivery with retry + semaphore
   usage_writer.rs     async batched writer: mpsc channel → background flush to usage_log table
   jwks.rs             JWKS cache: fetch, TTL refresh, stale fallback, background task
   router.rs           ModelRouter: alias -> Arc<RoutePool>
