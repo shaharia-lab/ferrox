@@ -21,6 +21,7 @@ use crate::telemetry::metrics::{
     self, ACTIVE_STREAMS, ERRORS_TOTAL, REQUESTS_TOTAL, REQUEST_DURATION_SECONDS,
 };
 use crate::types::RequestContext;
+use crate::usage_writer::UsageEvent;
 
 // ── Anthropic-format error responses ─────────────────────────────────────────
 
@@ -248,6 +249,16 @@ pub async fn anthropic_messages(
                         usage.prompt_tokens,
                         usage.completion_tokens,
                     );
+
+                    state.usage_writer.record(UsageEvent {
+                        client_id: ctx.client_id,
+                        request_id: ctx.request_id.clone(),
+                        model: model_alias.clone(),
+                        provider: provider_name.clone(),
+                        prompt_tokens: usage.prompt_tokens,
+                        completion_tokens: usage.completion_tokens,
+                        latency_ms: Some((latency * 1000.0) as u64),
+                    });
                 }
                 REQUESTS_TOTAL
                     .with_label_values(&[

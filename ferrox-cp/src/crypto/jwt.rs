@@ -27,6 +27,8 @@ struct RateLimitClaim {
 #[derive(Debug, Serialize, Deserialize)]
 struct FerroxClaim {
     tenant_id: String,
+    /// UUID of the client in the control-plane `clients` table.
+    client_id: String,
     allowed_models: Vec<String>,
     rate_limit: RateLimitClaim,
 }
@@ -85,6 +87,7 @@ impl JwtSigner {
             jti: jti.clone(),
             ferrox: FerroxClaim {
                 tenant_id: client.name.clone(),
+                client_id: client.id.to_string(),
                 allowed_models: client.allowed_models.clone(),
                 rate_limit: RateLimitClaim {
                     requests_per_minute: client.rpm,
@@ -197,6 +200,7 @@ mod tests {
         );
         assert_eq!(token_data.claims.ferrox.rate_limit.burst, client.burst);
         assert_eq!(token_data.claims.ferrox.tenant_id, client.name);
+        assert_eq!(token_data.claims.ferrox.client_id, client.id.to_string());
     }
 
     #[test]

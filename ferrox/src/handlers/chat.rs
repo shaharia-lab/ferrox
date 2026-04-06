@@ -19,6 +19,7 @@ use crate::telemetry::metrics::{
     self, ACTIVE_STREAMS, ERRORS_TOTAL, FALLBACK_TOTAL, REQUESTS_TOTAL, REQUEST_DURATION_SECONDS,
 };
 use crate::types::{ChatCompletionRequest, ChatCompletionResponse, RequestContext};
+use crate::usage_writer::UsageEvent;
 
 pub async fn chat_completions(
     State(state): State<AppState>,
@@ -61,6 +62,17 @@ pub async fn chat_completions(
                 // Clone all labels needed by the two closures (map + chain)
                 let p1 = provider_name.clone();
                 let a1 = alias.clone();
+                let usage_writer = state.usage_writer.clone();
+                let stream_client_id = ctx.client_id;
+                let stream_request_id = ctx.request_id.clone();
+                let stream_model = alias.clone();
+                let stream_provider = provider_name.clone();
+                let accumulated_prompt = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+                let accumulated_completion =
+                    std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+                let acc_p = accumulated_prompt.clone();
+                let acc_c = accumulated_completion.clone();
+
                 let p2 = provider_name.clone();
                 let a2 = alias.clone();
                 let k2 = key_name.clone();
@@ -75,6 +87,14 @@ pub async fn chat_completions(
                                     &a1,
                                     usage.prompt_tokens,
                                     usage.completion_tokens,
+                                );
+                                acc_p.store(
+                                    usage.prompt_tokens,
+                                    std::sync::atomic::Ordering::Relaxed,
+                                );
+                                acc_c.store(
+                                    usage.completion_tokens,
+                                    std::sync::atomic::Ordering::Relaxed,
                                 );
                             }
                             let data = serde_json::to_string(&chunk).unwrap_or_default();
@@ -98,6 +118,23 @@ pub async fn chat_completions(
                         ACTIVE_STREAMS
                             .with_label_values(&[p2.as_str(), a2.as_str()])
                             .dec();
+
+                        // Persist accumulated usage to database
+                        let prompt = accumulated_prompt.load(std::sync::atomic::Ordering::Relaxed);
+                        let completion =
+                            accumulated_completion.load(std::sync::atomic::Ordering::Relaxed);
+                        if prompt > 0 || completion > 0 {
+                            usage_writer.record(UsageEvent {
+                                client_id: stream_client_id,
+                                request_id: stream_request_id,
+                                model: stream_model,
+                                provider: stream_provider,
+                                prompt_tokens: prompt,
+                                completion_tokens: completion,
+                                latency_ms: Some((latency * 1000.0) as u64),
+                            });
+                        }
+
                         tracing::info!(
                             model_alias = %a2,
                             provider = %p2,
@@ -133,6 +170,17 @@ pub async fn chat_completions(
                         usage.prompt_tokens,
                         usage.completion_tokens,
                     );
+
+                    // Persist usage to database
+                    state.usage_writer.record(UsageEvent {
+                        client_id: ctx.client_id,
+                        request_id: ctx.request_id.clone(),
+                        model: req.model.clone(),
+                        provider: provider_name.clone(),
+                        prompt_tokens: usage.prompt_tokens,
+                        completion_tokens: usage.completion_tokens,
+                        latency_ms: Some((latency * 1000.0) as u64),
+                    });
                 }
                 REQUESTS_TOTAL
                     .with_label_values(&[

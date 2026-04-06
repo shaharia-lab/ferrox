@@ -66,6 +66,7 @@ mod tests {
             trusted_issuers: vec![],
             jwks_cache_ttl_secs: 300,
             rate_limiting: RateLimitingConfig::default(),
+            usage_database_url: None,
         };
 
         let registry: ProviderRegistry = HashMap::new();
@@ -80,6 +81,7 @@ mod tests {
             ready: Arc::new(AtomicBool::new(true)),
             jwks_cache: Arc::new(jwks_cache),
             config: Arc::new(config),
+            usage_writer: crate::usage_writer::noop_writer(),
         }
     }
 

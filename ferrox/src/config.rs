@@ -408,6 +408,12 @@ pub struct Config {
     pub jwks_cache_ttl_secs: u64,
     #[serde(default)]
     pub rate_limiting: RateLimitingConfig,
+    /// PostgreSQL connection URL for persisting per-request token usage.
+    /// When set, the gateway writes usage records to the `usage_log` table
+    /// (shared with ferrox-cp) via an async batched writer.
+    /// When absent, usage recording is silently disabled.
+    #[serde(default)]
+    pub usage_database_url: Option<String>,
 }
 
 fn default_jwks_cache_ttl_secs() -> u64 {
@@ -659,6 +665,7 @@ mod tests {
             trusted_issuers: vec![],
             jwks_cache_ttl_secs: default_jwks_cache_ttl_secs(),
             rate_limiting: RateLimitingConfig::default(),
+            usage_database_url: None,
         }
     }
 

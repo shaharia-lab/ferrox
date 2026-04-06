@@ -3,6 +3,30 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use uuid::Uuid;
 
+/// A single per-request token usage record reported by the gateway.
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct UsageRecord {
+    pub id: i64,
+    pub client_id: Uuid,
+    pub request_id: String,
+    pub model: String,
+    pub provider: String,
+    pub prompt_tokens: i32,
+    pub completion_tokens: i32,
+    pub total_tokens: i32,
+    pub latency_ms: Option<i32>,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Aggregated token usage for a client over a time period.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UsageSummary {
+    pub total_prompt_tokens: i64,
+    pub total_completion_tokens: i64,
+    pub total_tokens: i64,
+    pub request_count: i64,
+}
+
 /// A tenant / API client registered in the control plane.
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct Client {

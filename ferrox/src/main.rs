@@ -14,6 +14,7 @@ mod server;
 mod state;
 mod telemetry;
 mod types;
+mod usage_writer;
 
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -116,10 +117,27 @@ async fn main() -> Result<(), anyhow::Error> {
         );
     }
 
-    // 9. Init metrics
+    // 9. Usage writer (optional — requires usage_database_url)
+    let usage_writer = if let Some(ref db_url) = config.usage_database_url {
+        let pool = sqlx::PgPool::connect(db_url)
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to connect to usage database: {}", e))?;
+        tracing::info!("Usage writer: connected to database");
+        usage_writer::spawn_writer(
+            pool,
+            100,                               // batch_size
+            std::time::Duration::from_secs(5), // flush_interval
+            10_000,                            // buffer_capacity
+        )
+    } else {
+        tracing::info!("Usage writer: disabled (no usage_database_url configured)");
+        usage_writer::noop_writer()
+    };
+
+    // 10. Init metrics
     let metrics = Metrics::new();
 
-    // 10. Build AppState
+    // 11. Build AppState
     let ready = Arc::new(AtomicBool::new(false));
     let state = AppState {
         config: Arc::new(config),
@@ -129,6 +147,7 @@ async fn main() -> Result<(), anyhow::Error> {
         metrics: Arc::new(metrics),
         ready: ready.clone(),
         jwks_cache,
+        usage_writer,
     };
 
     // 11. Build axum router

@@ -30,6 +30,7 @@ struct FerroxJwtClaims {
 #[derive(Deserialize)]
 struct FerroxCustomClaims {
     tenant_id: Option<String>,
+    client_id: Option<String>,
     allowed_models: Option<Vec<String>>,
     rate_limit: Option<JwtRateLimitClaims>,
 }
@@ -46,6 +47,7 @@ struct JwtRateLimitClaims {
 struct AuthOutcome {
     key_name: String,
     allowed_models: Vec<String>,
+    client_id: Option<uuid::Uuid>,
 }
 
 // ── Middleware ────────────────────────────────────────────────────────────────
@@ -74,6 +76,7 @@ pub async fn auth_middleware(
         request_id,
         key_name: outcome.key_name,
         allowed_models: outcome.allowed_models,
+        client_id: outcome.client_id,
     };
 
     req.extensions_mut().insert(ctx);
@@ -111,6 +114,7 @@ async fn validate_static_key(token: &str, state: &AppState) -> Result<AuthOutcom
     Ok(AuthOutcome {
         key_name: key_config.name.clone(),
         allowed_models: key_config.allowed_models.clone(),
+        client_id: None, // Static keys have no control-plane identity
     })
 }
 
@@ -200,9 +204,15 @@ async fn validate_jwt(token: &str, state: &AppState) -> Result<AuthOutcome, Prox
         }
     }
 
+    // Parse client_id UUID from ferrox claims (if present)
+    let client_id = ferrox
+        .and_then(|f| f.client_id.as_deref())
+        .and_then(|id| uuid::Uuid::parse_str(id).ok());
+
     Ok(AuthOutcome {
         key_name,
         allowed_models,
+        client_id,
     })
 }
 
@@ -431,6 +441,7 @@ mod tests {
                 trusted_issuers: vec![],
                 jwks_cache_ttl_secs: 300,
                 rate_limiting: RateLimitingConfig::default(),
+                usage_database_url: None,
             }
         }
 
@@ -446,6 +457,7 @@ mod tests {
                 ready: Arc::new(AtomicBool::new(true)),
                 jwks_cache: Arc::new(jwks_cache),
                 config: Arc::new(config),
+                usage_writer: crate::usage_writer::noop_writer(),
             }
         }
 
@@ -538,6 +550,7 @@ mod tests {
                 }],
                 jwks_cache_ttl_secs: 300,
                 rate_limiting: RateLimitingConfig::default(),
+                usage_database_url: None,
             }
         }
 
@@ -564,6 +577,7 @@ mod tests {
                 ready: Arc::new(AtomicBool::new(true)),
                 jwks_cache: Arc::new(jwks_cache),
                 config: Arc::new(config),
+                usage_writer: crate::usage_writer::noop_writer(),
             }
         }
 
