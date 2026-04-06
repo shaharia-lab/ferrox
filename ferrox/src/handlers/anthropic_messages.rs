@@ -15,6 +15,7 @@ use crate::anthropic_types::{
     AnthropicMessagesRequest,
 };
 use crate::error::ProxyError;
+use crate::event_dispatcher::TokenUsageEvent;
 use crate::handlers::chat::{dispatch_non_stream, dispatch_stream, is_model_allowed};
 use crate::state::AppState;
 use crate::telemetry::metrics::{
@@ -217,7 +218,9 @@ pub async fn anthropic_messages(
                 let m2 = model_id.clone();
                 let usage_writer = state.usage_writer.clone();
                 let budget_enforcer = state.budget_enforcer.clone();
+                let event_dispatcher = state.event_dispatcher.clone();
                 let stream_client_id = ctx.client_id;
+                let stream_key_name = ctx.key_name.clone();
                 let stream_budget_period = ctx.budget_period.clone();
                 let stream_budget_reserved = ctx.budget_reserved_tokens;
                 let stream_request_id = ctx.request_id.clone();
@@ -254,6 +257,21 @@ pub async fn anthropic_messages(
                     let completion =
                         accumulated_completion.load(std::sync::atomic::Ordering::Relaxed);
                     if prompt > 0 || completion > 0 {
+                        // Push webhook event (before usage_writer moves the strings)
+                        event_dispatcher.dispatch(TokenUsageEvent {
+                            event: "token_usage",
+                            request_id: stream_request_id.clone(),
+                            client_id: stream_client_id,
+                            key_name: stream_key_name,
+                            model: stream_model.clone(),
+                            provider: stream_provider.clone(),
+                            prompt_tokens: prompt,
+                            completion_tokens: completion,
+                            total_tokens: prompt + completion,
+                            latency_ms: Some((latency * 1000.0) as u64),
+                            timestamp: chrono::Utc::now(),
+                        });
+
                         usage_writer.record(UsageEvent {
                             client_id: stream_client_id,
                             request_id: stream_request_id,
@@ -352,6 +370,21 @@ pub async fn anthropic_messages(
                             )
                             .await;
                     }
+
+                    // Push webhook event
+                    state.event_dispatcher.dispatch(TokenUsageEvent {
+                        event: "token_usage",
+                        request_id: ctx.request_id.clone(),
+                        client_id: ctx.client_id,
+                        key_name: ctx.key_name.clone(),
+                        model: model_alias.clone(),
+                        provider: provider_name.clone(),
+                        prompt_tokens: usage.prompt_tokens,
+                        completion_tokens: usage.completion_tokens,
+                        total_tokens: usage.prompt_tokens + usage.completion_tokens,
+                        latency_ms: Some((latency * 1000.0) as u64),
+                        timestamp: chrono::Utc::now(),
+                    });
                 }
                 REQUESTS_TOTAL
                     .with_label_values(&[

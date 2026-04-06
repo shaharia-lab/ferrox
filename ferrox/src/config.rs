@@ -414,6 +414,34 @@ pub struct Config {
     /// When absent, usage recording is silently disabled.
     #[serde(default)]
     pub usage_database_url: Option<String>,
+    /// Webhook endpoints that receive async push notifications for events
+    /// like token usage.  Each endpoint is called via HTTP POST with a
+    /// JSON payload and Bearer token authentication.
+    #[serde(default)]
+    pub event_endpoints: Vec<EventEndpointConfig>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct EventEndpointConfig {
+    /// Unique name for this endpoint (used in logs and metrics).
+    pub name: String,
+    /// HTTP(S) URL to POST events to.
+    pub url: String,
+    /// Bearer token for authenticating outgoing webhook requests.
+    pub token: String,
+    /// Event types this endpoint subscribes to (e.g., `["token_usage"]`).
+    pub events: Vec<String>,
+}
+
+impl std::fmt::Debug for EventEndpointConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EventEndpointConfig")
+            .field("name", &self.name)
+            .field("url", &self.url)
+            .field("token", &"[REDACTED]")
+            .field("events", &self.events)
+            .finish()
+    }
 }
 
 fn default_jwks_cache_ttl_secs() -> u64 {
@@ -666,6 +694,7 @@ mod tests {
             jwks_cache_ttl_secs: default_jwks_cache_ttl_secs(),
             rate_limiting: RateLimitingConfig::default(),
             usage_database_url: None,
+            event_endpoints: vec![],
         }
     }
 

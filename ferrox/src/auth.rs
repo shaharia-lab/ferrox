@@ -480,6 +480,7 @@ mod tests {
                 jwks_cache_ttl_secs: 300,
                 rate_limiting: RateLimitingConfig::default(),
                 usage_database_url: None,
+                event_endpoints: vec![],
             }
         }
 
@@ -497,6 +498,7 @@ mod tests {
                 config: Arc::new(config),
                 usage_writer: crate::usage_writer::noop_writer(),
                 budget_enforcer: Arc::new(crate::budget_enforcer::NoopBudgetEnforcer),
+                event_dispatcher: crate::event_dispatcher::noop_dispatcher(),
             }
         }
 
@@ -590,6 +592,7 @@ mod tests {
                 jwks_cache_ttl_secs: 300,
                 rate_limiting: RateLimitingConfig::default(),
                 usage_database_url: None,
+                event_endpoints: vec![],
             }
         }
 
@@ -618,6 +621,7 @@ mod tests {
                 config: Arc::new(config),
                 usage_writer: crate::usage_writer::noop_writer(),
                 budget_enforcer: Arc::new(crate::budget_enforcer::NoopBudgetEnforcer),
+                event_dispatcher: crate::event_dispatcher::noop_dispatcher(),
             }
         }
 

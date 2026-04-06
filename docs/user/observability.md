@@ -65,6 +65,13 @@ Metrics are available at `GET /metrics`. All metric names are prefixed `ferrox_`
 | `ferrox_circuit_breaker_state` | Gauge | `provider`, `model_alias` | State: `0`=closed, `1`=open, `2`=half-open |
 | `ferrox_circuit_breaker_trips_total` | Counter | `provider` | Times a circuit transitioned to open |
 
+### Webhook metrics
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `ferrox_webhook_dispatched_total` | Counter | `endpoint` | Webhook events successfully delivered |
+| `ferrox_webhook_errors_total` | Counter | `endpoint` | Delivery failures after all retries exhausted |
+
 ---
 
 ## Prometheus scrape config

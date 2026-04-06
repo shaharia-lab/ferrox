@@ -43,6 +43,12 @@
     "usage_database_url": {
       "type": "string",
       "description": "PostgreSQL connection URL for persisting per-request token usage. Points to the same database as ferrox-cp (usage_log table). When absent, usage recording is disabled."
+    },
+    "event_endpoints": {
+      "type": "array",
+      "items": { "$ref": "#/definitions/EventEndpointConfig" },
+      "default": [],
+      "description": "Webhook endpoints that receive async push notifications for events like token usage."
     }
   },
   "definitions": {
@@ -269,6 +275,32 @@
         "audience": {
           "type": "string",
           "description": "Expected value of the JWT `aud` claim. Omit to skip audience validation."
+        }
+      }
+    },
+    "EventEndpointConfig": {
+      "type": "object",
+      "required": ["name", "url", "token", "events"],
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Unique identifier for this endpoint (used in logs and metrics)."
+        },
+        "url": {
+          "type": "string",
+          "description": "HTTP(S) URL to POST events to."
+        },
+        "token": {
+          "type": "string",
+          "description": "Bearer token for authenticating outgoing webhook requests."
+        },
+        "events": {
+          "type": "array",
+          "items": { "type": "string", "enum": ["token_usage"] },
+          "minItems": 1,
+          "description": "Event types this endpoint subscribes to."
         }
       }
     }

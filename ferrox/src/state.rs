@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use crate::budget_enforcer::BudgetEnforcer;
 use crate::config::Config;
+use crate::event_dispatcher::EventDispatcher;
 use crate::jwks::JwksCache;
 use crate::metrics::Metrics;
 use crate::providers::ProviderRegistry;
@@ -26,4 +27,6 @@ pub struct AppState {
     pub usage_writer: UsageWriter,
     /// Redis-backed real-time budget enforcement.  No-op when Redis is not configured.
     pub budget_enforcer: Arc<dyn BudgetEnforcer>,
+    /// Async webhook dispatcher for pushing events to external systems.
+    pub event_dispatcher: EventDispatcher,
 }

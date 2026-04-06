@@ -3,6 +3,7 @@ mod auth;
 mod budget_enforcer;
 mod config;
 mod error;
+mod event_dispatcher;
 mod handlers;
 mod jwks;
 mod lb;
@@ -160,10 +161,24 @@ async fn main() -> Result<(), anyhow::Error> {
             }
         };
 
-    // 11. Init metrics
+    // 11. Event dispatcher (webhook push notifications)
+    let event_dispatcher = if config.event_endpoints.is_empty() {
+        tracing::info!("Event dispatcher: disabled (no event_endpoints configured)");
+        event_dispatcher::noop_dispatcher()
+    } else {
+        tracing::info!(
+            count = config.event_endpoints.len(),
+            "Event dispatcher: {} endpoint(s) configured",
+            config.event_endpoints.len()
+        );
+        event_dispatcher::register_metrics();
+        event_dispatcher::spawn_dispatcher(config.event_endpoints.clone(), 10_000)
+    };
+
+    // 12. Init metrics
     let metrics = Metrics::new();
 
-    // 12. Build AppState
+    // 13. Build AppState
     let ready = Arc::new(AtomicBool::new(false));
     let state = AppState {
         config: Arc::new(config),
@@ -175,6 +190,7 @@ async fn main() -> Result<(), anyhow::Error> {
         jwks_cache,
         usage_writer,
         budget_enforcer,
+        event_dispatcher,
     };
 
     // 11. Build axum router

@@ -11,6 +11,7 @@ use futures::StreamExt;
 
 use crate::config::RetryConfig;
 use crate::error::ProxyError;
+use crate::event_dispatcher::TokenUsageEvent;
 use crate::lb::{RoutePool, RouteTarget};
 use crate::providers::ProviderStream;
 use crate::retry::{execute_with_retry, is_retryable};
@@ -65,7 +66,9 @@ pub async fn chat_completions(
                 let k1 = key_name.clone();
                 let usage_writer = state.usage_writer.clone();
                 let budget_enforcer = state.budget_enforcer.clone();
+                let event_dispatcher = state.event_dispatcher.clone();
                 let stream_client_id = ctx.client_id;
+                let stream_key_name = key_name.clone();
                 let stream_budget_period = ctx.budget_period.clone();
                 let stream_budget_reserved = ctx.budget_reserved_tokens;
                 let stream_request_id = ctx.request_id.clone();
@@ -129,6 +132,21 @@ pub async fn chat_completions(
                         let completion =
                             accumulated_completion.load(std::sync::atomic::Ordering::Relaxed);
                         if prompt > 0 || completion > 0 {
+                            // Push webhook event (clone before usage_writer moves the strings)
+                            event_dispatcher.dispatch(TokenUsageEvent {
+                                event: "token_usage",
+                                request_id: stream_request_id.clone(),
+                                client_id: stream_client_id,
+                                key_name: stream_key_name,
+                                model: stream_model.clone(),
+                                provider: stream_provider.clone(),
+                                prompt_tokens: prompt,
+                                completion_tokens: completion,
+                                total_tokens: prompt + completion,
+                                latency_ms: Some((latency * 1000.0) as u64),
+                                timestamp: chrono::Utc::now(),
+                            });
+
                             usage_writer.record(UsageEvent {
                                 client_id: stream_client_id,
                                 request_id: stream_request_id,
@@ -215,6 +233,21 @@ pub async fn chat_completions(
                             )
                             .await;
                     }
+
+                    // Push webhook event
+                    state.event_dispatcher.dispatch(TokenUsageEvent {
+                        event: "token_usage",
+                        request_id: ctx.request_id.clone(),
+                        client_id: ctx.client_id,
+                        key_name: ctx.key_name.clone(),
+                        model: req.model.clone(),
+                        provider: provider_name.clone(),
+                        prompt_tokens: usage.prompt_tokens,
+                        completion_tokens: usage.completion_tokens,
+                        total_tokens: usage.prompt_tokens + usage.completion_tokens,
+                        latency_ms: Some((latency * 1000.0) as u64),
+                        timestamp: chrono::Utc::now(),
+                    });
                 }
                 REQUESTS_TOTAL
                     .with_label_values(&[

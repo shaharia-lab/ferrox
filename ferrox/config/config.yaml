@@ -218,3 +218,19 @@ virtual_keys:
     rate_limit:
       requests_per_minute: 120
       burst: 20
+
+# ─────────────────────────────────────────
+# Event webhook endpoints (optional)
+# Push per-request token usage events to external systems in real time.
+# Each endpoint receives an async HTTP POST with a JSON payload.
+# ─────────────────────────────────────────
+# event_endpoints:
+#   - name: "billing-webhook"
+#     url: "${BILLING_WEBHOOK_URL}"
+#     token: "${BILLING_WEBHOOK_TOKEN}"
+#     events: ["token_usage"]
+#
+#   - name: "analytics"
+#     url: "https://analytics.internal/ingest"
+#     token: "${ANALYTICS_TOKEN}"
+#     events: ["token_usage"]
