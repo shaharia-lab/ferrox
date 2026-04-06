@@ -76,23 +76,29 @@ pub async fn auth_middleware(
         .map(|s| s.to_string())
         .unwrap_or_else(|| Uuid::new_v4().to_string());
 
-    // Pre-request budget check (Redis-backed, if configured)
-    if let (Some(ref client_id), Some(budget), Some(ref period)) = (
+    // Pre-request budget reservation (Redis-backed, if configured).
+    // Reserves a pessimistic token estimate; handlers reconcile after the response.
+    let budget_reserved_tokens = if let (Some(ref client_id), Some(budget), Some(ref period)) = (
         &outcome.client_id,
         outcome.token_budget,
         &outcome.budget_period,
     ) {
-        if let Err(()) = state
+        let estimate = crate::budget_enforcer::DEFAULT_RESERVE_TOKENS;
+        if state
             .budget_enforcer
-            .check_budget(&client_id.to_string(), period, budget)
+            .reserve_tokens(&client_id.to_string(), period, budget, estimate)
             .await
+            .is_err()
         {
             return Err(ProxyError::BudgetExceeded(format!(
                 "Token budget exceeded for '{}'",
                 outcome.key_name
             )));
         }
-    }
+        estimate
+    } else {
+        0
+    };
 
     let ctx = RequestContext {
         request_id,
@@ -101,6 +107,7 @@ pub async fn auth_middleware(
         client_id: outcome.client_id,
         token_budget: outcome.token_budget,
         budget_period: outcome.budget_period,
+        budget_reserved_tokens,
     };
 
     req.extensions_mut().insert(ctx);

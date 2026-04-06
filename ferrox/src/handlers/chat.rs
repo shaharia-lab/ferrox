@@ -67,6 +67,7 @@ pub async fn chat_completions(
                 let budget_enforcer = state.budget_enforcer.clone();
                 let stream_client_id = ctx.client_id;
                 let stream_budget_period = ctx.budget_period.clone();
+                let stream_budget_reserved = ctx.budget_reserved_tokens;
                 let stream_request_id = ctx.request_id.clone();
                 let stream_model = alias.clone();
                 let stream_provider = provider_name.clone();
@@ -138,12 +139,17 @@ pub async fn chat_completions(
                                 latency_ms: Some((latency * 1000.0) as u64),
                             });
 
-                            // Record tokens in Redis budget counter
+                            // Reconcile budget reservation with actual usage
                             if let (Some(ref cid), Some(ref period)) =
                                 (&stream_client_id, &stream_budget_period)
                             {
                                 budget_enforcer
-                                    .record_tokens(&cid.to_string(), period, prompt + completion)
+                                    .reconcile_tokens(
+                                        &cid.to_string(),
+                                        period,
+                                        stream_budget_reserved,
+                                        prompt + completion,
+                                    )
                                     .await;
                             }
                         }
@@ -196,14 +202,15 @@ pub async fn chat_completions(
                         latency_ms: Some((latency * 1000.0) as u64),
                     });
 
-                    // Record tokens in Redis budget counter
+                    // Reconcile budget reservation with actual usage
                     if let (Some(ref cid), Some(ref period)) = (&ctx.client_id, &ctx.budget_period)
                     {
                         state
                             .budget_enforcer
-                            .record_tokens(
+                            .reconcile_tokens(
                                 &cid.to_string(),
                                 period,
+                                ctx.budget_reserved_tokens,
                                 usage.prompt_tokens + usage.completion_tokens,
                             )
                             .await;

@@ -266,14 +266,15 @@ pub async fn anthropic_messages(
                         latency_ms: Some((latency * 1000.0) as u64),
                     });
 
-                    // Record tokens in Redis budget counter
+                    // Reconcile budget reservation with actual usage
                     if let (Some(ref cid), Some(ref period)) = (&ctx.client_id, &ctx.budget_period)
                     {
                         state
                             .budget_enforcer
-                            .record_tokens(
+                            .reconcile_tokens(
                                 &cid.to_string(),
                                 period,
+                                ctx.budget_reserved_tokens,
                                 usage.prompt_tokens + usage.completion_tokens,
                             )
                             .await;

@@ -1,22 +1,36 @@
 use async_trait::async_trait;
 use deadpool_redis::Pool;
 
-/// Pre-request budget check + post-response token recording.
+/// Pre-request budget reservation + post-response reconciliation.
 ///
 /// Uses Redis as a fast distributed counter. The key pattern is
 /// `ferrox:budget:{client_id}:{period}` with a TTL matching the budget period.
+///
+/// The reserve-then-reconcile pattern avoids the TOCTOU race:
+/// 1. `reserve_tokens`: atomically checks budget AND increments the counter
+///    by a pessimistic estimate (request's `max_tokens`).
+/// 2. `reconcile_tokens`: after the response, adjusts the counter to reflect
+///    actual usage (refunds unused reserved tokens).
 ///
 /// On Redis unavailability, falls back to allowing the request (fail-open),
 /// relying on Phase 3's periodic soft enforcement as a safety net.
 #[async_trait]
 pub trait BudgetEnforcer: Send + Sync {
-    /// Check if the client is within budget.  Returns `Ok(())` if allowed,
-    /// `Err(())` if the budget is exhausted.
-    async fn check_budget(&self, client_id: &str, period: &str, budget: i64) -> Result<(), ()>;
+    /// Atomically check budget and reserve `estimated_tokens`.
+    /// Returns `Ok(())` if the reservation succeeds (within budget),
+    /// `Err(())` if the budget would be exceeded.
+    async fn reserve_tokens(
+        &self,
+        client_id: &str,
+        period: &str,
+        budget: i64,
+        estimated_tokens: u32,
+    ) -> Result<(), ()>;
 
-    /// Record actual tokens consumed after a response completes.
-    /// Atomically increments the Redis counter.
-    async fn record_tokens(&self, client_id: &str, period: &str, tokens: u32);
+    /// Reconcile the reservation with actual token usage.
+    /// If `actual < reserved`, refunds the difference.
+    /// If `actual > reserved`, increments by the difference.
+    async fn reconcile_tokens(&self, client_id: &str, period: &str, reserved: u32, actual: u32);
 }
 
 /// No-op enforcer used when Redis is not configured.
@@ -25,11 +39,24 @@ pub struct NoopBudgetEnforcer;
 
 #[async_trait]
 impl BudgetEnforcer for NoopBudgetEnforcer {
-    async fn check_budget(&self, _client_id: &str, _period: &str, _budget: i64) -> Result<(), ()> {
+    async fn reserve_tokens(
+        &self,
+        _client_id: &str,
+        _period: &str,
+        _budget: i64,
+        _estimated_tokens: u32,
+    ) -> Result<(), ()> {
         Ok(())
     }
 
-    async fn record_tokens(&self, _client_id: &str, _period: &str, _tokens: u32) {}
+    async fn reconcile_tokens(
+        &self,
+        _client_id: &str,
+        _period: &str,
+        _reserved: u32,
+        _actual: u32,
+    ) {
+    }
 }
 
 /// Redis-backed budget enforcer.
@@ -49,31 +76,39 @@ impl RedisBudgetEnforcer {
     }
 }
 
-/// Lua script for atomic budget check.
-/// Returns 1 if within budget, 0 if exceeded.
-const BUDGET_CHECK_LUA: &str = r#"
-local key    = KEYS[1]
-local budget = tonumber(ARGV[1])
+/// Lua script for atomic budget check + reservation.
+/// Checks if current + reserve <= budget; if so, increments and returns 1.
+/// Also sets TTL on first write.  Returns 0 if budget would be exceeded.
+const RESERVE_LUA: &str = r#"
+local key     = KEYS[1]
+local reserve = tonumber(ARGV[1])
+local budget  = tonumber(ARGV[2])
+local ttl     = tonumber(ARGV[3])
 
 local current = tonumber(redis.call('GET', key) or "0")
-if current < budget then
-    return 1
-else
+if current + reserve > budget then
     return 0
 end
-"#;
-
-/// Lua script for atomic token recording with TTL management.
-/// Increments the counter by the given amount and sets TTL if the key is new.
-const RECORD_TOKENS_LUA: &str = r#"
-local key    = KEYS[1]
-local tokens = tonumber(ARGV[1])
-local ttl    = tonumber(ARGV[2])
-
-local new_val = redis.call('INCRBY', key, tokens)
--- Set TTL only if the key doesn't have one yet (first write in this period)
+redis.call('INCRBY', key, reserve)
 if redis.call('TTL', key) == -1 then
     redis.call('EXPIRE', key, ttl)
+end
+return 1
+"#;
+
+/// Lua script for reconciliation: adjusts the counter by a delta.
+/// delta > 0 means actual > reserved (under-estimated — add more).
+/// delta < 0 means actual < reserved (over-estimated — refund).
+const RECONCILE_LUA: &str = r#"
+local key   = KEYS[1]
+local delta = tonumber(ARGV[1])
+
+if delta == 0 then return 0 end
+local new_val = redis.call('INCRBY', key, delta)
+-- Prevent counter from going negative (safety guard)
+if new_val < 0 then
+    redis.call('SET', key, 0)
+    new_val = 0
 end
 return new_val
 "#;
@@ -88,32 +123,44 @@ fn period_ttl_secs(period: &str) -> i64 {
 
 #[async_trait]
 impl BudgetEnforcer for RedisBudgetEnforcer {
-    async fn check_budget(&self, client_id: &str, period: &str, budget: i64) -> Result<(), ()> {
+    async fn reserve_tokens(
+        &self,
+        client_id: &str,
+        period: &str,
+        budget: i64,
+        estimated_tokens: u32,
+    ) -> Result<(), ()> {
         let redis_key = format!("{}budget:{}:{}", self.key_prefix, client_id, period);
+        let ttl = period_ttl_secs(period);
 
         let mut conn = match self.pool.get().await {
             Ok(c) => c,
             Err(e) => {
-                tracing::warn!(error = %e, client_id = %client_id, "Redis unavailable for budget check");
+                tracing::warn!(error = %e, client_id = %client_id, "Redis unavailable for budget reservation");
                 return if self.fail_open { Ok(()) } else { Err(()) };
             }
         };
 
-        let script = redis::Script::new(BUDGET_CHECK_LUA);
+        let script = redis::Script::new(RESERVE_LUA);
         let result: redis::RedisResult<i64> = script
             .key(&redis_key)
+            .arg(estimated_tokens as i64)
             .arg(budget)
+            .arg(ttl)
             .invoke_async(&mut conn)
             .await;
 
         match result {
             Ok(1) => Ok(()),
             Ok(_) => {
-                tracing::info!(client_id = %client_id, "budget exhausted — blocking request");
+                tracing::info!(
+                    client_id = %client_id,
+                    "budget exhausted — blocking request"
+                );
                 Err(())
             }
             Err(e) => {
-                tracing::warn!(error = %e, client_id = %client_id, "Redis script error in budget check");
+                tracing::warn!(error = %e, client_id = %client_id, "Redis script error in budget reservation");
                 if self.fail_open {
                     Ok(())
                 } else {
@@ -123,27 +170,26 @@ impl BudgetEnforcer for RedisBudgetEnforcer {
         }
     }
 
-    async fn record_tokens(&self, client_id: &str, period: &str, tokens: u32) {
-        if tokens == 0 {
+    async fn reconcile_tokens(&self, client_id: &str, period: &str, reserved: u32, actual: u32) {
+        let delta = actual as i64 - reserved as i64;
+        if delta == 0 {
             return;
         }
 
         let redis_key = format!("{}budget:{}:{}", self.key_prefix, client_id, period);
-        let ttl = period_ttl_secs(period);
 
         let mut conn = match self.pool.get().await {
             Ok(c) => c,
             Err(e) => {
-                tracing::warn!(error = %e, client_id = %client_id, "Redis unavailable for token recording");
+                tracing::warn!(error = %e, client_id = %client_id, "Redis unavailable for budget reconciliation");
                 return;
             }
         };
 
-        let script = redis::Script::new(RECORD_TOKENS_LUA);
+        let script = redis::Script::new(RECONCILE_LUA);
         let result: redis::RedisResult<i64> = script
             .key(&redis_key)
-            .arg(tokens as i64)
-            .arg(ttl)
+            .arg(delta)
             .invoke_async(&mut conn)
             .await;
 
@@ -151,17 +197,22 @@ impl BudgetEnforcer for RedisBudgetEnforcer {
             Ok(new_total) => {
                 tracing::debug!(
                     client_id = %client_id,
-                    tokens = tokens,
+                    reserved = reserved,
+                    actual = actual,
+                    delta = delta,
                     new_total = new_total,
-                    "recorded tokens in budget counter"
+                    "reconciled budget counter"
                 );
             }
             Err(e) => {
-                tracing::warn!(error = %e, client_id = %client_id, "failed to record tokens in Redis");
+                tracing::warn!(error = %e, client_id = %client_id, "failed to reconcile budget counter");
             }
         }
     }
 }
+
+/// Default reservation estimate when `max_tokens` is not provided in the request.
+pub const DEFAULT_RESERVE_TOKENS: u32 = 4096;
 
 #[cfg(test)]
 mod tests {
@@ -171,11 +222,13 @@ mod tests {
     async fn noop_enforcer_always_allows() {
         let enforcer = NoopBudgetEnforcer;
         assert!(enforcer
-            .check_budget("client-1", "daily", 1000)
+            .reserve_tokens("client-1", "daily", 1000, 500)
             .await
             .is_ok());
-        // record_tokens should not panic
-        enforcer.record_tokens("client-1", "daily", 500).await;
+        // reconcile should not panic
+        enforcer
+            .reconcile_tokens("client-1", "daily", 500, 300)
+            .await;
     }
 
     #[tokio::test]
