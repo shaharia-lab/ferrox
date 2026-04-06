@@ -122,7 +122,7 @@ The gateway runs standalone — it only needs provider API keys. Control plane, 
 
 ### Control plane (ferrox-cp)
 
-The control plane requires PostgreSQL and a few environment variables.
+The control plane requires PostgreSQL and a few environment variables. All are defined in `.env.example` — fill them in your `.env` file.
 
 ```bash
 # 1. Start a local Postgres instance
@@ -133,19 +133,27 @@ docker run --name ferrox-cp-pg \
   -p 5432:5432 \
   -d postgres:16-alpine
 
-# 2. Generate required secrets (one-time)
-CP_ENCRYPTION_KEY=$(openssl rand -hex 32)   # 64 hex chars, encrypts private keys at rest
-CP_ADMIN_KEY=$(openssl rand -hex 20)        # admin API bearer token
+# 2. Generate required secrets and add to your .env file
+#    CP_ENCRYPTION_KEY — 64 hex chars, encrypts private keys at rest
+openssl rand -hex 32
+#    CP_ADMIN_KEY — admin API bearer token, min 32 chars
+openssl rand -hex 20
 
-# 3. Run the control plane
-DATABASE_URL="postgres://ferrox:ferrox@localhost:5432/ferrox_cp" \
-  CP_ENCRYPTION_KEY="$CP_ENCRYPTION_KEY" \
-  CP_ADMIN_KEY="$CP_ADMIN_KEY" \
-  CP_ISSUER="http://localhost:9090" \
-  cargo run -p ferrox-cp
+# 3. Run the control plane (loads .env automatically)
+set -a && . ./.env && set +a
+cargo run -p ferrox-cp
 ```
 
-The control plane runs on port 9090 by default. On startup it:
+Required environment variables (see `.env.example` for the full list):
+
+| Variable | Description |
+|---|---|
+| `DATABASE_URL` | PostgreSQL connection string |
+| `CP_ENCRYPTION_KEY` | 64 hex chars — AES-256-GCM key for private keys at rest |
+| `CP_ADMIN_KEY` | Bearer token for the admin REST API and UI |
+| `CP_ISSUER` | JWT `iss` claim value — must match gateway `trusted_issuers` |
+
+The control plane runs on port 9090 by default (`CP_PORT`). On startup it:
 - Runs database migrations automatically
 - Generates an RSA-2048 signing key (if none exist)
 - Starts background tasks (key retirement, budget enforcement)
@@ -167,15 +175,12 @@ trusted_issuers:
 usage_database_url: "postgres://ferrox:ferrox@localhost:5432/ferrox_cp"
 ```
 
-Then start both services (in separate terminals):
+Then start both services (in separate terminals). Both load from `.env`:
 
 ```bash
-# Terminal 1: control plane (no Makefile target — run manually)
-DATABASE_URL="postgres://ferrox:ferrox@localhost:5432/ferrox_cp" \
-  CP_ENCRYPTION_KEY="$CP_ENCRYPTION_KEY" \
-  CP_ADMIN_KEY="$CP_ADMIN_KEY" \
-  CP_ISSUER="http://localhost:9090" \
-  cargo run -p ferrox-cp
+# Terminal 1: control plane
+set -a && . ./.env && set +a
+cargo run -p ferrox-cp
 
 # Terminal 2: gateway
 make run
