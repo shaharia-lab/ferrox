@@ -46,6 +46,12 @@ pub struct Client {
     pub active: bool,
     pub created_at: DateTime<Utc>,
     pub revoked_at: Option<DateTime<Utc>>,
+    /// Maximum tokens allowed per budget period.  `None` means unlimited.
+    pub token_budget: Option<i64>,
+    /// Budget period: "daily", "monthly", or `None` (unlimited).
+    pub budget_period: Option<String>,
+    /// Start of the current budget period.  Reset by the budget checker.
+    pub budget_reset_at: Option<DateTime<Utc>>,
 }
 
 /// An RSA signing keypair used to issue JWTs.
@@ -82,6 +88,7 @@ pub enum AuditEvent {
     ClientCreated,
     ClientRevoked,
     KeyRotated,
+    BudgetExceeded,
     #[serde(untagged)]
     Other(String),
 }
@@ -93,6 +100,7 @@ impl AuditEvent {
             Self::ClientCreated => "client_created",
             Self::ClientRevoked => "client_revoked",
             Self::KeyRotated => "key_rotated",
+            Self::BudgetExceeded => "budget_exceeded",
             Self::Other(s) => s.as_str(),
         }
     }
@@ -108,6 +116,7 @@ impl<'r> sqlx::Decode<'r, sqlx::Postgres> for AuditEvent {
             "client_created" => Self::ClientCreated,
             "client_revoked" => Self::ClientRevoked,
             "key_rotated" => Self::KeyRotated,
+            "budget_exceeded" => Self::BudgetExceeded,
             other => Self::Other(other.to_string()),
         })
     }

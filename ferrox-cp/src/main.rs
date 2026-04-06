@@ -1,6 +1,7 @@
 // ferrox-cp: control plane for the Ferrox LLM gateway
 // Phase 3 — public API + admin API + embedded admin UI.
 #![allow(dead_code)]
+mod budget;
 mod config;
 mod crypto;
 mod db;
@@ -25,7 +26,8 @@ use db::signing_key_repo::SigningKeyRepository;
 use error::CpError;
 use handlers::admin::audit::list_audit;
 use handlers::admin::clients::{
-    client_usage, client_usage_details, create_client, get_client, list_clients, revoke_client,
+    client_usage, client_usage_details, create_client, get_client, list_clients, reactivate_client,
+    revoke_client, update_client_budget,
 };
 use handlers::admin::signing_keys::{list_signing_keys, rotate_keys};
 use handlers::{health::health_handler, jwks::jwks_handler, token::token_handler};
@@ -91,6 +93,10 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    // Spawn background task: check token budgets and revoke over-budget clients.
+    // Runs every 60 seconds.
+    budget::spawn_budget_checker(state.db.clone(), Duration::from_secs(60));
+
     // ── Public routes (no auth) ──────────────────────────────────────────────
     let public_routes = Router::new()
         .route("/.well-known/jwks.json", get(jwks_handler))
@@ -103,6 +109,11 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/clients/:id", get(get_client).delete(revoke_client))
         .route("/api/clients/:id/usage", get(client_usage))
         .route("/api/clients/:id/usage/details", get(client_usage_details))
+        .route(
+            "/api/clients/:id/budget",
+            axum::routing::patch(update_client_budget),
+        )
+        .route("/api/clients/:id/reactivate", post(reactivate_client))
         .route("/api/signing-keys", get(list_signing_keys))
         .route("/api/signing-keys/rotate", post(rotate_keys))
         .route("/api/audit", get(list_audit))

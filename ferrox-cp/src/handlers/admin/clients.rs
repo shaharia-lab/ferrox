@@ -26,6 +26,8 @@ pub struct CreateClientRequest {
     pub rpm: i32,
     pub burst: i32,
     pub token_ttl_seconds: i32,
+    pub token_budget: Option<i64>,
+    pub budget_period: Option<String>,
 }
 
 impl CreateClientRequest {
@@ -46,6 +48,45 @@ impl CreateClientRequest {
         if self.token_ttl_seconds <= 0 {
             return Err("token_ttl_seconds must be greater than zero");
         }
+        if let Some(budget) = self.token_budget {
+            if budget <= 0 {
+                return Err("token_budget must be greater than zero");
+            }
+        }
+        if let Some(ref period) = self.budget_period {
+            if period != "daily" && period != "monthly" {
+                return Err("budget_period must be 'daily' or 'monthly'");
+            }
+        }
+        // Budget and period must be set together.
+        if self.token_budget.is_some() != self.budget_period.is_some() {
+            return Err("token_budget and budget_period must both be set or both be null");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UpdateBudgetRequest {
+    pub token_budget: Option<i64>,
+    pub budget_period: Option<String>,
+}
+
+impl UpdateBudgetRequest {
+    fn validate(&self) -> Result<(), &'static str> {
+        if let Some(budget) = self.token_budget {
+            if budget <= 0 {
+                return Err("token_budget must be greater than zero");
+            }
+        }
+        if let Some(ref period) = self.budget_period {
+            if period != "daily" && period != "monthly" {
+                return Err("budget_period must be 'daily' or 'monthly'");
+            }
+        }
+        if self.token_budget.is_some() != self.budget_period.is_some() {
+            return Err("token_budget and budget_period must both be set or both be null");
+        }
         Ok(())
     }
 }
@@ -64,6 +105,8 @@ pub struct CreateClientResponse {
     pub token_ttl_seconds: i32,
     pub active: bool,
     pub created_at: DateTime<Utc>,
+    pub token_budget: Option<i64>,
+    pub budget_period: Option<String>,
 }
 
 /// Safe client representation (no key material).
@@ -79,6 +122,9 @@ pub struct ClientResponse {
     pub active: bool,
     pub created_at: DateTime<Utc>,
     pub revoked_at: Option<DateTime<Utc>>,
+    pub token_budget: Option<i64>,
+    pub budget_period: Option<String>,
+    pub budget_reset_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -181,6 +227,18 @@ pub async fn create_client(
             }
         })?;
 
+    // Set budget if provided.
+    let client = if req.token_budget.is_some() {
+        repo.update_budget(client.id, req.token_budget, req.budget_period.as_deref())
+            .await
+            .map_err(|e| {
+                error!(error = %e, "db error setting budget");
+                api_error(StatusCode::INTERNAL_SERVER_ERROR, "database error")
+            })?
+    } else {
+        client
+    };
+
     // Audit log — non-fatal.
     let audit_meta = serde_json::json!({ "name": client.name });
     if let Err(e) = AuditRepository::new(&state.db)
@@ -209,6 +267,8 @@ pub async fn create_client(
             token_ttl_seconds: client.token_ttl_seconds,
             active: client.active,
             created_at: client.created_at,
+            token_budget: client.token_budget,
+            budget_period: client.budget_period,
         }),
     ))
 }
@@ -328,6 +388,55 @@ pub async fn client_usage(
     }))
 }
 
+/// `PATCH /api/clients/:id/budget`
+///
+/// Update token budget settings for a client.
+pub async fn update_client_budget(
+    State(state): State<CpState>,
+    Path(id): Path<Uuid>,
+    Json(req): Json<UpdateBudgetRequest>,
+) -> Result<Json<ClientResponse>, (StatusCode, Json<serde_json::Value>)> {
+    req.validate()
+        .map_err(|msg| api_error(StatusCode::UNPROCESSABLE_ENTITY, msg))?;
+
+    let repo = ClientRepository::new(&state.db);
+    let client = repo
+        .update_budget(id, req.token_budget, req.budget_period.as_deref())
+        .await
+        .map_err(|e| {
+            if matches!(e, crate::db::error::RepoError::NotFound(_)) {
+                api_error(StatusCode::NOT_FOUND, "client not found")
+            } else {
+                error!(error = %e, "db error updating budget");
+                api_error(StatusCode::INTERNAL_SERVER_ERROR, "database error")
+            }
+        })?;
+
+    info!(client_id = %id, budget = ?req.token_budget, period = ?req.budget_period, "budget updated");
+    Ok(Json(client_to_response(client)))
+}
+
+/// `POST /api/clients/:id/reactivate`
+///
+/// Re-activate a revoked client and reset its budget period.
+pub async fn reactivate_client(
+    State(state): State<CpState>,
+    Path(id): Path<Uuid>,
+) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
+    let repo = ClientRepository::new(&state.db);
+    repo.reactivate(id).await.map_err(|e| {
+        if matches!(e, crate::db::error::RepoError::NotFound(_)) {
+            api_error(StatusCode::NOT_FOUND, "client not found or already active")
+        } else {
+            error!(error = %e, "db error reactivating client");
+            api_error(StatusCode::INTERNAL_SERVER_ERROR, "database error")
+        }
+    })?;
+
+    info!(client_id = %id, "client reactivated");
+    Ok(StatusCode::NO_CONTENT)
+}
+
 /// `GET /api/clients/:id/usage/details`
 ///
 /// Returns paginated per-request usage records from `usage_log`.
@@ -398,6 +507,9 @@ fn client_to_response(c: crate::db::models::Client) -> ClientResponse {
         active: c.active,
         created_at: c.created_at,
         revoked_at: c.revoked_at,
+        token_budget: c.token_budget,
+        budget_period: c.budget_period,
+        budget_reset_at: c.budget_reset_at,
     }
 }
 
@@ -456,6 +568,11 @@ mod tests {
             .route("/api/clients/:id", get(get_client).delete(revoke_client))
             .route("/api/clients/:id/usage", get(client_usage))
             .route("/api/clients/:id/usage/details", get(client_usage_details))
+            .route(
+                "/api/clients/:id/budget",
+                axum::routing::patch(update_client_budget),
+            )
+            .route("/api/clients/:id/reactivate", post(reactivate_client))
             .layer(axum::middleware::from_fn_with_state(
                 state.clone(),
                 require_admin_key,
@@ -863,6 +980,167 @@ mod tests {
             .oneshot(admin_request(
                 "GET",
                 &format!("/api/clients/{}/usage/details", Uuid::new_v4()),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn create_client_with_budget_fields(pool: sqlx::PgPool) {
+        let app = make_app(make_state(pool));
+        let resp = app
+            .oneshot(admin_request(
+                "POST",
+                "/api/clients",
+                Some(r#"{"name":"budgeted","allowed_models":["*"],"rpm":10,"burst":5,"token_ttl_seconds":900,"token_budget":100000,"budget_period":"monthly"}"#),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let body: serde_json::Value =
+            serde_json::from_slice(&axum::body::to_bytes(resp.into_body(), 4096).await.unwrap())
+                .unwrap();
+        assert_eq!(body["token_budget"].as_i64().unwrap(), 100000);
+        assert_eq!(body["budget_period"].as_str().unwrap(), "monthly");
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn create_client_rejects_mismatched_budget(pool: sqlx::PgPool) {
+        let app = make_app(make_state(pool));
+        // token_budget without budget_period
+        let resp = app
+            .oneshot(admin_request(
+                "POST",
+                "/api/clients",
+                Some(r#"{"name":"bad","allowed_models":["*"],"rpm":10,"burst":5,"token_ttl_seconds":900,"token_budget":100000}"#),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn update_budget_and_get_client_shows_budget(pool: sqlx::PgPool) {
+        let state = make_state(pool.clone());
+        let app = make_app(state);
+
+        // Create a client without budget.
+        let resp = app
+            .clone()
+            .oneshot(admin_request(
+                "POST",
+                "/api/clients",
+                Some(r#"{"name":"patch-test","allowed_models":["*"],"rpm":10,"burst":5,"token_ttl_seconds":900}"#),
+            ))
+            .await
+            .unwrap();
+        let created: serde_json::Value =
+            serde_json::from_slice(&axum::body::to_bytes(resp.into_body(), 4096).await.unwrap())
+                .unwrap();
+        let id = created["id"].as_str().unwrap();
+
+        // PATCH budget.
+        let resp = app
+            .clone()
+            .oneshot(admin_request(
+                "PATCH",
+                &format!("/api/clients/{id}/budget"),
+                Some(r#"{"token_budget":50000,"budget_period":"daily"}"#),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: serde_json::Value =
+            serde_json::from_slice(&axum::body::to_bytes(resp.into_body(), 4096).await.unwrap())
+                .unwrap();
+        assert_eq!(body["token_budget"].as_i64().unwrap(), 50000);
+        assert_eq!(body["budget_period"].as_str().unwrap(), "daily");
+        assert!(body["budget_reset_at"].is_string());
+
+        // GET client should also show budget.
+        let resp = app
+            .oneshot(admin_request("GET", &format!("/api/clients/{id}"), None))
+            .await
+            .unwrap();
+        let body: serde_json::Value =
+            serde_json::from_slice(&axum::body::to_bytes(resp.into_body(), 4096).await.unwrap())
+                .unwrap();
+        assert_eq!(body["token_budget"].as_i64().unwrap(), 50000);
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn reactivate_revoked_client(pool: sqlx::PgPool) {
+        let state = make_state(pool.clone());
+        let app = make_app(state);
+
+        // Create and revoke a client.
+        let resp = app
+            .clone()
+            .oneshot(admin_request(
+                "POST",
+                "/api/clients",
+                Some(r#"{"name":"reactivate-me","allowed_models":["*"],"rpm":10,"burst":5,"token_ttl_seconds":900}"#),
+            ))
+            .await
+            .unwrap();
+        let created: serde_json::Value =
+            serde_json::from_slice(&axum::body::to_bytes(resp.into_body(), 4096).await.unwrap())
+                .unwrap();
+        let id = created["id"].as_str().unwrap();
+
+        app.clone()
+            .oneshot(admin_request("DELETE", &format!("/api/clients/{id}"), None))
+            .await
+            .unwrap();
+
+        // Reactivate.
+        let resp = app
+            .clone()
+            .oneshot(admin_request(
+                "POST",
+                &format!("/api/clients/{id}/reactivate"),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+        // Verify client is active again.
+        let uuid: Uuid = id.parse().unwrap();
+        let client = crate::db::client_repo::ClientRepository::new(&pool)
+            .find_by_id(uuid)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(client.active);
+        assert!(client.revoked_at.is_none());
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn reactivate_active_client_returns_404(pool: sqlx::PgPool) {
+        let state = make_state(pool.clone());
+        let app = make_app(state);
+
+        let resp = app
+            .clone()
+            .oneshot(admin_request(
+                "POST",
+                "/api/clients",
+                Some(r#"{"name":"already-active","allowed_models":["*"],"rpm":10,"burst":5,"token_ttl_seconds":900}"#),
+            ))
+            .await
+            .unwrap();
+        let created: serde_json::Value =
+            serde_json::from_slice(&axum::body::to_bytes(resp.into_body(), 4096).await.unwrap())
+                .unwrap();
+        let id = created["id"].as_str().unwrap();
+
+        let resp = app
+            .oneshot(admin_request(
+                "POST",
+                &format!("/api/clients/{id}/reactivate"),
                 None,
             ))
             .await

@@ -133,6 +133,9 @@ mod tests {
             active: true,
             created_at: Utc::now(),
             revoked_at: None,
+            token_budget: None,
+            budget_period: None,
+            budget_reset_at: None,
         }
     }
 
