@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -64,6 +65,10 @@ pub fn spawn_dispatcher(
     EventDispatcher { tx }
 }
 
+/// Maximum number of concurrent in-flight webhook delivery tasks.
+/// Prevents unbounded task spawning when endpoints are slow or failing.
+const MAX_INFLIGHT_DELIVERIES: usize = 256;
+
 async fn dispatch_loop(
     endpoints: Vec<EventEndpointConfig>,
     mut rx: mpsc::Receiver<TokenUsageEvent>,
@@ -73,6 +78,8 @@ async fn dispatch_loop(
         .timeout(Duration::from_secs(10))
         .build()
         .expect("failed to create webhook HTTP client");
+
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_INFLIGHT_DELIVERIES));
 
     // Pre-filter endpoints that subscribe to token_usage events.
     let usage_endpoints: Vec<&EventEndpointConfig> = endpoints
@@ -95,10 +102,18 @@ async fn dispatch_loop(
             let ep_token = ep.token.clone();
             let payload = payload.clone();
             let client = client.clone();
+            let sem = semaphore.clone();
 
-            // Spawn a per-endpoint delivery task so slow endpoints don't block others.
+            // Acquire a permit before spawning — bounds concurrent tasks.
+            // If all permits are taken, this awaits until one completes.
+            let permit = match sem.acquire_owned().await {
+                Ok(p) => p,
+                Err(_) => break, // semaphore closed — shutting down
+            };
+
             tokio::spawn(async move {
                 deliver_with_retry(&client, &ep_name, &ep_url, &ep_token, &payload).await;
+                drop(permit); // release the semaphore slot
             });
         }
     }

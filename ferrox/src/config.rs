@@ -421,7 +421,7 @@ pub struct Config {
     pub event_endpoints: Vec<EventEndpointConfig>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct EventEndpointConfig {
     /// Unique name for this endpoint (used in logs and metrics).
     pub name: String,
@@ -431,6 +431,17 @@ pub struct EventEndpointConfig {
     pub token: String,
     /// Event types this endpoint subscribes to (e.g., `["token_usage"]`).
     pub events: Vec<String>,
+}
+
+impl std::fmt::Debug for EventEndpointConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EventEndpointConfig")
+            .field("name", &self.name)
+            .field("url", &self.url)
+            .field("token", &"[REDACTED]")
+            .field("events", &self.events)
+            .finish()
+    }
 }
 
 fn default_jwks_cache_ttl_secs() -> u64 {
