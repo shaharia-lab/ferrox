@@ -66,6 +66,14 @@ base64 = "0.21"
 deadpool-redis = { version = "0.15", features = ["rt_tokio_1"] }
 redis = { version = "0.25", default-features = false, features = ["tokio-comp", "script"] }
 
+# Database (for usage log persistence)
+sqlx = { version = "0.8", default-features = false, features = [
+    "postgres",
+    "runtime-tokio-rustls",
+    "uuid",
+    "chrono",
+] }
+
 # AWS Bedrock
 aws-config = { version = "1", features = ["behavior-version-latest"] }
 aws-sdk-bedrockruntime = "1"

@@ -68,10 +68,17 @@ export interface CreateClientResponse extends Client {
   api_key: string
 }
 
+export interface UsageSummary {
+  total_prompt_tokens: number
+  total_completion_tokens: number
+  total_tokens: number
+  request_count: number
+}
+
 export interface UsageStats {
-  last_24h: number
-  last_7d: number
-  last_30d: number
+  last_24h: UsageSummary
+  last_7d: UsageSummary
+  last_30d: UsageSummary
 }
 
 export interface SigningKey {

@@ -10,7 +10,7 @@ import {
   Tooltip,
   ResponsiveContainer,
 } from 'recharts'
-import { api, type Client, type UsageStats, type AuditEntry } from '../api'
+import { api, type Client, type UsageSummary, type UsageStats, type AuditEntry } from '../api'
 import { Card, CardHeader, CardBody } from '../components/ui/Card'
 import Badge from '../components/ui/Badge'
 
@@ -18,11 +18,14 @@ function fmtDate(iso: string) {
   return new Date(iso).toLocaleString()
 }
 
-function StatBox({ label, value }: { label: string; value: number }) {
+function StatBox({ label, value }: { label: string; value: UsageSummary }) {
   return (
     <div className="text-center">
-      <p className="text-2xl font-semibold text-gray-900">{value.toLocaleString()}</p>
+      <p className="text-2xl font-semibold text-gray-900">{value.total_tokens.toLocaleString()}</p>
       <p className="text-xs text-gray-500 mt-0.5">{label}</p>
+      <p className="text-xs text-gray-400 mt-0.5">
+        {value.request_count.toLocaleString()} requests
+      </p>
     </div>
   )
 }
@@ -50,9 +53,9 @@ export default function ClientDetail() {
 
   const usageChartData = usage.data
     ? [
-        { period: 'Last 24h', tokens: usage.data.last_24h },
-        { period: 'Last 7d', tokens: usage.data.last_7d },
-        { period: 'Last 30d', tokens: usage.data.last_30d },
+        { period: 'Last 24h', tokens: usage.data.last_24h.total_tokens },
+        { period: 'Last 7d', tokens: usage.data.last_7d.total_tokens },
+        { period: 'Last 30d', tokens: usage.data.last_30d.total_tokens },
       ]
     : []
 

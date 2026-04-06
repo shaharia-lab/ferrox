@@ -10,7 +10,8 @@ use uuid::Uuid;
 
 use crate::db::audit_repo::AuditRepository;
 use crate::db::client_repo::ClientRepository;
-use crate::db::models::AuditEvent;
+use crate::db::models::{AuditEvent, UsageSummary};
+use crate::db::usage_repo::UsageRepository;
 use crate::state::CpState;
 
 // ── Request / response types ─────────────────────────────────────────────────
@@ -82,9 +83,9 @@ pub struct ClientResponse {
 
 #[derive(Debug, Serialize)]
 pub struct UsageResponse {
-    pub last_24h: i64,
-    pub last_7d: i64,
-    pub last_30d: i64,
+    pub last_24h: UsageSummary,
+    pub last_7d: UsageSummary,
+    pub last_30d: UsageSummary,
 }
 
 #[derive(Debug, Deserialize)]
@@ -250,6 +251,8 @@ pub async fn revoke_client(
 }
 
 /// `GET /api/clients/:id/usage`
+///
+/// Returns aggregated token usage from `usage_log` for the last 24h, 7d, and 30d.
 pub async fn client_usage(
     State(state): State<CpState>,
     Path(id): Path<Uuid>,
@@ -268,30 +271,30 @@ pub async fn client_usage(
         return Err(api_error(StatusCode::NOT_FOUND, "client not found"));
     }
 
-    let audit_repo = AuditRepository::new(&state.db);
+    let usage_repo = UsageRepository::new(&state.db);
     let now = Utc::now();
 
-    let last_24h = audit_repo
-        .count_tokens_issued(id, now - chrono::Duration::hours(24))
+    let last_24h = usage_repo
+        .summarize(id, Some(now - chrono::Duration::hours(24)), Some(now))
         .await
         .map_err(|e| {
-            error!(error = %e, "db error counting tokens");
+            error!(error = %e, "db error summarizing usage");
             api_error(StatusCode::INTERNAL_SERVER_ERROR, "database error")
         })?;
 
-    let last_7d = audit_repo
-        .count_tokens_issued(id, now - chrono::Duration::days(7))
+    let last_7d = usage_repo
+        .summarize(id, Some(now - chrono::Duration::days(7)), Some(now))
         .await
         .map_err(|e| {
-            error!(error = %e, "db error counting tokens");
+            error!(error = %e, "db error summarizing usage");
             api_error(StatusCode::INTERNAL_SERVER_ERROR, "database error")
         })?;
 
-    let last_30d = audit_repo
-        .count_tokens_issued(id, now - chrono::Duration::days(30))
+    let last_30d = usage_repo
+        .summarize(id, Some(now - chrono::Duration::days(30)), Some(now))
         .await
         .map_err(|e| {
-            error!(error = %e, "db error counting tokens");
+            error!(error = %e, "db error summarizing usage");
             api_error(StatusCode::INTERNAL_SERVER_ERROR, "database error")
         })?;
 
@@ -568,7 +571,7 @@ mod tests {
     }
 
     #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn client_usage_returns_counts(pool: sqlx::PgPool) {
+    async fn client_usage_returns_token_summaries(pool: sqlx::PgPool) {
         let state = make_state(pool.clone());
         let app = make_app(state);
 
@@ -587,14 +590,21 @@ mod tests {
                 .unwrap();
         let id: Uuid = created["id"].as_str().unwrap().parse().unwrap();
 
-        // Insert a few token_issued events.
-        let audit = crate::db::audit_repo::AuditRepository::new(&pool);
-        for _ in 0..3 {
-            audit
-                .record(Some(id), &AuditEvent::TokenIssued, None)
-                .await
-                .unwrap();
-        }
+        // Insert usage records directly.
+        let usage_repo = crate::db::usage_repo::UsageRepository::new(&pool);
+        let records: Vec<crate::db::usage_repo::UsageInsert> = (0..3)
+            .map(|i| crate::db::usage_repo::UsageInsert {
+                client_id: id,
+                request_id: format!("req-{i}"),
+                model: "gpt-4".to_string(),
+                provider: "openai".to_string(),
+                prompt_tokens: 100,
+                completion_tokens: 50,
+                total_tokens: 150,
+                latency_ms: Some(200),
+            })
+            .collect();
+        usage_repo.insert_batch(&records).await.unwrap();
 
         let resp = app
             .oneshot(admin_request(
@@ -606,11 +616,12 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let body: serde_json::Value =
-            serde_json::from_slice(&axum::body::to_bytes(resp.into_body(), 1024).await.unwrap())
+            serde_json::from_slice(&axum::body::to_bytes(resp.into_body(), 2048).await.unwrap())
                 .unwrap();
-        assert_eq!(body["last_24h"].as_i64().unwrap(), 3);
-        assert_eq!(body["last_7d"].as_i64().unwrap(), 3);
-        assert_eq!(body["last_30d"].as_i64().unwrap(), 3);
+        assert_eq!(body["last_24h"]["total_tokens"].as_i64().unwrap(), 450);
+        assert_eq!(body["last_24h"]["request_count"].as_i64().unwrap(), 3);
+        assert_eq!(body["last_7d"]["total_tokens"].as_i64().unwrap(), 450);
+        assert_eq!(body["last_30d"]["total_tokens"].as_i64().unwrap(), 450);
     }
 
     #[sqlx::test(migrator = "crate::MIGRATOR")]

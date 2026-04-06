@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use uuid::Uuid;
 
 // ── Inbound request ──────────────────────────────────────────────────────────
 
@@ -200,6 +201,9 @@ pub struct RequestContext {
     pub request_id: String,
     pub key_name: String,
     pub allowed_models: Vec<String>,
+    /// UUID of the authenticated client (from JWT `sub` or ferrox claims).
+    /// `None` for static virtual keys (which have no control-plane identity).
+    pub client_id: Option<Uuid>,
 }
 
 #[cfg(test)]

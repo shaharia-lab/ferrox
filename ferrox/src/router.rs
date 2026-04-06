@@ -127,6 +127,7 @@ mod tests {
             trusted_issuers: vec![],
             jwks_cache_ttl_secs: 300,
             rate_limiting: crate::config::RateLimitingConfig::default(),
+            usage_database_url: None,
         }
     }
 
