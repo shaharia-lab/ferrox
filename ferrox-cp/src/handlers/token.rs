@@ -272,7 +272,18 @@ mod tests {
         let prefix = &key_body[..8];
         let hash = bcrypt::hash(raw_key.as_bytes(), bcrypt::DEFAULT_COST).unwrap();
         ClientRepository::new(pool)
-            .create(name, None, prefix, &hash, &["*".to_string()], 100, 10, 900)
+            .create(
+                name,
+                None,
+                prefix,
+                &hash,
+                &["*".to_string()],
+                100,
+                10,
+                900,
+                None,
+                None,
+            )
             .await
             .unwrap();
         raw_key.to_string()

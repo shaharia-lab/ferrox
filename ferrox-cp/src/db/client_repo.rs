@@ -29,12 +29,16 @@ impl<'a> ClientRepository<'a> {
         rpm: i32,
         burst: i32,
         token_ttl_seconds: i32,
+        token_budget: Option<i64>,
+        budget_period: Option<&str>,
     ) -> Result<Client, RepoError> {
         let client = sqlx::query_as::<_, Client>(
             r#"
             INSERT INTO clients
-                (name, description, key_prefix, api_key_hash, allowed_models, rpm, burst, token_ttl_seconds)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                (name, description, key_prefix, api_key_hash, allowed_models, rpm, burst,
+                 token_ttl_seconds, token_budget, budget_period, budget_reset_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+                    CASE WHEN $9 IS NOT NULL THEN now() ELSE NULL END)
             RETURNING
                 id, name, description, key_prefix, api_key_hash,
                 allowed_models, rpm, burst, token_ttl_seconds,
@@ -50,6 +54,8 @@ impl<'a> ClientRepository<'a> {
         .bind(rpm)
         .bind(burst)
         .bind(token_ttl_seconds)
+        .bind(token_budget)
+        .bind(budget_period)
         .fetch_one(self.db)
         .await
         .map_err(|e| {
@@ -303,6 +309,8 @@ mod tests {
                 100,
                 10,
                 600,
+                None,
+                None,
             )
             .await
             .expect("create should succeed");
@@ -323,7 +331,9 @@ mod tests {
         let repo = ClientRepository::new(&pool);
         let models = vec!["gpt-4".to_string(), "claude-3".to_string()];
         let client = repo
-            .create("m-test", None, "pfx12345", "h", &models, 10, 5, 300)
+            .create(
+                "m-test", None, "pfx12345", "h", &models, 10, 5, 300, None, None,
+            )
             .await
             .unwrap();
         assert_eq!(client.allowed_models, models);
@@ -341,6 +351,8 @@ mod tests {
             10,
             5,
             300,
+            None,
+            None,
         )
         .await
         .expect("first insert ok");
@@ -354,6 +366,8 @@ mod tests {
                 10,
                 5,
                 300,
+                None,
+                None,
             )
             .await
             .unwrap_err();
@@ -379,6 +393,8 @@ mod tests {
             10,
             5,
             300,
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -406,6 +422,8 @@ mod tests {
                 10,
                 5,
                 300,
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -430,6 +448,8 @@ mod tests {
                 10,
                 5,
                 300,
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -451,6 +471,8 @@ mod tests {
                 10,
                 5,
                 300,
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -475,6 +497,8 @@ mod tests {
                 10,
                 5,
                 300,
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -499,12 +523,34 @@ mod tests {
         assert_eq!(repo.count_active().await.unwrap(), 0);
 
         let a = repo
-            .create("a", None, "pfx_a_01", "h", &["*".to_string()], 10, 5, 300)
+            .create(
+                "a",
+                None,
+                "pfx_a_01",
+                "h",
+                &["*".to_string()],
+                10,
+                5,
+                300,
+                None,
+                None,
+            )
             .await
             .unwrap();
-        repo.create("b", None, "pfx_b_01", "h2", &["*".to_string()], 10, 5, 300)
-            .await
-            .unwrap();
+        repo.create(
+            "b",
+            None,
+            "pfx_b_01",
+            "h2",
+            &["*".to_string()],
+            10,
+            5,
+            300,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(repo.count_active().await.unwrap(), 2);
         repo.revoke(a.id).await.unwrap();

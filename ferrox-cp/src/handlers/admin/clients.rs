@@ -216,6 +216,8 @@ pub async fn create_client(
             req.rpm,
             req.burst,
             req.token_ttl_seconds,
+            req.token_budget,
+            req.budget_period.as_deref(),
         )
         .await
         .map_err(|e| {
@@ -226,18 +228,6 @@ pub async fn create_client(
                 api_error(StatusCode::INTERNAL_SERVER_ERROR, "database error")
             }
         })?;
-
-    // Set budget if provided.
-    let client = if req.token_budget.is_some() {
-        repo.update_budget(client.id, req.token_budget, req.budget_period.as_deref())
-            .await
-            .map_err(|e| {
-                error!(error = %e, "db error setting budget");
-                api_error(StatusCode::INTERNAL_SERVER_ERROR, "database error")
-            })?
-    } else {
-        client
-    };
 
     // Audit log — non-fatal.
     let audit_meta = serde_json::json!({ "name": client.name });
