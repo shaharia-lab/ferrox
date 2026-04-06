@@ -27,12 +27,19 @@ providers:
   - name: openai-primary
     type: openai
     api_key: "${OPENAI_API_KEY}"
-    base_url: "https://api.openai.com"
+    base_url: "https://api.openai.com/v1"
 ```
 
 Because Ferrox exposes an OpenAI-compatible API, requests are forwarded with minimal transformation. For streaming, Ferrox injects `stream_options: {include_usage: true}` to get token counts in the final chunk.
 
-**Compatible with any OpenAI-compatible API** (Azure OpenAI, local models via LiteLLM, etc.) by setting `base_url`.
+**Compatible with any OpenAI-compatible API** (Azure OpenAI, local models via LiteLLM, Ollama, etc.) by setting `base_url`.
+
+> **`base_url` convention:** the value must include the API version segment.
+> The adapter appends only `/chat/completions`, so the full request URL is
+> `{base_url}/chat/completions`.  Examples:
+> - OpenAI: `https://api.openai.com/v1`
+> - Ollama: `http://localhost:11434/v1`
+> - Azure OpenAI: `https://<resource>.openai.azure.com/openai/deployments/<deployment>/`
 
 **Required env var:** `OPENAI_API_KEY`
 
@@ -89,6 +96,8 @@ providers:
 ```
 
 GLM uses an OpenAI-compatible API, so Ferrox routes requests through the same adapter as OpenAI with no transformation. All OpenAI features (streaming, tool use, system prompts) work as-is.
+
+The `base_url` already includes GLM's version prefix (`/v4`); the adapter appends `/chat/completions` to produce the correct endpoint `https://api.z.ai/api/paas/v4/chat/completions`.
 
 Available models: `GLM-5.1`, `GLM-5`, `GLM-4.7`, `GLM-4.5-air`.
 

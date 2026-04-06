@@ -14,10 +14,21 @@ use crate::types::{
     MessageContent, StopSequences,
 };
 
-const DEFAULT_BASE_URL: &str = "https://api.openai.com";
+/// Default base URL **including the API version prefix**.
+///
+/// `base_url` must include the version segment so that different providers
+/// (e.g. OpenAI `/v1`, GLM `/v4`) can be configured without code changes.
+/// The adapter appends only `/chat/completions`.
+///
+/// **Breaking change from < 0.3.2:** previously the default was
+/// `https://api.openai.com` and the adapter appended `/v1/chat/completions`.
+/// Configs that omit `base_url` are unaffected (the new default includes `/v1`),
+/// but any explicit `base_url` that did not include the version must be updated.
+const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 
 // ── Adapter ──────────────────────────────────────────────────────────────────
 
+#[derive(Debug)]
 pub struct OpenAIAdapter {
     name: String,
     api_key: String,
@@ -32,6 +43,22 @@ impl OpenAIAdapter {
             .clone()
             .ok_or_else(|| anyhow::anyhow!("OpenAI provider '{}' requires api_key", cfg.name))?;
 
+        let base_url = cfg
+            .base_url
+            .clone()
+            .unwrap_or_else(|| DEFAULT_BASE_URL.to_string());
+
+        // Guard against the most common misconfiguration: a base_url that still
+        // ends with the full endpoint path.  This would produce a double-path
+        // like `.../v1/chat/completions/chat/completions`.
+        if base_url.ends_with("/chat/completions") {
+            anyhow::bail!(
+                "Provider '{}': base_url must not end with '/chat/completions' — \
+                 set it to the versioned API root (e.g. 'https://api.openai.com/v1')",
+                cfg.name
+            );
+        }
+
         let timeouts = cfg.timeouts.as_ref().unwrap_or(&defaults.timeouts);
 
         let client = Client::builder()
@@ -42,12 +69,17 @@ impl OpenAIAdapter {
         Ok(Self {
             name: cfg.name.clone(),
             api_key,
-            base_url: cfg
-                .base_url
-                .clone()
-                .unwrap_or_else(|| DEFAULT_BASE_URL.to_string()),
+            base_url,
             client,
         })
+    }
+
+    /// Returns the chat completions endpoint URL for this provider.
+    ///
+    /// `base_url` is expected to include the API version (e.g. `/v1`, `/v4`).
+    /// The adapter appends only `/chat/completions`.
+    pub(crate) fn completions_url(&self) -> String {
+        format!("{}/chat/completions", self.base_url)
     }
 }
 
@@ -63,7 +95,7 @@ impl ProviderAdapter for OpenAIAdapter {
         model_id: &str,
     ) -> Result<ChatCompletionResponse, ProxyError> {
         let body = build_request_body(req, model_id, false);
-        let url = format!("{}/v1/chat/completions", self.base_url);
+        let url = self.completions_url();
 
         let resp = self
             .client
@@ -102,7 +134,7 @@ impl ProviderAdapter for OpenAIAdapter {
         model_id: &str,
     ) -> Result<ProviderStream, ProxyError> {
         let body = build_request_body(req, model_id, true);
-        let url = format!("{}/v1/chat/completions", self.base_url);
+        let url = self.completions_url();
 
         let resp = self
             .client
@@ -243,5 +275,116 @@ fn build_request_body(req: &ChatCompletionRequest, model_id: &str, stream: bool)
         stop,
         tools,
         tool_choice: req.tool_choice.clone(),
+    }
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{DefaultsConfig, ProviderConfig, ProviderType};
+
+    fn defaults() -> DefaultsConfig {
+        DefaultsConfig::default()
+    }
+
+    fn provider_cfg(base_url: Option<&str>) -> ProviderConfig {
+        ProviderConfig {
+            name: "test".to_string(),
+            provider_type: ProviderType::OpenAI,
+            api_key: Some("sk-test".to_string()),
+            base_url: base_url.map(str::to_string),
+            region: None,
+            timeouts: None,
+            retry: None,
+            circuit_breaker: None,
+        }
+    }
+
+    #[test]
+    fn default_base_url_includes_v1() {
+        let adapter = OpenAIAdapter::new(&provider_cfg(None), &defaults()).unwrap();
+        assert_eq!(
+            adapter.completions_url(),
+            "https://api.openai.com/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn explicit_openai_base_url_with_v1() {
+        let adapter = OpenAIAdapter::new(
+            &provider_cfg(Some("https://api.openai.com/v1")),
+            &defaults(),
+        )
+        .unwrap();
+        assert_eq!(
+            adapter.completions_url(),
+            "https://api.openai.com/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn glm_v4_base_url() {
+        let adapter = OpenAIAdapter::new(
+            &provider_cfg(Some("https://api.z.ai/api/paas/v4")),
+            &defaults(),
+        )
+        .unwrap();
+        assert_eq!(
+            adapter.completions_url(),
+            "https://api.z.ai/api/paas/v4/chat/completions"
+        );
+    }
+
+    #[test]
+    fn glm_coding_base_url() {
+        let adapter = OpenAIAdapter::new(
+            &provider_cfg(Some("https://api.z.ai/api/coding/paas/v4")),
+            &defaults(),
+        )
+        .unwrap();
+        assert_eq!(
+            adapter.completions_url(),
+            "https://api.z.ai/api/coding/paas/v4/chat/completions"
+        );
+    }
+
+    #[test]
+    fn custom_openai_compatible_base_url() {
+        let adapter = OpenAIAdapter::new(
+            &provider_cfg(Some("http://localhost:11434/v1")),
+            &defaults(),
+        )
+        .unwrap();
+        assert_eq!(
+            adapter.completions_url(),
+            "http://localhost:11434/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn rejects_base_url_ending_with_full_endpoint_path() {
+        let err = OpenAIAdapter::new(
+            &provider_cfg(Some("https://api.openai.com/v1/chat/completions")),
+            &defaults(),
+        )
+        .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("must not end with '/chat/completions'"));
+    }
+
+    #[test]
+    fn rejects_base_url_without_version_that_ends_in_chat_completions() {
+        // Catches the old-style misconfiguration where someone pasted the full URL
+        let err = OpenAIAdapter::new(
+            &provider_cfg(Some("https://api.z.ai/api/paas/v4/chat/completions")),
+            &defaults(),
+        )
+        .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("must not end with '/chat/completions'"));
     }
 }

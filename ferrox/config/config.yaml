@@ -82,7 +82,7 @@ providers:
   - name: openai-primary
     type: openai
     api_key: "${OPENAI_API_KEY:-placeholder}"
-    base_url: "https://api.openai.com"
+    base_url: "https://api.openai.com/v1"
 
   - name: gemini-primary
     type: gemini

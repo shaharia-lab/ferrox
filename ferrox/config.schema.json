@@ -138,7 +138,11 @@
           "enum": ["anthropic", "openai", "gemini", "bedrock", "glm"]
         },
         "api_key": { "type": "string" },
-        "base_url": { "type": "string", "format": "uri" },
+        "base_url": {
+          "type": "string",
+          "format": "uri",
+          "description": "API base URL including the version prefix. The adapter appends /chat/completions (OpenAI/GLM) or the provider-specific path. Must NOT end with /chat/completions. Examples: 'https://api.openai.com/v1', 'https://api.z.ai/api/paas/v4'."
+        },
         "region": { "type": "string" },
         "timeouts": { "$ref": "#/definitions/TimeoutsConfig" },
         "retry": { "$ref": "#/definitions/RetryConfig" },
