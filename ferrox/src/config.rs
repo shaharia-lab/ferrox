@@ -39,7 +39,10 @@ impl Default for TimeoutsConfig {
 pub struct ServerConfig {
     #[serde(default = "default_host")]
     pub host: String,
-    #[serde(default = "default_port")]
+    #[serde(
+        default = "default_port",
+        deserialize_with = "deserialize_u16_or_string"
+    )]
     pub port: u16,
     #[serde(default)]
     pub timeouts: TimeoutsConfig,
@@ -95,6 +98,27 @@ impl Default for MetricsConfig {
             enabled: true,
             path: default_metrics_path(),
         }
+    }
+}
+
+/// Accepts both a YAML integer and a string representation of one.
+/// This is needed because env-var interpolation always produces a string, e.g.
+/// `port: "${FERROX_PORT:-8080}"` becomes the string `"8080"` after substitution.
+fn deserialize_u16_or_string<'de, D>(de: D) -> Result<u16, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum U16OrString {
+        Int(u16),
+        Str(String),
+    }
+    match U16OrString::deserialize(de)? {
+        U16OrString::Int(n) => Ok(n),
+        U16OrString::Str(s) => s.trim().parse::<u16>().map_err(|_| {
+            serde::de::Error::custom(format!("expected a port number (0–65535), got \"{s}\""))
+        }),
     }
 }
 

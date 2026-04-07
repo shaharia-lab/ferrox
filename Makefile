@@ -1,5 +1,6 @@
-.PHONY: build build-release test fmt lint check run run-release clean \
-        docker-build docker-up docker-down docker-logs \
+.PHONY: build build-release test fmt lint check run run-release \
+        run-ferrox run-ferrox-cp \
+        clean docker-build docker-up docker-up-detached docker-down docker-logs \
         ui-install ui-build ui-dev \
         setup help
 
@@ -59,6 +60,22 @@ run: ferrox/config/local.yaml
 		set -a && . ./.env && set +a && LLM_PROXY_CONFIG=ferrox/config/local.yaml cargo run -p ferrox; \
 	else \
 		LLM_PROXY_CONFIG=ferrox/config/local.yaml cargo run -p ferrox; \
+	fi
+
+## Run the gateway (loads .env, uses ferrox/config/local.yaml)
+run-ferrox: ferrox/config/local.yaml
+	@if [ -f .env ]; then \
+		set -a && . ./.env && set +a && LLM_PROXY_CONFIG=ferrox/config/local.yaml cargo run -p ferrox; \
+	else \
+		LLM_PROXY_CONFIG=ferrox/config/local.yaml cargo run -p ferrox; \
+	fi
+
+## Run the control plane (loads .env, builds UI first, requires PostgreSQL)
+run-ferrox-cp: ui-build
+	@if [ -f .env ]; then \
+		set -a && . ./.env && set +a && cargo run -p ferrox-cp; \
+	else \
+		cargo run -p ferrox-cp; \
 	fi
 
 ## Run release binary
@@ -133,6 +150,8 @@ help:
 	@echo "  check              fmt-check + lint + test (CI equivalent)"
 	@echo ""
 	@echo "  run                Run dev server (loads .env, uses ferrox/config/local.yaml)"
+	@echo "  run-ferrox         Run gateway (loads .env, uses ferrox/config/local.yaml)"
+	@echo "  run-ferrox-cp      Run control plane (loads .env, builds UI, requires PostgreSQL)"
 	@echo "  run-release        Run release binary"
 	@echo "  health             Check /healthz and /readyz"
 	@echo "  metrics            Print /metrics output"

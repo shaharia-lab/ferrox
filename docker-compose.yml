@@ -22,19 +22,21 @@ services:
       dockerfile: ferrox-cp/Dockerfile
     image: ghcr.io/shaharia-lab/ferrox-cp:local
     ports:
-      - "9090:9090"
+      - "${CP_PORT:-9090}:${CP_PORT:-9090}"
     environment:
       DATABASE_URL: "postgres://ferrox:${POSTGRES_PASSWORD:-ferrox}@postgres:5432/ferrox_cp"
       CP_ENCRYPTION_KEY: "${CP_ENCRYPTION_KEY}"
       CP_ISSUER: "${CP_ISSUER:-http://localhost:9090}"
       CP_ADMIN_KEY: "${CP_ADMIN_KEY}"
-      CP_PORT: "9090"
+      CP_PORT: "${CP_PORT:-9090}"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     depends_on:
       postgres:
         condition: service_healthy
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:9090/healthz"]
+      test: ["CMD", "wget", "-qO-", "http://localhost:${CP_PORT:-9090}/healthz"]
       interval: 10s
       timeout: 3s
       retries: 3
@@ -45,24 +47,44 @@ services:
     build: .
     image: ferrox:local
     ports:
-      - "8080:8080"
+      - "${FERROX_PORT:-8080}:${FERROX_PORT:-8080}"
     environment:
+      FERROX_PORT: "${FERROX_PORT:-8080}"
+      # Provider API keys
       ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
       OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
       GEMINI_API_KEY: "${GEMINI_API_KEY:-}"
+      GLM_API_KEY: "${GLM_API_KEY:-}"
       AWS_ACCESS_KEY_ID: "${AWS_ACCESS_KEY_ID:-}"
       AWS_SECRET_ACCESS_KEY: "${AWS_SECRET_ACCESS_KEY:-}"
-      AWS_DEFAULT_REGION: "${AWS_DEFAULT_REGION:-us-east-1}"
+      AWS_REGION: "${AWS_REGION:-us-east-1}"
+      # Virtual keys (inbound auth)
+      PROXY_KEY_TOKENBANK: "${PROXY_KEY_TOKENBANK:-sk-proxy-dev-key}"
+      PROXY_KEY_APP: "${PROXY_KEY_APP:-sk-proxy-app-key}"
+      # Usage tracking
       USAGE_DATABASE_URL: "postgres://ferrox:${POSTGRES_PASSWORD:-ferrox}@postgres:5432/ferrox_cp"
+      # Telemetry — OTLP endpoint points to lgtm service inside Docker
+      OTEL_ENABLED: "${OTEL_ENABLED:-false}"
+      OTEL_EXPORTER_OTLP_ENDPOINT: "http://lgtm:4317"
+      # Webhook event endpoints
+      BILLING_WEBHOOK_URL: "${BILLING_WEBHOOK_URL:-}"
+      BILLING_WEBHOOK_TOKEN: "${BILLING_WEBHOOK_TOKEN:-}"
       LLM_PROXY_CONFIG: /app/config/config.yaml
+    # Allows the gateway to reach services running on the host machine
+    # (e.g. billing webhooks at http://host.docker.internal:<port>/...).
+    # Works on Linux (Docker 20.10+), Mac, and Windows Docker Desktop.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       - ./ferrox/config:/app/config:ro
     depends_on:
       lgtm:
         condition: service_healthy
+      ferrox-cp:
+        condition: service_healthy
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:8080/healthz"]
+      test: ["CMD", "wget", "-qO-", "http://localhost:${FERROX_PORT:-8080}/healthz"]
       interval: 10s
       timeout: 3s
       retries: 3

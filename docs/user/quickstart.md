@@ -132,7 +132,7 @@ Then open `.env` and set at least one provider key:
 ```bash
 # .env
 ANTHROPIC_API_KEY=sk-ant-...
-PROXY_KEY=sk-local-dev       # your inbound virtual key
+PROXY_KEY_TOKENBANK=sk-local-dev   # inbound virtual key (referenced in config.yaml)
 ```
 
 `CP_ENCRYPTION_KEY` and `CP_ADMIN_KEY` are filled in automatically by `make setup`.
@@ -155,7 +155,7 @@ LLM_PROXY_CONFIG=config/local.yaml ferrox
 ```bash
 docker run -p 8080:8080 \
   -e ANTHROPIC_API_KEY=sk-ant-... \
-  -e PROXY_KEY=sk-local-dev \
+  -e PROXY_KEY_TOKENBANK=sk-local-dev \
   -v $(pwd)/local.yaml:/etc/ferrox/config.yaml \
   ghcr.io/shaharia-lab/ferrox:latest \
   --config /etc/ferrox/config.yaml
@@ -164,7 +164,7 @@ docker run -p 8080:8080 \
 **Build from source (Makefile):**
 
 ```bash
-make run
+make run-ferrox
 ```
 
 ## Send a request
