@@ -59,7 +59,7 @@ chrono = { version = "0.4", features = ["serde"] }
 regex = "1"
 once_cell = "1"
 dotenvy = "0.15"
-rand = "0.8"
+rand = "0.10"
 clap = { version = "4", features = ["derive", "env"] }
 jsonwebtoken = { version = "10", features = ["rust_crypto"] }
 base64 = "0.21"
