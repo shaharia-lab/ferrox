@@ -79,7 +79,30 @@ impl GeminiAdapter {
     }
 
     async fn fetch_image_as_data_url(&self, url: &str) -> Option<String> {
-        let resp = self.client.get(url).send().await.ok()?;
+        // SSRF guard: only http(s), and refuse hosts that resolve to a non-public
+        // address (loopback/private/link-local incl. cloud-metadata 169.254.169.254).
+        let parsed = reqwest::Url::parse(url).ok()?;
+        if !matches!(parsed.scheme(), "http" | "https") {
+            return None;
+        }
+        let host = parsed.host_str()?;
+        let port = parsed.port_or_known_default().unwrap_or(443);
+        let mut resolved_any = false;
+        for addr in tokio::net::lookup_host((host, port)).await.ok()? {
+            resolved_any = true;
+            if !is_public_ip(&addr.ip()) {
+                tracing::warn!(
+                    %host,
+                    "refusing to fetch image from a non-public address (SSRF guard)"
+                );
+                return None;
+            }
+        }
+        if !resolved_any {
+            return None;
+        }
+
+        let resp = self.client.get(parsed).send().await.ok()?;
         if !resp.status().is_success() {
             return None;
         }
@@ -91,9 +114,44 @@ impl GeminiAdapter {
             .unwrap_or("image/jpeg")
             .to_string();
         let bytes = resp.bytes().await.ok()?;
+        // Cap the download to bound memory (20 MiB).
+        if bytes.len() > 20 * 1024 * 1024 {
+            tracing::warn!(len = bytes.len(), "remote image exceeds size cap; skipping");
+            return None;
+        }
         use base64::Engine;
         let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
         Some(format!("data:{mime};base64,{b64}"))
+    }
+}
+
+/// Whether an IP is a public (non-internal) address — used to block SSRF to
+/// loopback, private, link-local (incl. cloud metadata), and unspecified ranges.
+fn is_public_ip(ip: &std::net::IpAddr) -> bool {
+    use std::net::IpAddr;
+    match ip {
+        IpAddr::V4(v4) => {
+            !(v4.is_private()
+                || v4.is_loopback()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+                || v4.is_documentation()
+                || v4.octets()[0] == 0)
+        }
+        IpAddr::V6(v6) => {
+            if v6.is_loopback() || v6.is_unspecified() || v6.is_multicast() {
+                return false;
+            }
+            // IPv4-mapped (::ffff:a.b.c.d) → check the embedded v4.
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_public_ip(&IpAddr::V4(v4));
+            }
+            let seg0 = v6.segments()[0];
+            let unique_local = seg0 & 0xfe00 == 0xfc00; // fc00::/7
+            let link_local = seg0 & 0xffc0 == 0xfe80; // fe80::/10
+            !(unique_local || link_local)
+        }
     }
 }
 
@@ -726,6 +784,35 @@ mod tests {
             &DefaultsConfig::default(),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn ssrf_guard_rejects_internal_addresses() {
+        use std::net::IpAddr;
+        // Rejected (SSRF targets).
+        for s in [
+            "127.0.0.1",
+            "10.0.0.1",
+            "192.168.1.1",
+            "172.16.0.1",
+            "169.254.169.254", // cloud metadata
+            "0.0.0.0",
+            "::1",
+            "fe80::1",
+            "fc00::1",
+        ] {
+            assert!(
+                !is_public_ip(&s.parse::<IpAddr>().unwrap()),
+                "{s} must be blocked"
+            );
+        }
+        // Allowed (public).
+        for s in ["8.8.8.8", "1.1.1.1", "2606:4700:4700::1111"] {
+            assert!(
+                is_public_ip(&s.parse::<IpAddr>().unwrap()),
+                "{s} must be allowed"
+            );
+        }
     }
 
     #[tokio::test]
