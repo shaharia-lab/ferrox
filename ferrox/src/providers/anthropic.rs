@@ -214,10 +214,30 @@ enum AnthropicPart {
 }
 
 #[derive(Serialize, Clone)]
-struct AnthropicImageSource {
-    #[serde(rename = "type")]
-    source_type: String,
-    url: String,
+#[serde(tag = "type", rename_all = "snake_case")]
+enum AnthropicImageSource {
+    /// Inline base64 image data. Required for `data:` URIs — sending those as a
+    /// `url` source is rejected by api.anthropic.com.
+    Base64 { media_type: String, data: String },
+    /// A fetchable http(s) URL.
+    Url { url: String },
+}
+
+/// Build an Anthropic image source from an OpenAI `image_url` URL, splitting
+/// `data:<media>;base64,<data>` into a base64 source and passing URLs through.
+fn image_url_to_source(url: &str) -> AnthropicImageSource {
+    if let Some(rest) = url.strip_prefix("data:") {
+        if let Some((header, data)) = rest.split_once(',') {
+            let media_type = header.split(';').next().unwrap_or("image/jpeg").to_string();
+            return AnthropicImageSource::Base64 {
+                media_type,
+                data: data.to_string(),
+            };
+        }
+    }
+    AnthropicImageSource::Url {
+        url: url.to_string(),
+    }
 }
 
 #[derive(Serialize)]
@@ -429,10 +449,7 @@ fn convert_message(msg: &ChatMessage) -> AnthropicMessage {
                     .map(|p| match p {
                         ContentPart::Text { text } => AnthropicPart::Text { text: text.clone() },
                         ContentPart::ImageUrl { image_url } => AnthropicPart::Image {
-                            source: AnthropicImageSource {
-                                source_type: "url".to_string(),
-                                url: image_url.url.clone(),
-                            },
+                            source: image_url_to_source(&image_url.url),
                         },
                     })
                     .collect();
@@ -633,5 +650,23 @@ mod tests {
         assert!(
             matches!(&out.choices[0].message.content, Some(crate::types::MessageContent::Text(t)) if t == "hi")
         );
+    }
+    #[test]
+    fn data_url_image_becomes_base64_source() {
+        match image_url_to_source("data:image/png;base64,QUJD") {
+            AnthropicImageSource::Base64 { media_type, data } => {
+                assert_eq!(media_type, "image/png");
+                assert_eq!(data, "QUJD");
+            }
+            _ => panic!("data: URL must become a base64 source"),
+        }
+    }
+
+    #[test]
+    fn http_url_image_stays_url_source() {
+        assert!(matches!(
+            image_url_to_source("https://x/i.png"),
+            AnthropicImageSource::Url { .. }
+        ));
     }
 }

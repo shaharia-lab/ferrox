@@ -265,21 +265,41 @@ fn bedrock_message(m: &ChatMessage) -> Value {
 
     let content = match &m.content {
         Some(MessageContent::Text(t)) => Value::String(t.clone()),
-        // Multi-part (image) content is handled in the multimodal work (#73);
-        // fall back to concatenated text here.
-        Some(MessageContent::Parts(parts)) => Value::String(
+        // Multi-part content → Anthropic content-block array (text + image).
+        Some(MessageContent::Parts(parts)) => Value::Array(
             parts
                 .iter()
-                .filter_map(|p| match p {
-                    crate::types::ContentPart::Text { text } => Some(text.as_str()),
-                    _ => None,
+                .map(|p| match p {
+                    crate::types::ContentPart::Text { text } => {
+                        serde_json::json!({"type": "text", "text": text})
+                    }
+                    crate::types::ContentPart::ImageUrl { image_url } => {
+                        anthropic_image_block(&image_url.url)
+                    }
                 })
-                .collect::<Vec<_>>()
-                .join(""),
+                .collect(),
         ),
         None => Value::String(String::new()),
     };
     serde_json::json!({ "role": role, "content": content })
+}
+
+/// Build an Anthropic `image` content block from an OpenAI image URL
+/// (`data:` → base64 source; otherwise a `url` source).
+fn anthropic_image_block(url: &str) -> Value {
+    if let Some(rest) = url.strip_prefix("data:") {
+        if let Some((header, data)) = rest.split_once(',') {
+            let media_type = header.split(';').next().unwrap_or("image/jpeg");
+            return serde_json::json!({
+                "type": "image",
+                "source": {"type": "base64", "media_type": media_type, "data": data},
+            });
+        }
+    }
+    serde_json::json!({
+        "type": "image",
+        "source": {"type": "url", "url": url},
+    })
 }
 
 /// Map an OpenAI `tool_choice` to an Anthropic `tool_choice` object.
@@ -499,5 +519,33 @@ mod tests {
         assert_eq!(tc.function.name, "get_weather");
         assert!(tc.function.arguments.contains("NYC"));
         assert_eq!(out.choices[0].finish_reason.as_deref(), Some("tool_calls"));
+    }
+    #[test]
+    fn image_part_becomes_anthropic_image_block() {
+        let m = ChatMessage {
+            role: "user".into(),
+            content: Some(MessageContent::Parts(vec![
+                crate::types::ContentPart::Text {
+                    text: "look".into(),
+                },
+                crate::types::ContentPart::ImageUrl {
+                    image_url: crate::types::ImageUrl {
+                        url: "data:image/png;base64,QUJD".into(),
+                        detail: None,
+                    },
+                },
+            ])),
+            name: None,
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        };
+        let v = bedrock_message(&m);
+        let blocks = v["content"].as_array().unwrap();
+        assert_eq!(blocks[0]["type"], "text");
+        assert_eq!(blocks[1]["type"], "image");
+        assert_eq!(blocks[1]["source"]["type"], "base64");
+        assert_eq!(blocks[1]["source"]["media_type"], "image/png");
+        assert_eq!(blocks[1]["source"]["data"], "QUJD");
     }
 }
