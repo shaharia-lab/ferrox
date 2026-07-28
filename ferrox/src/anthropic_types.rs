@@ -481,6 +481,11 @@ struct StreamState {
     text_block_closed: bool,
     /// Running count of content blocks emitted so far (used as the next index).
     next_block_index: u32,
+    /// Open tool_use blocks, as `(openai_tool_index, anthropic_block_index)`.
+    /// OpenAI-format streams fragment each tool call across many deltas keyed by
+    /// `index`; we open one Anthropic block per distinct index, stream its
+    /// argument fragments as `input_json_delta`, and close them all at the end.
+    tool_blocks: Vec<(u32, u32)>,
 }
 
 /// Wraps a `ProviderStream` (OpenAI chunk format) and re-emits events in the
@@ -508,6 +513,7 @@ pub fn openai_stream_to_anthropic_sse(
         text_block_started: false,
         text_block_closed: false,
         next_block_index: 0,
+        tool_blocks: Vec::new(),
     };
 
     futures::stream::unfold(state, |mut s| async move {
@@ -535,6 +541,11 @@ pub fn openai_stream_to_anthropic_sse(
                     if s.text_block_started && !s.text_block_closed {
                         s.text_block_closed = true;
                         s.pending.push_back(Ok(make_content_block_stop_event(0)));
+                    }
+                    // Close every open tool_use block (in the order opened).
+                    for (_, block_index) in std::mem::take(&mut s.tool_blocks) {
+                        s.pending
+                            .push_back(Ok(make_content_block_stop_event(block_index)));
                     }
                     s.pending.push_back(Ok(make_message_delta_event(
                         &s.stop_reason,
@@ -596,27 +607,46 @@ pub fn openai_stream_to_anthropic_sse(
                             .push_back(Ok(make_content_block_delta_event(0, &text)));
                     }
 
-                    // Emit tool_use blocks for each tool call
+                    // Accumulate fragmented tool-call deltas by `index`: open one
+                    // Anthropic tool_use block the first time an index is seen
+                    // (id/name arrive in that first fragment) and stream later
+                    // fragments' arguments into it. Blocks are closed at stream end.
                     for tc in &tool_calls {
-                        // Close the text block before starting tool_use blocks,
-                        // but only if it was actually opened.
-                        if s.text_block_started && !s.text_block_closed {
-                            s.text_block_closed = true;
-                            s.pending.push_back(Ok(make_content_block_stop_event(0)));
+                        // Some providers send -1 for a single tool call; clamp
+                        // negatives to 0 (matching the official SDKs).
+                        let idx = tc.index.max(0) as u32;
+                        let name = tc.function.as_ref().and_then(|f| f.name.as_deref());
+                        let args = tc.function.as_ref().and_then(|f| f.arguments.as_deref());
+
+                        // Open the block on first sighting of this tool index.
+                        if !s.tool_blocks.iter().any(|(oi, _)| *oi == idx) {
+                            // Close the text block before the first tool_use block,
+                            // but only if it was actually opened.
+                            if s.text_block_started && !s.text_block_closed {
+                                s.text_block_closed = true;
+                                s.pending.push_back(Ok(make_content_block_stop_event(0)));
+                            }
+                            let block_index = s.next_block_index;
+                            s.next_block_index += 1;
+                            s.tool_blocks.push((idx, block_index));
+                            s.pending.push_back(Ok(make_tool_use_block_start_event(
+                                block_index,
+                                tc.id.as_deref().unwrap_or(""),
+                                name.unwrap_or(""),
+                            )));
                         }
-                        let block_index = s.next_block_index;
-                        s.next_block_index += 1;
-                        s.pending.push_back(Ok(make_tool_use_block_start_event(
-                            block_index,
-                            &tc.id,
-                            &tc.function.name,
-                        )));
-                        s.pending.push_back(Ok(make_input_json_delta_event(
-                            block_index,
-                            &tc.function.arguments,
-                        )));
-                        s.pending
-                            .push_back(Ok(make_content_block_stop_event(block_index)));
+
+                        // Stream this fragment's argument piece into the block.
+                        if let Some(args) = args.filter(|a| !a.is_empty()) {
+                            let block_index = s
+                                .tool_blocks
+                                .iter()
+                                .find(|(oi, _)| *oi == idx)
+                                .map(|(_, bi)| *bi)
+                                .unwrap_or(0);
+                            s.pending
+                                .push_back(Ok(make_input_json_delta_event(block_index, args)));
+                        }
                     }
                     // Loop back to drain pending or fetch the next chunk
                 }
@@ -1218,19 +1248,187 @@ mod tests {
                 delta: ChunkDelta {
                     role: None,
                     content: None,
-                    tool_calls: Some(vec![crate::types::ToolCall {
-                        id: id.to_string(),
-                        r#type: "function".to_string(),
-                        function: crate::types::FunctionCall {
-                            name: name.to_string(),
-                            arguments: args.to_string(),
-                        },
+                    tool_calls: Some(vec![crate::types::StreamToolCall {
+                        index: 0,
+                        id: Some(id.to_string()),
+                        r#type: Some("function".to_string()),
+                        function: Some(crate::types::StreamFunctionCall {
+                            name: Some(name.to_string()),
+                            arguments: Some(args.to_string()),
+                        }),
                     }]),
                 },
                 finish_reason: finish_reason.map(str::to_string),
             }],
             usage: None,
         }
+    }
+
+    /// One fragmented streaming tool-call delta (id/name only in the first).
+    fn tool_frag(
+        index: i32,
+        id: Option<&str>,
+        name: Option<&str>,
+        args: Option<&str>,
+        finish: Option<&str>,
+    ) -> ChatCompletionChunk {
+        ChatCompletionChunk {
+            id: "c".to_string(),
+            object: "chat.completion.chunk".to_string(),
+            created: 0,
+            model: "k".to_string(),
+            choices: vec![ChunkChoice {
+                index: 0,
+                delta: ChunkDelta {
+                    role: None,
+                    content: None,
+                    tool_calls: Some(vec![crate::types::StreamToolCall {
+                        index,
+                        id: id.map(str::to_string),
+                        r#type: id.map(|_| "function".to_string()),
+                        function: Some(crate::types::StreamFunctionCall {
+                            name: name.map(str::to_string),
+                            arguments: args.map(str::to_string),
+                        }),
+                    }]),
+                },
+                finish_reason: finish.map(str::to_string),
+            }],
+            usage: None,
+        }
+    }
+
+    #[test]
+    fn streaming_tool_call_continuation_fragment_deserializes() {
+        // Regression: continuation fragments carry only `index` + partial
+        // `arguments` (no id/type/name). Modelling those as required aborted the
+        // whole stream. They must now deserialize.
+        let json = r#"{"id":"c","object":"chat.completion.chunk","created":0,"model":"k","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"date"}}]},"finish_reason":null}],"usage":null}"#;
+        let chunk: ChatCompletionChunk =
+            serde_json::from_str(json).expect("continuation fragment must deserialize");
+        let tc = &chunk.choices[0].delta.tool_calls.as_ref().unwrap()[0];
+        assert_eq!(tc.index, 0);
+        assert!(tc.id.is_none());
+        assert_eq!(
+            tc.function.as_ref().unwrap().arguments.as_deref(),
+            Some("date")
+        );
+    }
+
+    #[tokio::test]
+    async fn fragmented_tool_call_accumulates_into_one_block() {
+        // id+name in the first fragment, arguments streamed across the rest.
+        let chunks: Vec<Result<ChatCompletionChunk, ProxyError>> = vec![
+            Ok(tool_frag(0, Some("t1"), Some("Bash"), Some(""), None)),
+            Ok(tool_frag(0, None, None, Some(r#"{"cmd":""#), None)),
+            Ok(tool_frag(0, None, None, Some("ls"), None)),
+            Ok(tool_frag(0, None, None, Some(r#""}"#), None)),
+            Ok(make_chunk(None, Some("tool_calls"))),
+        ];
+        let inner: ProviderStream = Box::pin(futures::stream::iter(chunks));
+        let events: Vec<_> =
+            openai_stream_to_anthropic_sse("m".to_string(), "msg".to_string(), inner)
+                .collect()
+                .await;
+
+        assert!(events.iter().all(|e| e.is_ok()), "stream must not abort");
+        let dump = events
+            .iter()
+            .map(|e| format!("{:?}", e.as_ref().unwrap()))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // Exactly ONE tool block: one start, one stop (not one per fragment).
+        // Count the SSE event-name line ("content_block_start" also appears in
+        // the JSON `type` field, so match the `event:` prefix).
+        assert_eq!(
+            dump.matches("event: content_block_start").count(),
+            1,
+            "exactly one content_block_start: {dump}"
+        );
+        assert_eq!(
+            dump.matches("event: content_block_stop").count(),
+            1,
+            "exactly one content_block_stop"
+        );
+        // id + name captured from the first fragment.
+        assert!(dump.contains("t1") && dump.contains("Bash"));
+        // Three non-empty argument fragments streamed as input_json_delta.
+        assert_eq!(
+            dump.matches("input_json_delta").count(),
+            3,
+            "one input_json_delta per non-empty arg fragment: {dump}"
+        );
+    }
+
+    #[tokio::test]
+    async fn parallel_tool_calls_produce_distinct_blocks() {
+        // Two tool calls interleaved by index 0 and 1.
+        let chunks: Vec<Result<ChatCompletionChunk, ProxyError>> = vec![
+            Ok(tool_frag(
+                0,
+                Some("a"),
+                Some("Bash"),
+                Some(r#"{"c":"#),
+                None,
+            )),
+            Ok(tool_frag(
+                1,
+                Some("b"),
+                Some("Read"),
+                Some(r#"{"p":"#),
+                None,
+            )),
+            Ok(tool_frag(0, None, None, Some("1}"), None)),
+            Ok(tool_frag(1, None, None, Some("2}"), None)),
+            Ok(make_chunk(None, Some("tool_calls"))),
+        ];
+        let inner: ProviderStream = Box::pin(futures::stream::iter(chunks));
+        let events: Vec<_> =
+            openai_stream_to_anthropic_sse("m".to_string(), "msg".to_string(), inner)
+                .collect()
+                .await;
+        assert!(events.iter().all(|e| e.is_ok()));
+        let dump = events
+            .iter()
+            .map(|e| format!("{:?}", e.as_ref().unwrap()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        // Two distinct tool blocks: two starts, two stops.
+        assert_eq!(dump.matches("event: content_block_start").count(), 2);
+        assert_eq!(dump.matches("event: content_block_stop").count(), 2);
+        assert!(dump.contains("Bash") && dump.contains("Read"));
+    }
+
+    #[tokio::test]
+    async fn negative_tool_call_index_is_clamped() {
+        // A provider that sends -1 for a single tool call must not abort.
+        let chunks: Vec<Result<ChatCompletionChunk, ProxyError>> = vec![
+            Ok(tool_frag(
+                -1,
+                Some("x"),
+                Some("Bash"),
+                Some(r#"{"c":"ls"}"#),
+                None,
+            )),
+            Ok(make_chunk(None, Some("tool_calls"))),
+        ];
+        let inner: ProviderStream = Box::pin(futures::stream::iter(chunks));
+        let events: Vec<_> =
+            openai_stream_to_anthropic_sse("m".to_string(), "msg".to_string(), inner)
+                .collect()
+                .await;
+        assert!(
+            events.iter().all(|e| e.is_ok()),
+            "stream must not abort on index -1"
+        );
+        let dump = events
+            .iter()
+            .map(|e| format!("{:?}", e.as_ref().unwrap()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(dump.matches("event: content_block_start").count(), 1);
+        assert!(dump.contains("Bash"));
     }
 
     /// Tool-only stream must NOT produce an empty text block.
