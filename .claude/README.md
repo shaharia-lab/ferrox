@@ -70,3 +70,13 @@ Re-runs the provider-SDK compatibility audit: clones the official OpenAI / Anthr
 ```
 /sdk-compat-audit
 ```
+
+---
+
+## `/release`
+
+Cuts a new tagged release. Picks the next semver version from the commits since the last tag (patch for fixes, minor for features — confirmed with you), publishes a GitHub Release with auto-generated notes, which triggers the release workflow (cross-platform binaries + `.sha256` sidecars, GHCR Docker images for `ferrox` and `ferrox-cp` tagged `X.Y.Z`/`major.minor`/`major`/`latest`, and the Homebrew tap update). Then watches the workflow to green and verifies the published images and assets. Releases are tag-driven — no manual version-bump commit.
+
+```
+/release
+```
