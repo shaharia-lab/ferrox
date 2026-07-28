@@ -1,0 +1,22 @@
+# Dependabot configuration.
+# Scoped to the artifacts hardened in issue #57 so their pins stay current:
+#   - github-actions: SHA-pinned in the workflows (B1)
+#   - docker: base images digest-pinned in the Dockerfile (B3)
+# Dependabot rewrites the pinned commit/digest + `# vX` comment on updates.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: build(deps)
+
+  - package-ecosystem: docker
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: build(deps)

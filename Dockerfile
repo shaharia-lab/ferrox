@@ -1,5 +1,5 @@
 # ── Stage 1: Build ─────────────────────────────────────────────────────────────
-FROM rust:1.94-slim-bookworm AS builder
+FROM rust:1.94-slim-bookworm@sha256:cf9dd0ec73e75f827fe59123fff9dc65af1a1c8363c3c31ee8d7f8ad0b6a5fb2 AS builder
 
 # protobuf-compiler required by opentelemetry-otlp/tonic build script
 # git required by build.rs (git rev-parse for version embedding)
@@ -28,7 +28,7 @@ RUN touch ferrox/src/main.rs \
     && cargo build --release -p ferrox
 
 # ── Stage 2: Runtime ──────────────────────────────────────────────────────────
-FROM debian:bookworm-slim
+FROM debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
