@@ -325,12 +325,23 @@ fn convert_blocks(role: String, blocks: Vec<AnthropicContentBlock>, out: &mut Ve
             AnthropicContentBlock::ToolResult {
                 tool_use_id,
                 content,
-                ..
+                is_error,
             } => {
-                tool_results.push((tool_use_id, tool_result_content_to_string(content)));
+                let mut text = tool_result_content_to_string(content);
+                // The OpenAI `tool` role has no `is_error`; annotate so the model
+                // can tell a failed tool call from a successful one.
+                if is_error {
+                    text = format!("[tool error] {text}");
+                }
+                tool_results.push((tool_use_id, text));
             }
-            // Document/thinking/unknown blocks have no OpenAI equivalent — dropped.
-            AnthropicContentBlock::Unknown => {}
+            // Document/thinking/unknown blocks have no OpenAI equivalent. Warn so
+            // a silently-dropped block isn't mistaken for successful handling.
+            AnthropicContentBlock::Unknown => {
+                tracing::warn!(
+                    "dropping unsupported Anthropic content block (no OpenAI equivalent)"
+                );
+            }
         }
     }
 
@@ -1295,6 +1306,28 @@ mod tests {
         );
     }
 
+    #[test]
+    fn response_extra_fields_round_trip() {
+        // service_tier + choice logprobs survive the OpenAI-format round-trip.
+        let json = r#"{"id":"c","object":"chat.completion","created":0,"model":"m","service_tier":"default","choices":[{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"stop","logprobs":{"content":[]}}],"usage":null,"system_fingerprint":null}"#;
+        let resp: ChatCompletionResponse = serde_json::from_str(json).unwrap();
+        let out = serde_json::to_value(&resp).unwrap();
+        assert_eq!(out["service_tier"], "default");
+        assert!(out["choices"][0]["logprobs"].is_object());
+    }
+
+    #[test]
+    fn tool_result_is_error_is_annotated() {
+        let json = r#"{"model":"m","max_tokens":10,"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"boom","is_error":true}]}]}"#;
+        let req: AnthropicMessagesRequest = serde_json::from_str(json).unwrap();
+        let internal = to_chat_completion_request(req);
+        let tool_msg = internal.messages.iter().find(|m| m.role == "tool").unwrap();
+        match tool_msg.content.as_ref().unwrap() {
+            MessageContent::Text(t) => assert!(t.starts_with("[tool error] "), "got: {t}"),
+            other => panic!("expected text, got {other:?}"),
+        }
+    }
+
     // ── to_anthropic_response ─────────────────────────────────────────────────
 
     fn make_openai_response(content: &str, finish_reason: &str) -> ChatCompletionResponse {
@@ -1314,6 +1347,7 @@ mod tests {
                     reasoning_content: None,
                 },
                 finish_reason: Some(finish_reason.to_string()),
+                extra: Default::default(),
             }],
             usage: Some(Usage {
                 prompt_tokens: 10,
@@ -1322,6 +1356,7 @@ mod tests {
                 extra: Default::default(),
             }),
             system_fingerprint: None,
+            extra: Default::default(),
         }
     }
 
@@ -1395,9 +1430,11 @@ mod tests {
                     reasoning_content: None,
                 },
                 finish_reason: Some("tool_calls".to_string()),
+                extra: Default::default(),
             }],
             usage: None,
             system_fingerprint: None,
+            extra: Default::default(),
         };
         let r = to_anthropic_response(resp);
         assert_eq!(r.content.len(), 1);
@@ -1466,8 +1503,10 @@ mod tests {
                     reasoning_content: None,
                 },
                 finish_reason: finish_reason.map(str::to_string),
+                extra: Default::default(),
             }],
             usage: None,
+            extra: Default::default(),
         }
     }
 
@@ -1499,8 +1538,10 @@ mod tests {
                     reasoning_content: None,
                 },
                 finish_reason: finish_reason.map(str::to_string),
+                extra: Default::default(),
             }],
             usage: None,
+            extra: Default::default(),
         }
     }
 
@@ -1534,8 +1575,10 @@ mod tests {
                     reasoning_content: None,
                 },
                 finish_reason: finish.map(str::to_string),
+                extra: Default::default(),
             }],
             usage: None,
+            extra: Default::default(),
         }
     }
 

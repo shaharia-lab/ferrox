@@ -217,8 +217,10 @@ impl ProviderAdapter for GeminiAdapter {
                             reasoning_content: None,
                         },
                         finish_reason,
+                        extra: Default::default(),
                     }],
                     usage,
+                    extra: Default::default(),
                 };
                 yield Ok(chunk);
             }
@@ -641,6 +643,7 @@ fn gemini_to_openai_response(resp: GeminiResponse, model_id: &str) -> ChatComple
                 index: i as u32,
                 message,
                 finish_reason,
+                extra: Default::default(),
             }
         })
         .collect();
@@ -653,6 +656,7 @@ fn gemini_to_openai_response(resp: GeminiResponse, model_id: &str) -> ChatComple
         choices,
         usage,
         system_fingerprint: None,
+        extra: Default::default(),
     }
 }
 

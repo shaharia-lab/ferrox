@@ -224,8 +224,10 @@ pub fn make_text_chunk(id: &str, model: &str, text: String) -> ChatCompletionChu
                 reasoning_content: None,
             },
             finish_reason: None,
+            extra: Default::default(),
         }],
         usage: None,
+        extra: Default::default(),
     }
 }
 
@@ -244,8 +246,10 @@ pub fn make_reasoning_chunk(id: &str, model: &str, thinking: String) -> ChatComp
                 reasoning_content: Some(thinking),
             },
             finish_reason: None,
+            extra: Default::default(),
         }],
         usage: None,
+        extra: Default::default(),
     }
 }
 
@@ -264,8 +268,10 @@ fn stream_tool_chunk(id: &str, model: &str, stc: StreamToolCall) -> ChatCompleti
                 reasoning_content: None,
             },
             finish_reason: None,
+            extra: Default::default(),
         }],
         usage: None,
+        extra: Default::default(),
     }
 }
 
@@ -334,8 +340,10 @@ pub fn make_final_chunk(
                 reasoning_content: None,
             },
             finish_reason: stop_reason,
+            extra: Default::default(),
         }],
         usage,
+        extra: Default::default(),
     }
 }
 

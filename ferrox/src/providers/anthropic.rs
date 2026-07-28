@@ -578,9 +578,11 @@ fn anthropic_to_openai_response(resp: AnthropicResponse, model_id: &str) -> Chat
             index: 0,
             message,
             finish_reason,
+            extra: Default::default(),
         }],
         usage,
         system_fingerprint: None,
+        extra: Default::default(),
     }
 }
 

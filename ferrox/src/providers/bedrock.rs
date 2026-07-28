@@ -411,9 +411,11 @@ fn bedrock_anthropic_to_openai(resp: &Value, model_id: &str) -> ChatCompletionRe
             index: 0,
             message,
             finish_reason,
+            extra: Default::default(),
         }],
         usage,
         system_fingerprint: None,
+        extra: Default::default(),
     }
 }
 
