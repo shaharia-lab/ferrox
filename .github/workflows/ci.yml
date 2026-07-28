@@ -104,6 +104,11 @@ jobs:
   audit:
     name: Security audit
     runs-on: ubuntu-latest
+    # rustsec/audit-check publishes advisories as a Check run, which needs
+    # `checks: write` on top of the workflow's read-only default.
+    permissions:
+      contents: read
+      checks: write
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6
       - uses: rustsec/audit-check@e9159ac5f7d7d873ce074ca134da2f445c0a4a61  # v1

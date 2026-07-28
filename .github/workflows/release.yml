@@ -20,6 +20,11 @@ env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
 
+# Least-privilege default token scope. Jobs widen it locally where needed
+# (upload-assets/docker/docker-cp declare their own writes; homebrew uses a PAT).
+permissions:
+  contents: read
+
 jobs:
   # ── Cross-platform binaries ───────────────────────────────────────────────────
   # Compiles ferrox and ferrox-cp for all four supported targets and uploads the
