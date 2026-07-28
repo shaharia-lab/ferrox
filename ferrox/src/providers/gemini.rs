@@ -54,6 +54,107 @@ impl GeminiAdapter {
     }
 }
 
+impl GeminiAdapter {
+    /// Gemini can't fetch an arbitrary image URL, so download any http(s) image
+    /// parts and inline them as `data:` URLs (which `convert_message` turns into
+    /// `inline_data`). A fetch failure leaves the URL untouched.
+    async fn inline_remote_images(&self, req: &ChatCompletionRequest) -> ChatCompletionRequest {
+        let mut resolved = req.clone();
+        for msg in &mut resolved.messages {
+            if let Some(MessageContent::Parts(parts)) = &mut msg.content {
+                for part in parts.iter_mut() {
+                    if let ContentPart::ImageUrl { image_url } = part {
+                        if !image_url.url.starts_with("data:") {
+                            if let Some(data_url) =
+                                self.fetch_image_as_data_url(&image_url.url).await
+                            {
+                                image_url.url = data_url;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        resolved
+    }
+
+    async fn fetch_image_as_data_url(&self, url: &str) -> Option<String> {
+        // SSRF guard: only http(s), and refuse hosts that resolve to a non-public
+        // address (loopback/private/link-local incl. cloud-metadata 169.254.169.254).
+        let parsed = reqwest::Url::parse(url).ok()?;
+        if !matches!(parsed.scheme(), "http" | "https") {
+            return None;
+        }
+        let host = parsed.host_str()?;
+        let port = parsed.port_or_known_default().unwrap_or(443);
+        let mut resolved_any = false;
+        for addr in tokio::net::lookup_host((host, port)).await.ok()? {
+            resolved_any = true;
+            if !is_public_ip(&addr.ip()) {
+                tracing::warn!(
+                    %host,
+                    "refusing to fetch image from a non-public address (SSRF guard)"
+                );
+                return None;
+            }
+        }
+        if !resolved_any {
+            return None;
+        }
+
+        let resp = self.client.get(parsed).send().await.ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        let mime = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.split(';').next())
+            .unwrap_or("image/jpeg")
+            .to_string();
+        let bytes = resp.bytes().await.ok()?;
+        // Cap the download to bound memory (20 MiB).
+        if bytes.len() > 20 * 1024 * 1024 {
+            tracing::warn!(len = bytes.len(), "remote image exceeds size cap; skipping");
+            return None;
+        }
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        Some(format!("data:{mime};base64,{b64}"))
+    }
+}
+
+/// Whether an IP is a public (non-internal) address — used to block SSRF to
+/// loopback, private, link-local (incl. cloud metadata), and unspecified ranges.
+fn is_public_ip(ip: &std::net::IpAddr) -> bool {
+    use std::net::IpAddr;
+    match ip {
+        IpAddr::V4(v4) => {
+            !(v4.is_private()
+                || v4.is_loopback()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+                || v4.is_documentation()
+                || v4.octets()[0] == 0)
+        }
+        IpAddr::V6(v6) => {
+            if v6.is_loopback() || v6.is_unspecified() || v6.is_multicast() {
+                return false;
+            }
+            // IPv4-mapped (::ffff:a.b.c.d) → check the embedded v4.
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_public_ip(&IpAddr::V4(v4));
+            }
+            let seg0 = v6.segments()[0];
+            let unique_local = seg0 & 0xfe00 == 0xfc00; // fc00::/7
+            let link_local = seg0 & 0xffc0 == 0xfe80; // fe80::/10
+            !(unique_local || link_local)
+        }
+    }
+}
+
 #[async_trait]
 impl ProviderAdapter for GeminiAdapter {
     fn name(&self) -> &str {
@@ -65,7 +166,8 @@ impl ProviderAdapter for GeminiAdapter {
         req: &ChatCompletionRequest,
         model_id: &str,
     ) -> Result<ChatCompletionResponse, ProxyError> {
-        let body = build_request_body(req);
+        let req = self.inline_remote_images(req).await;
+        let body = build_request_body(&req);
         let url = format!(
             "{}/v1beta/models/{}:generateContent?key={}",
             self.base_url, model_id, self.api_key
@@ -105,7 +207,8 @@ impl ProviderAdapter for GeminiAdapter {
         req: &ChatCompletionRequest,
         model_id: &str,
     ) -> Result<ProviderStream, ProxyError> {
-        let body = build_request_body(req);
+        let req = self.inline_remote_images(req).await;
+        let body = build_request_body(&req);
         let url = format!(
             "{}/v1beta/models/{}:streamGenerateContent?key={}&alt=sse",
             self.base_url, model_id, self.api_key
@@ -663,7 +766,83 @@ fn gemini_to_openai_response(resp: GeminiResponse, model_id: &str) -> ChatComple
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{Tool, ToolFunction};
+    use crate::config::{DefaultsConfig, ProviderConfig, ProviderType};
+    use crate::types::{ImageUrl, Tool, ToolFunction};
+
+    fn adapter() -> GeminiAdapter {
+        GeminiAdapter::new(
+            &ProviderConfig {
+                name: "g".into(),
+                provider_type: ProviderType::Gemini,
+                api_key: Some("k".into()),
+                base_url: None,
+                region: None,
+                timeouts: None,
+                retry: None,
+                circuit_breaker: None,
+            },
+            &DefaultsConfig::default(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn ssrf_guard_rejects_internal_addresses() {
+        use std::net::IpAddr;
+        // Rejected (SSRF targets).
+        for s in [
+            "127.0.0.1",
+            "10.0.0.1",
+            "192.168.1.1",
+            "172.16.0.1",
+            "169.254.169.254", // cloud metadata
+            "0.0.0.0",
+            "::1",
+            "fe80::1",
+            "fc00::1",
+        ] {
+            assert!(
+                !is_public_ip(&s.parse::<IpAddr>().unwrap()),
+                "{s} must be blocked"
+            );
+        }
+        // Allowed (public).
+        for s in ["8.8.8.8", "1.1.1.1", "2606:4700:4700::1111"] {
+            assert!(
+                is_public_ip(&s.parse::<IpAddr>().unwrap()),
+                "{s} must be allowed"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn data_url_images_are_not_refetched() {
+        // A data: image must be left untouched (no network fetch).
+        let a = adapter();
+        let msg = ChatMessage {
+            role: "user".into(),
+            content: Some(MessageContent::Parts(vec![ContentPart::ImageUrl {
+                image_url: ImageUrl {
+                    url: "data:image/png;base64,QUJD".into(),
+                    detail: None,
+                },
+            }])),
+            name: None,
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        };
+        let resolved = a.inline_remote_images(&req(vec![msg], None)).await;
+        if let Some(MessageContent::Parts(parts)) = &resolved.messages[0].content {
+            if let ContentPart::ImageUrl { image_url } = &parts[0] {
+                assert_eq!(image_url.url, "data:image/png;base64,QUJD");
+            } else {
+                panic!("expected image part");
+            }
+        } else {
+            panic!("expected parts");
+        }
+    }
 
     fn req(messages: Vec<ChatMessage>, tool_choice: Option<Value>) -> ChatCompletionRequest {
         ChatCompletionRequest {

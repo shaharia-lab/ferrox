@@ -434,12 +434,19 @@ fn tool_result_content_to_string(v: Option<serde_json::Value>) -> String {
         Some(serde_json::Value::String(s)) => s,
         Some(serde_json::Value::Array(arr)) => arr
             .iter()
-            .filter_map(|item| {
-                if item.get("type").and_then(|t| t.as_str()) == Some("text") {
-                    item.get("text")
-                        .and_then(|t| t.as_str())
-                        .map(str::to_string)
-                } else {
+            .filter_map(|item| match item.get("type").and_then(|t| t.as_str()) {
+                Some("text") => item
+                    .get("text")
+                    .and_then(|t| t.as_str())
+                    .map(str::to_string),
+                other => {
+                    // OpenAI `tool` role messages are text-only, so non-text tool
+                    // result blocks (e.g. images) can't be represented — warn
+                    // instead of dropping silently.
+                    tracing::warn!(
+                        block = other.unwrap_or("unknown"),
+                        "dropping non-text tool_result block (OpenAI tool messages are text-only)"
+                    );
                     None
                 }
             })
@@ -1314,6 +1321,20 @@ mod tests {
         let out = serde_json::to_value(&resp).unwrap();
         assert_eq!(out["service_tier"], "default");
         assert!(out["choices"][0]["logprobs"].is_object());
+    }
+
+    #[test]
+    fn tool_result_non_text_dropped_text_kept() {
+        // A tool_result with text + image: text preserved, image dropped (OpenAI
+        // tool messages are text-only).
+        let json = r#"{"model":"m","max_tokens":10,"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":[{"type":"text","text":"see this:"},{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAA"}}]}]}]}"#;
+        let req: AnthropicMessagesRequest = serde_json::from_str(json).unwrap();
+        let internal = to_chat_completion_request(req);
+        let tool_msg = internal.messages.iter().find(|m| m.role == "tool").unwrap();
+        match tool_msg.content.as_ref().unwrap() {
+            MessageContent::Text(t) => assert_eq!(t, "see this:"),
+            other => panic!("expected text, got {other:?}"),
+        }
     }
 
     #[test]
