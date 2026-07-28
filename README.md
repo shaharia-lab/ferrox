@@ -159,6 +159,7 @@ curl http://localhost:8080/v1/chat/completions \
 | [Quick Start](docs/user/quickstart.md) | Get running in 5 minutes |
 | [Configuration](docs/user/configuration.md) | Full config reference |
 | [Providers](docs/user/providers.md) | Anthropic, OpenAI, Gemini, Bedrock setup |
+| [GLM & Kimi in Claude Code](docs/user/coding-plans-in-claude-code.md) | Use Z.AI / Moonshot coding plans from Claude Code |
 | [Routing](docs/user/routing.md) | Strategies, failover, circuit breakers |
 | [Virtual Keys](docs/user/virtual-keys.md) | Auth, rate limits, model access |
 | [API Reference](docs/user/api-reference.md) | Endpoints and request/response formats |

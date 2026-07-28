@@ -1,9 +1,12 @@
 # Rust build output (Cargo.lock is intentionally committed — this is a binary crate)
 /target/
 
-# Local config overrides with real API keys
-config/local.yaml
-config/local.*.yaml
+# Local config overrides with real API keys.
+# Patterns containing a slash are anchored to this directory, so an unanchored
+# `config/local.yaml` would NOT match `ferrox/config/local.yaml` — the path the
+# Makefile actually generates. Use `**/` so every config dir is covered.
+**/config/local.yaml
+**/config/local.*.yaml
 
 # Environment files with secrets
 .env
