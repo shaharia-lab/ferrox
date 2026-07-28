@@ -245,6 +245,7 @@ fn bedrock_anthropic_to_openai(resp: &Value, model_id: &str) -> ChatCompletionRe
         name: None,
         tool_calls: None,
         tool_call_id: None,
+        reasoning_content: None,
     };
 
     ChatCompletionResponse {
