@@ -2,7 +2,7 @@
 //!
 //! The document is built at compile time by `utoipa` from the `#[utoipa::path]`
 //! annotations on the handlers plus the `ToSchema`-deriving types, and served
-//! from a cold, unauthenticated `/schema` (alias `/openapi.json`) route — no
+//! from a cold, unauthenticated `/api-schema` (alias `/openapi.json`) route — no
 //! hot-path impact.
 //!
 //! Scope guardrail: the `/v1/chat/completions` and `/anthropic/v1/messages`
@@ -238,6 +238,50 @@ mod tests {
         let sec = &v["components"]["securitySchemes"];
         assert!(sec["bearer_auth"].is_object());
         assert!(sec["api_key_auth"].is_object());
+    }
+
+    #[test]
+    fn every_ref_resolves_to_a_registered_schema() {
+        // The core job of an OpenAPI validator: no dangling `$ref`. Referencing
+        // a schema by full path (e.g. `crate::openapi::ErrorResponse`) instead
+        // of its registered component name silently produces an unresolvable
+        // ref, so guard against it here.
+        let v: serde_json::Value = serde_json::from_str(openapi_json()).unwrap();
+        let schemas = &v["components"]["schemas"];
+
+        fn collect_refs<'a>(node: &'a serde_json::Value, out: &mut Vec<&'a str>) {
+            match node {
+                serde_json::Value::Object(map) => {
+                    for (k, val) in map {
+                        if k == "$ref" {
+                            if let Some(s) = val.as_str() {
+                                out.push(s);
+                            }
+                        } else {
+                            collect_refs(val, out);
+                        }
+                    }
+                }
+                serde_json::Value::Array(arr) => arr.iter().for_each(|x| collect_refs(x, out)),
+                _ => {}
+            }
+        }
+
+        let mut refs = Vec::new();
+        collect_refs(&v, &mut refs);
+        assert!(
+            !refs.is_empty(),
+            "expected at least one $ref in the document"
+        );
+        for r in refs {
+            let name = r
+                .strip_prefix("#/components/schemas/")
+                .unwrap_or_else(|| panic!("unexpected $ref form: {r}"));
+            assert!(
+                schemas.get(name).is_some(),
+                "dangling $ref {r}: no component schema named {name:?}"
+            );
+        }
     }
 
     /// Drift guard: the committed `ferrox/openapi.json` must match the spec
