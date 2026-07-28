@@ -43,11 +43,17 @@ pub fn build_router(state: AppState) -> Router {
             auth_middleware,
         ));
 
-    // Public routes (no auth)
-    let public_routes = Router::new()
+    // Public routes (no auth). The metrics endpoint is mounted only when
+    // enabled, at its configured path — honoring `telemetry.metrics`
+    // (`enabled` + `path`), which was previously ignored (the route was
+    // hardcoded at `/metrics` and always mounted).
+    let mut public_routes = Router::new()
         .route("/healthz", get(healthz))
-        .route("/readyz", get(readyz))
-        .route("/metrics", get(metrics_handler));
+        .route("/readyz", get(readyz));
+    let metrics = &state.config.telemetry.metrics;
+    if metrics.enabled {
+        public_routes = public_routes.route(&metrics.path, get(metrics_handler));
+    }
 
     Router::new()
         .merge(v1_routes)
@@ -69,4 +75,91 @@ async fn metrics_handler() -> impl axum::response::IntoResponse {
         )],
         body,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+    use tower::ServiceExt; // for `oneshot`
+
+    /// Build a minimal `AppState` for router tests. All config fields default
+    /// except `providers`/`models` (required by deserialization); the caller
+    /// tweaks `telemetry.metrics` before calling.
+    fn build_state(config: Config) -> AppState {
+        let registry: crate::providers::ProviderRegistry = std::collections::HashMap::new();
+        let router = crate::router::ModelRouter::from_config(&config, &registry).unwrap();
+        let jwks_cache = crate::jwks::JwksCache::new(vec![], 300, reqwest::Client::new());
+        AppState {
+            config: Arc::new(config),
+            providers: Arc::new(registry),
+            router: Arc::new(router),
+            rate_limit_backend: Arc::new(crate::ratelimit::MemoryBackend::new()),
+            metrics: Arc::new(crate::metrics::Metrics::new()),
+            ready: Arc::new(AtomicBool::new(true)),
+            jwks_cache: Arc::new(jwks_cache),
+            usage_writer: crate::usage_writer::noop_writer(),
+            budget_enforcer: Arc::new(crate::budget_enforcer::NoopBudgetEnforcer),
+            event_dispatcher: crate::event_dispatcher::noop_dispatcher(),
+        }
+    }
+
+    fn minimal_config() -> Config {
+        serde_json::from_value(serde_json::json!({"providers": [], "models": []})).unwrap()
+    }
+
+    /// GET `path` against the built router, returning the response status.
+    async fn get_status(config: Config, path: &str) -> StatusCode {
+        let app = build_router(build_state(config));
+        let resp = app
+            .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        resp.status()
+    }
+
+    #[tokio::test]
+    async fn metrics_route_served_at_default_path_when_enabled() {
+        // Default config: enabled = true, path = "/metrics".
+        assert_eq!(
+            get_status(minimal_config(), "/metrics").await,
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn metrics_route_absent_when_disabled() {
+        let mut config = minimal_config();
+        config.telemetry.metrics.enabled = false;
+        assert_eq!(
+            get_status(config, "/metrics").await,
+            StatusCode::NOT_FOUND,
+            "metrics route must not be mounted when disabled"
+        );
+    }
+
+    #[tokio::test]
+    async fn metrics_route_served_at_custom_path() {
+        let mut config = minimal_config();
+        config.telemetry.metrics.path = "/internal/metrics".to_string();
+        // Served at the custom path...
+        assert_eq!(
+            get_status(config.clone(), "/internal/metrics").await,
+            StatusCode::OK
+        );
+        // ...and no longer at the hardcoded default.
+        assert_eq!(get_status(config, "/metrics").await, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn health_routes_unaffected_by_metrics_config() {
+        let mut config = minimal_config();
+        config.telemetry.metrics.enabled = false;
+        assert_eq!(get_status(config.clone(), "/healthz").await, StatusCode::OK);
+        assert_eq!(get_status(config, "/readyz").await, StatusCode::OK);
+    }
 }

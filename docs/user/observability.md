@@ -36,7 +36,20 @@ Every completed request emits a structured log line at `info` level:
 
 ## Prometheus metrics
 
-Metrics are available at `GET /metrics`. All metric names are prefixed `ferrox_`.
+Metrics are available at `GET /metrics` (the default path). All metric names are
+prefixed `ferrox_`. The endpoint is a public, unauthenticated route.
+
+Both the exposure and the path are configurable under `telemetry.metrics`:
+
+```yaml
+telemetry:
+  metrics:
+    enabled: true        # set false to not mount the endpoint at all
+    path: /metrics       # serve at a custom path, e.g. /internal/metrics
+```
+
+When `enabled: false`, the route is not mounted and requests to it return `404`.
+When `path` is set, metrics are served only at that path.
 
 ### Request metrics
 

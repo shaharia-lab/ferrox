@@ -587,6 +587,16 @@ pub(crate) fn validate(config: &Config) -> Result<(), anyhow::Error> {
         bail!("rate_limiting.backend is 'redis' but redis_url is not set");
     }
 
+    // Validate the metrics route path: it is mounted verbatim on the router,
+    // and axum panics at startup on a path that doesn't start with '/'. Fail
+    // here with a clear message instead.
+    if config.telemetry.metrics.enabled && !config.telemetry.metrics.path.starts_with('/') {
+        bail!(
+            "telemetry.metrics.path must start with '/', got '{}'",
+            config.telemetry.metrics.path
+        );
+    }
+
     // Validate model routing references
     for m in &config.models {
         if m.routing.targets.is_empty() {
@@ -786,6 +796,22 @@ mod tests {
         config.models[0].routing.targets.clear();
         let err = validate(&config).unwrap_err().to_string();
         assert!(err.contains("at least one target"));
+    }
+
+    #[test]
+    fn validate_rejects_metrics_path_without_leading_slash() {
+        let mut config = minimal_config("openai", "gpt-4");
+        config.telemetry.metrics.path = "metrics".to_string();
+        let err = validate(&config).unwrap_err().to_string();
+        assert!(err.contains("telemetry.metrics.path must start with '/'"));
+    }
+
+    #[test]
+    fn validate_ignores_metrics_path_when_disabled() {
+        let mut config = minimal_config("openai", "gpt-4");
+        config.telemetry.metrics.enabled = false;
+        config.telemetry.metrics.path = "not-a-path".to_string();
+        assert!(validate(&config).is_ok());
     }
 
     #[test]
