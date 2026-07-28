@@ -22,6 +22,23 @@ use crate::telemetry::metrics::{
 use crate::types::{ChatCompletionRequest, ChatCompletionResponse, RequestContext};
 use crate::usage_writer::UsageEvent;
 
+#[utoipa::path(
+    post,
+    path = "/v1/chat/completions",
+    tag = "OpenAI",
+    security(("bearer_auth" = [])),
+    request_body = ChatCompletionRequestCore,
+    responses(
+        (status = 200, description = "Chat completion. JSON body (mirrors the OpenAI Chat \
+            Completions response), or an SSE stream of `chat.completion.chunk` events \
+            terminated by `data: [DONE]` when `stream=true`."),
+        (status = 401, description = "Missing or invalid credentials", body = ErrorResponse),
+        (status = 403, description = "Model not permitted for this key", body = ErrorResponse),
+        (status = 404, description = "Unknown model alias", body = ErrorResponse),
+        (status = 429, description = "Rate limited or budget exceeded", body = ErrorResponse),
+        (status = 502, description = "Upstream provider error", body = ErrorResponse),
+    )
+)]
 pub async fn chat_completions(
     State(state): State<AppState>,
     Extension(ctx): Extension<RequestContext>,

@@ -316,6 +316,20 @@ No authentication required. See [Observability](observability.md) for the full m
 
 ---
 
+## GET /api-schema · GET /openapi.json
+
+OpenAPI 3.x document describing the gateway's HTTP surface (content type `application/json`). Both paths serve the same document — `/openapi.json` is the convention most SDK generators and API clients auto-detect; `/api-schema` is a friendly alias.
+
+No authentication required. Useful for gateway-only deployments (no control plane) to discover the API, generate typed SDKs, or import into Postman/Insomnia.
+
+The Ferrox-owned shapes (`/v1/models`, `/anthropic/v1/models`, the error envelope) are modeled fully. The `/v1/chat/completions` and `/anthropic/v1/messages` bodies mirror the upstream OpenAI / Anthropic wire formats — only the fields Ferrox owns are modeled, with a reference to the upstream specs for the exhaustive tail.
+
+```bash
+curl http://localhost:8080/openapi.json | jq .
+```
+
+---
+
 ## Using the Anthropic SDK / Claude Code CLI
 
 Point `ANTHROPIC_BASE_URL` at the `/anthropic` prefix. The SDK appends `/v1/messages` automatically.

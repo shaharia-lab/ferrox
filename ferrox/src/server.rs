@@ -49,7 +49,12 @@ pub fn build_router(state: AppState) -> Router {
     // hardcoded at `/metrics` and always mounted).
     let mut public_routes = Router::new()
         .route("/healthz", get(healthz))
-        .route("/readyz", get(readyz));
+        .route("/readyz", get(readyz))
+        // OpenAPI schema for the gateway surface — discovery/SDK-generation for
+        // gateway-only deployments. Cold, unauthenticated; `/openapi.json` is
+        // the auto-detected convention, `/api-schema` a friendly alias.
+        .route("/api-schema", get(schema_handler))
+        .route("/openapi.json", get(schema_handler));
     let metrics = &state.config.telemetry.metrics;
     if metrics.enabled {
         public_routes = public_routes.route(&metrics.path, get(metrics_handler));
@@ -74,6 +79,15 @@ async fn metrics_handler() -> impl axum::response::IntoResponse {
             "text/plain; version=0.0.4; charset=utf-8",
         )],
         body,
+    )
+}
+
+/// Serve the pre-built OpenAPI document as `application/json`. The body is
+/// cached (built once), so this route allocates nothing per request.
+async fn schema_handler() -> impl axum::response::IntoResponse {
+    (
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        crate::openapi::openapi_json(),
     )
 }
 
@@ -161,5 +175,48 @@ mod tests {
         config.telemetry.metrics.enabled = false;
         assert_eq!(get_status(config.clone(), "/healthz").await, StatusCode::OK);
         assert_eq!(get_status(config, "/readyz").await, StatusCode::OK);
+    }
+
+    /// GET `path`, returning (status, content-type, body bytes).
+    async fn get_full(config: Config, path: &str) -> (StatusCode, String, Vec<u8>) {
+        let app = build_router(build_state(config));
+        let resp = app
+            .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = resp.status();
+        let content_type = resp
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec();
+        (status, content_type, bytes)
+    }
+
+    #[tokio::test]
+    async fn schema_routes_serve_openapi_json_without_auth() {
+        for path in ["/api-schema", "/openapi.json"] {
+            let (status, content_type, body) = get_full(minimal_config(), path).await;
+            assert_eq!(status, StatusCode::OK, "{path} should be public + 200");
+            assert!(
+                content_type.starts_with("application/json"),
+                "{path} content-type was {content_type}"
+            );
+            let doc: serde_json::Value = serde_json::from_slice(&body)
+                .unwrap_or_else(|e| panic!("{path} body must be JSON: {e}"));
+            assert!(
+                doc["openapi"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .starts_with("3."),
+                "{path} must be an OpenAPI 3.x document"
+            );
+            assert!(doc["paths"]["/v1/chat/completions"].is_object());
+        }
     }
 }

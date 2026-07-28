@@ -19,6 +19,9 @@ axum = { version = "0.7", features = ["macros"] }
 tower = { version = "0.4", features = ["util"] }
 tower-http = { version = "0.5", features = ["trace", "cors", "request-id", "timeout", "compression-gzip"] }
 
+# OpenAPI schema generation (compile-time; served from a cold public route)
+utoipa = { version = "4", features = ["axum_extras"] }
+
 # HTTP client
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 

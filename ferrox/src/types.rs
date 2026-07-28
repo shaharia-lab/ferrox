@@ -259,17 +259,26 @@ pub struct ChunkDelta {
 
 // ── Models list response ─────────────────────────────────────────────────────
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct ModelsResponse {
+    /// Always `"list"`.
+    #[schema(example = "list")]
     pub object: String,
     pub data: Vec<ModelObject>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct ModelObject {
+    /// The model alias configured in the gateway.
+    #[schema(example = "claude-sonnet")]
     pub id: String,
+    /// Always `"model"`.
+    #[schema(example = "model")]
     pub object: String,
+    /// Unix timestamp; the gateway emits `0` (aliases are not versioned).
     pub created: u64,
+    /// Always `"proxy"`.
+    #[schema(example = "proxy")]
     pub owned_by: String,
 }
 

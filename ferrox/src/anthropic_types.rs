@@ -163,7 +163,7 @@ pub struct AnthropicUsage {
 
 // ── Models list response ─────────────────────────────────────────────────────
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct AnthropicModelsResponse {
     pub data: Vec<AnthropicModelObject>,
     pub has_more: bool,
@@ -171,12 +171,18 @@ pub struct AnthropicModelsResponse {
     pub last_id: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct AnthropicModelObject {
+    /// Always `"model"`.
     #[serde(rename = "type")]
+    #[schema(rename = "type", example = "model")]
     pub object_type: String,
+    /// The model alias configured in the gateway.
+    #[schema(example = "claude-sonnet")]
     pub id: String,
     pub display_name: String,
+    /// RFC 3339 timestamp; the gateway emits an empty string (aliases are not
+    /// versioned).
     pub created_at: String,
 }
 

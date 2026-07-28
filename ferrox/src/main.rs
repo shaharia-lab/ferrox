@@ -8,6 +8,7 @@ mod handlers;
 mod jwks;
 mod lb;
 mod metrics;
+mod openapi;
 mod providers;
 mod ratelimit;
 mod retry;

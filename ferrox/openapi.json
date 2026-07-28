@@ -1,0 +1,525 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "Ferrox Gateway API",
+    "description": "Stateless, OpenAI-compatible LLM gateway. Exposes OpenAI-format and Anthropic-native inference routes plus operational endpoints. The chat/messages request and response bodies mirror the upstream OpenAI / Anthropic wire formats — only the fields Ferrox owns are modeled here; refer to the upstream specs for the exhaustive schema.",
+    "license": {
+      "name": "MIT"
+    },
+    "version": "0.1.0"
+  },
+  "paths": {
+    "/anthropic/v1/messages": {
+      "post": {
+        "tags": [
+          "Anthropic"
+        ],
+        "operationId": "anthropic_messages",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AnthropicMessagesRequestCore"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Message response. JSON body (mirrors the Anthropic Messages response), or an Anthropic SSE event stream when `stream=true`."
+          },
+          "401": {
+            "description": "Missing or invalid credentials",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Model not permitted for this key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown model alias",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Rate limited or budget exceeded",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "Upstream provider error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "api_key_auth": []
+          },
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
+    "/anthropic/v1/models": {
+      "get": {
+        "tags": [
+          "Anthropic"
+        ],
+        "operationId": "list_models_anthropic",
+        "responses": {
+          "200": {
+            "description": "Configured model aliases in Anthropic list format",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AnthropicModelsResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credentials",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "api_key_auth": []
+          },
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
+    "/healthz": {
+      "get": {
+        "tags": [
+          "Observability"
+        ],
+        "operationId": "healthz",
+        "responses": {
+          "200": {
+            "description": "Process is alive"
+          }
+        }
+      }
+    },
+    "/metrics": {
+      "get": {
+        "tags": [
+          "Observability"
+        ],
+        "summary": "Documentation-only stub for the Prometheus metrics endpoint. It has no",
+        "description": "dedicated handler function (it's a closure over `gather()` in `server.rs`),\nso its path item is described here. Public, unauthenticated; present only\nwhen `telemetry.metrics.enabled` (default true), at `telemetry.metrics.path`\n(default `/metrics`).",
+        "operationId": "metrics_doc",
+        "responses": {
+          "200": {
+            "description": "Prometheus/OpenMetrics text exposition"
+          }
+        }
+      }
+    },
+    "/readyz": {
+      "get": {
+        "tags": [
+          "Observability"
+        ],
+        "operationId": "readyz",
+        "responses": {
+          "200": {
+            "description": "Ready to serve traffic"
+          },
+          "503": {
+            "description": "Not ready (still starting or draining)"
+          }
+        }
+      }
+    },
+    "/v1/chat/completions": {
+      "post": {
+        "tags": [
+          "OpenAI"
+        ],
+        "operationId": "chat_completions",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ChatCompletionRequestCore"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Chat completion. JSON body (mirrors the OpenAI Chat Completions response), or an SSE stream of `chat.completion.chunk` events terminated by `data: [DONE]` when `stream=true`."
+          },
+          "401": {
+            "description": "Missing or invalid credentials",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Model not permitted for this key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown model alias",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Rate limited or budget exceeded",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "Upstream provider error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
+    "/v1/models": {
+      "get": {
+        "tags": [
+          "OpenAI"
+        ],
+        "operationId": "list_models",
+        "responses": {
+          "200": {
+            "description": "Configured model aliases in OpenAI list format",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ModelsResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credentials",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "AnthropicMessagesRequestCore": {
+        "type": "object",
+        "description": "Core of the Anthropic-format messages request. As with the OpenAI path, the\nfull body is forwarded upstream; only owned fields are modeled. See\n<https://docs.anthropic.com/en/api/messages> for the exhaustive schema.\n\nSchema-only (see `ChatCompletionRequestCore`): describes the request body,\nnot read at runtime.",
+        "required": [
+          "model",
+          "max_tokens",
+          "messages"
+        ],
+        "properties": {
+          "max_tokens": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Upper bound on tokens to generate (Anthropic requires this field).",
+            "example": 1024,
+            "minimum": 0
+          },
+          "messages": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            },
+            "description": "Conversation messages in Anthropic format. Modeled here as opaque\nobjects; see the upstream spec for the content-block union."
+          },
+          "model": {
+            "type": "string",
+            "description": "Model alias to route to — one of the aliases from `GET /anthropic/v1/models`.",
+            "example": "claude-sonnet"
+          },
+          "stream": {
+            "type": "boolean",
+            "description": "When `true`, the response is streamed as Anthropic SSE events.",
+            "nullable": true
+          }
+        }
+      },
+      "AnthropicModelObject": {
+        "type": "object",
+        "required": [
+          "type",
+          "id",
+          "display_name",
+          "created_at"
+        ],
+        "properties": {
+          "created_at": {
+            "type": "string",
+            "description": "RFC 3339 timestamp; the gateway emits an empty string (aliases are not\nversioned)."
+          },
+          "display_name": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string",
+            "description": "The model alias configured in the gateway.",
+            "example": "claude-sonnet"
+          },
+          "type": {
+            "type": "string",
+            "description": "Always `\"model\"`.",
+            "example": "model"
+          }
+        }
+      },
+      "AnthropicModelsResponse": {
+        "type": "object",
+        "required": [
+          "data",
+          "has_more"
+        ],
+        "properties": {
+          "data": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AnthropicModelObject"
+            }
+          },
+          "first_id": {
+            "type": "string",
+            "nullable": true
+          },
+          "has_more": {
+            "type": "boolean"
+          },
+          "last_id": {
+            "type": "string",
+            "nullable": true
+          }
+        }
+      },
+      "ChatCompletionRequestCore": {
+        "type": "object",
+        "description": "Core of the OpenAI-format chat request. Ferrox forwards the **full** OpenAI\nChat Completions body upstream; only the fields the gateway reads/owns are\nmodeled. See <https://platform.openai.com/docs/api-reference/chat/create>\nfor the exhaustive schema (messages content unions, tools, etc.).\n\nSchema-only: the fields exist to describe the request body, not to be read\nat runtime (the real request type is `crate::types::ChatCompletionRequest`).",
+        "required": [
+          "model",
+          "messages"
+        ],
+        "properties": {
+          "messages": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            },
+            "description": "Conversation messages in OpenAI format. Modeled here as opaque objects;\nsee the upstream spec for the role/content/tool-call union."
+          },
+          "model": {
+            "type": "string",
+            "description": "Model alias to route to — one of the aliases returned by `GET /v1/models`.",
+            "example": "claude-sonnet"
+          },
+          "stream": {
+            "type": "boolean",
+            "description": "When `true`, the response is streamed as SSE chunks terminated by a\nfinal `data: [DONE]` sentinel.",
+            "nullable": true
+          }
+        }
+      },
+      "ErrorDetail": {
+        "type": "object",
+        "required": [
+          "message",
+          "type",
+          "code"
+        ],
+        "properties": {
+          "code": {
+            "type": "integer",
+            "format": "int32",
+            "description": "HTTP status code, duplicated in the body for convenience.",
+            "example": 404,
+            "minimum": 0
+          },
+          "message": {
+            "type": "string",
+            "description": "Human-readable error message.",
+            "example": "Model not found: gpt-5"
+          },
+          "type": {
+            "type": "string",
+            "description": "Machine-readable error category (e.g. `unauthorized`, `model_not_found`,\n`rate_limited`, `provider_error`).",
+            "example": "model_not_found"
+          }
+        }
+      },
+      "ErrorResponse": {
+        "type": "object",
+        "description": "The gateway error envelope: every error response is `{\"error\": {...}}`.\nMirrors the shape produced by `crate::error::ProxyError`.",
+        "required": [
+          "error"
+        ],
+        "properties": {
+          "error": {
+            "$ref": "#/components/schemas/ErrorDetail"
+          }
+        }
+      },
+      "ModelObject": {
+        "type": "object",
+        "required": [
+          "id",
+          "object",
+          "created",
+          "owned_by"
+        ],
+        "properties": {
+          "created": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Unix timestamp; the gateway emits `0` (aliases are not versioned).",
+            "minimum": 0
+          },
+          "id": {
+            "type": "string",
+            "description": "The model alias configured in the gateway.",
+            "example": "claude-sonnet"
+          },
+          "object": {
+            "type": "string",
+            "description": "Always `\"model\"`.",
+            "example": "model"
+          },
+          "owned_by": {
+            "type": "string",
+            "description": "Always `\"proxy\"`.",
+            "example": "proxy"
+          }
+        }
+      },
+      "ModelsResponse": {
+        "type": "object",
+        "required": [
+          "object",
+          "data"
+        ],
+        "properties": {
+          "data": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ModelObject"
+            }
+          },
+          "object": {
+            "type": "string",
+            "description": "Always `\"list\"`.",
+            "example": "list"
+          }
+        }
+      }
+    },
+    "securitySchemes": {
+      "api_key_auth": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "x-api-key"
+      },
+      "bearer_auth": {
+        "type": "http",
+        "scheme": "bearer"
+      }
+    }
+  },
+  "tags": [
+    {
+      "name": "OpenAI",
+      "description": "OpenAI-compatible inference routes (Authorization: Bearer)"
+    },
+    {
+      "name": "Anthropic",
+      "description": "Anthropic-native inference routes (x-api-key or Bearer)"
+    },
+    {
+      "name": "Observability",
+      "description": "Health and metrics (public, unauthenticated)"
+    }
+  ]
+}
