@@ -1,6 +1,6 @@
-# Claude Code Agents
+# Claude Code Agents & Skills
 
-Project-scoped sub-agents for the Ferrox repository. Invoke with `@<agent-name>` in any Claude Code session.
+Project-scoped sub-agents (invoke with `@<agent-name>`) and skills (invoke with `/<skill-name>`) for the Ferrox repository, available in any Claude Code session.
 
 ---
 
@@ -57,4 +57,16 @@ Audits documentation for staleness, gaps, inconsistencies, and duplication. Also
 ```
 ```
 @documentation-reviewer Find any duplicated content across the user and developer docs.
+```
+
+---
+
+# Skills
+
+## `/sdk-compat-audit`
+
+Re-runs the provider-SDK compatibility audit: clones the official OpenAI / Anthropic / Gemini SDKs into a temp dir, cross-references Ferrox's OpenAI ⇄ Anthropic translation layer (`ferrox/src/anthropic_types.rs`, `types.rs`, `providers/*.rs`) against their real wire contracts across the translation dimensions (streaming tool calls, reasoning, usage, multimodal, per-provider tool calling, stop_reason mapping, transparent field pass-through, error/protocol events), deduplicates findings against existing GitHub issues, and files new ones. Read-only on the codebase; the only writes are GitHub issues.
+
+```
+/sdk-compat-audit
 ```
