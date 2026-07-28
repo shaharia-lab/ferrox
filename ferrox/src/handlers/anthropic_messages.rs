@@ -83,6 +83,22 @@ fn proxy_error_to_anthropic_response(e: &ProxyError) -> Response {
     (status, Json(body)).into_response()
 }
 
+#[utoipa::path(
+    post,
+    path = "/anthropic/v1/messages",
+    tag = "Anthropic",
+    security(("api_key_auth" = []), ("bearer_auth" = [])),
+    request_body = AnthropicMessagesRequestCore,
+    responses(
+        (status = 200, description = "Message response. JSON body (mirrors the Anthropic \
+            Messages response), or an Anthropic SSE event stream when `stream=true`."),
+        (status = 401, description = "Missing or invalid credentials", body = ErrorResponse),
+        (status = 403, description = "Model not permitted for this key", body = ErrorResponse),
+        (status = 404, description = "Unknown model alias", body = ErrorResponse),
+        (status = 429, description = "Rate limited or budget exceeded", body = ErrorResponse),
+        (status = 502, description = "Upstream provider error", body = ErrorResponse),
+    )
+)]
 pub async fn anthropic_messages(
     State(state): State<AppState>,
     Extension(ctx): Extension<RequestContext>,

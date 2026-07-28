@@ -3,6 +3,16 @@ use axum::{extract::State, Json};
 use crate::anthropic_types::{AnthropicModelObject, AnthropicModelsResponse};
 use crate::state::AppState;
 
+#[utoipa::path(
+    get,
+    path = "/anthropic/v1/models",
+    tag = "Anthropic",
+    security(("api_key_auth" = []), ("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "Configured model aliases in Anthropic list format", body = AnthropicModelsResponse),
+        (status = 401, description = "Missing or invalid credentials", body = ErrorResponse),
+    )
+)]
 pub async fn list_models_anthropic(State(state): State<AppState>) -> Json<AnthropicModelsResponse> {
     let data: Vec<AnthropicModelObject> = state
         .config
