@@ -641,7 +641,10 @@ pub fn openai_stream_to_anthropic_sse(
                     }
 
                     // Thinking (reasoning) block — opened first, before text/tools.
-                    if !reasoning.is_empty() {
+                    // Ignore reasoning that arrives after the block was closed
+                    // (e.g. reasoning interleaved after text) to avoid emitting a
+                    // delta into a stopped block.
+                    if !reasoning.is_empty() && !s.thinking_closed {
                         if !s.thinking_started {
                             s.thinking_started = true;
                             s.thinking_index = s.next_block_index;

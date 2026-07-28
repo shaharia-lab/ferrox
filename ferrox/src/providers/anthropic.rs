@@ -604,3 +604,34 @@ fn transform_stream(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn thinking_block_deserializes_and_maps_to_reasoning() {
+        // Regression: a response containing a `thinking` block previously failed
+        // to deserialize entirely. It must parse and surface as reasoning_content.
+        let json = r#"{"id":"m","model":"glm","content":[{"type":"thinking","thinking":"reasoning here"},{"type":"text","text":"answer"}],"stop_reason":"end_turn","usage":{"input_tokens":5,"output_tokens":3}}"#;
+        let resp: AnthropicResponse =
+            serde_json::from_str(json).expect("thinking response must deserialize");
+        let out = anthropic_to_openai_response(resp, "glm");
+        let msg = &out.choices[0].message;
+        assert_eq!(msg.reasoning_content.as_deref(), Some("reasoning here"));
+        assert!(
+            matches!(&msg.content, Some(crate::types::MessageContent::Text(t)) if t == "answer")
+        );
+    }
+
+    #[test]
+    fn unknown_content_block_is_ignored_not_fatal() {
+        let json = r#"{"id":"m","model":"x","content":[{"type":"redacted_thinking","data":"..."},{"type":"text","text":"hi"}],"stop_reason":"end_turn","usage":null}"#;
+        let resp: AnthropicResponse =
+            serde_json::from_str(json).expect("unknown block must not be fatal");
+        let out = anthropic_to_openai_response(resp, "x");
+        assert!(
+            matches!(&out.choices[0].message.content, Some(crate::types::MessageContent::Text(t)) if t == "hi")
+        );
+    }
+}
