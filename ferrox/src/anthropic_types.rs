@@ -467,6 +467,10 @@ struct StreamState {
     is_first: bool,
     pending: VecDeque<Result<Event, ProxyError>>,
     output_tokens: u32,
+    /// Prompt tokens. OpenAI-format upstreams deliver this only in the final
+    /// chunk's usage (via `stream_options.include_usage`), so we capture it
+    /// whenever a chunk carries usage and emit it in `message_delta`.
+    input_tokens: u32,
     stop_reason: String,
     stream_done: bool,
     /// Whether the text content_block (index 0) has been opened.
@@ -498,6 +502,7 @@ pub fn openai_stream_to_anthropic_sse(
         is_first: true,
         pending: VecDeque::new(),
         output_tokens: 0,
+        input_tokens: 0,
         stop_reason: "end_turn".to_string(),
         stream_done: false,
         text_block_started: false,
@@ -533,6 +538,7 @@ pub fn openai_stream_to_anthropic_sse(
                     }
                     s.pending.push_back(Ok(make_message_delta_event(
                         &s.stop_reason,
+                        s.input_tokens,
                         s.output_tokens,
                     )));
                     s.pending.push_back(Ok(make_message_stop_event()));
@@ -543,6 +549,9 @@ pub fn openai_stream_to_anthropic_sse(
                     // Update accumulated state
                     if let Some(usage) = &chunk.usage {
                         s.output_tokens = usage.completion_tokens;
+                        if usage.prompt_tokens > 0 {
+                            s.input_tokens = usage.prompt_tokens;
+                        }
                     }
                     if let Some(choice) = chunk.choices.first() {
                         if let Some(reason) = &choice.finish_reason {
@@ -696,14 +705,16 @@ fn make_content_block_stop_event(index: u32) -> Event {
         .data(serde_json::json!({"type": "content_block_stop", "index": index}).to_string())
 }
 
-fn make_message_delta_event(stop_reason: &str, output_tokens: u32) -> Event {
+fn make_message_delta_event(stop_reason: &str, input_tokens: u32, output_tokens: u32) -> Event {
+    // Anthropic clients read the authoritative `input_tokens` from `message_delta`
+    // (message_start only carries a placeholder), so surface it here.
     let data = serde_json::json!({
         "type": "message_delta",
         "delta": {
             "stop_reason": stop_reason,
             "stop_sequence": null
         },
-        "usage": {"output_tokens": output_tokens}
+        "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens}
     });
     Event::default()
         .event("message_delta")
@@ -1278,6 +1289,38 @@ mod tests {
         //            delta("Hello"), delta(" world"),
         //            content_block_stop, message_delta, message_stop
         assert_eq!(events.len(), 8);
+    }
+
+    #[tokio::test]
+    async fn message_delta_includes_input_tokens_from_final_usage() {
+        // OpenAI-format upstreams report prompt_tokens only in the final chunk's
+        // usage; it must surface as Anthropic `input_tokens` in message_delta.
+        let mut usage_chunk = make_chunk(None, Some("stop"));
+        usage_chunk.usage = Some(crate::types::Usage {
+            prompt_tokens: 123,
+            completion_tokens: 45,
+            total_tokens: 168,
+        });
+        let chunks: Vec<Result<ChatCompletionChunk, ProxyError>> =
+            vec![Ok(make_chunk(Some("hi"), None)), Ok(usage_chunk)];
+        let inner: ProviderStream = Box::pin(futures::stream::iter(chunks));
+
+        let events: Vec<_> =
+            openai_stream_to_anthropic_sse("m".to_string(), "msg_u".to_string(), inner)
+                .collect()
+                .await;
+        let dump = events
+            .iter()
+            .map(|e| format!("{:?}", e.as_ref().unwrap()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        // Event Debug-formats its buffer as an escaped byte string, so quotes
+        // appear as \"; match the token/value pair rather than exact JSON.
+        assert!(
+            dump.contains(r#"input_tokens\":123"#),
+            "message_delta must carry input_tokens: {dump}"
+        );
+        assert!(dump.contains(r#"output_tokens\":45"#));
     }
 
     #[tokio::test]
