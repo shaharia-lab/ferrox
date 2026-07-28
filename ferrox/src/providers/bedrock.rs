@@ -8,8 +8,8 @@ use crate::error::ProxyError;
 use crate::providers::anthropic_events::{make_final_chunk, AnthropicEventProcessor};
 use crate::providers::{ProviderAdapter, ProviderStream};
 use crate::types::{
-    ChatCompletionRequest, ChatCompletionResponse, ChatMessage, Choice, MessageContent,
-    StopSequences, Usage,
+    ChatCompletionRequest, ChatCompletionResponse, ChatMessage, Choice, FunctionCall,
+    MessageContent, StopSequences, ToolCall, Usage,
 };
 
 // ── Adapter ──────────────────────────────────────────────────────────────────
@@ -162,18 +162,7 @@ fn build_anthropic_body(req: &ChatCompletionRequest, model_id: &str, stream: boo
         .messages
         .iter()
         .filter(|m| m.role != "system")
-        .map(|m| {
-            let role = match m.role.as_str() {
-                "assistant" => "assistant",
-                _ => "user",
-            };
-            let content = match &m.content {
-                None => Value::String(String::new()),
-                Some(MessageContent::Text(t)) => Value::String(t.clone()),
-                Some(MessageContent::Parts(_)) => Value::String(String::new()),
-            };
-            serde_json::json!({ "role": role, "content": content })
-        })
+        .map(bedrock_message)
         .collect();
 
     let stop_sequences: Option<Vec<String>> = req.stop.as_ref().map(|s| match s {
@@ -203,8 +192,113 @@ fn build_anthropic_body(req: &ChatCompletionRequest, model_id: &str, stream: boo
     if let Some(stop) = stop_sequences {
         body["stop_sequences"] = serde_json::to_value(stop).unwrap_or(Value::Null);
     }
+    if let Some(tools) = &req.tools {
+        body["tools"] = Value::Array(
+            tools
+                .iter()
+                .map(|t| {
+                    serde_json::json!({
+                        "name": t.function.name,
+                        "description": t.function.description,
+                        "input_schema": t.function.parameters.clone()
+                            .unwrap_or_else(|| serde_json::json!({"type": "object"})),
+                    })
+                })
+                .collect(),
+        );
+    }
+    if let Some(tc) = req
+        .tool_choice
+        .as_ref()
+        .and_then(openai_tool_choice_to_anthropic)
+    {
+        body["tool_choice"] = tc;
+    }
 
     body
+}
+
+/// Build one Anthropic message Value, handling assistant tool calls (→ `tool_use`
+/// blocks) and `role:"tool"` results (→ a user turn with a `tool_result` block).
+fn bedrock_message(m: &ChatMessage) -> Value {
+    if m.role == "tool" {
+        let result = match &m.content {
+            Some(MessageContent::Text(t)) => t.clone(),
+            _ => String::new(),
+        };
+        return serde_json::json!({
+            "role": "user",
+            "content": [{
+                "type": "tool_result",
+                "tool_use_id": m.tool_call_id.clone().unwrap_or_default(),
+                "content": result,
+            }],
+        });
+    }
+
+    let role = if m.role == "assistant" {
+        "assistant"
+    } else {
+        "user"
+    };
+
+    // Assistant tool calls (with optional preceding text) → a content-block array.
+    if let Some(tcs) = &m.tool_calls {
+        let mut blocks: Vec<Value> = Vec::new();
+        if let Some(MessageContent::Text(t)) = &m.content {
+            if !t.is_empty() {
+                blocks.push(serde_json::json!({"type": "text", "text": t}));
+            }
+        }
+        for tc in tcs {
+            let input: Value = serde_json::from_str(&tc.function.arguments)
+                .unwrap_or_else(|_| serde_json::json!({}));
+            blocks.push(serde_json::json!({
+                "type": "tool_use",
+                "id": tc.id,
+                "name": tc.function.name,
+                "input": input,
+            }));
+        }
+        return serde_json::json!({ "role": role, "content": blocks });
+    }
+
+    let content = match &m.content {
+        Some(MessageContent::Text(t)) => Value::String(t.clone()),
+        // Multi-part (image) content is handled in the multimodal work (#73);
+        // fall back to concatenated text here.
+        Some(MessageContent::Parts(parts)) => Value::String(
+            parts
+                .iter()
+                .filter_map(|p| match p {
+                    crate::types::ContentPart::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join(""),
+        ),
+        None => Value::String(String::new()),
+    };
+    serde_json::json!({ "role": role, "content": content })
+}
+
+/// Map an OpenAI `tool_choice` to an Anthropic `tool_choice` object.
+fn openai_tool_choice_to_anthropic(tc: &Value) -> Option<Value> {
+    match tc {
+        Value::String(s) => match s.as_str() {
+            "auto" => Some(serde_json::json!({"type": "auto"})),
+            "required" => Some(serde_json::json!({"type": "any"})),
+            // Anthropic has no explicit "none"; omit to let the model not call tools.
+            "none" => None,
+            _ => None,
+        },
+        Value::Object(o) => o
+            .get("function")
+            .and_then(|f| f.get("name"))
+            .and_then(|n| n.as_str())
+            .map(|name| serde_json::json!({"type": "tool", "name": name})),
+        _ => None,
+    }
 }
 
 // ── Response conversion ───────────────────────────────────────────────────────
@@ -216,11 +310,40 @@ fn bedrock_anthropic_to_openai(resp: &Value, model_id: &str) -> ChatCompletionRe
         .unwrap_or("")
         .to_string();
 
-    let text = resp
-        .pointer("/content/0/text")
-        .and_then(|t| t.as_str())
-        .unwrap_or("")
-        .to_string();
+    // Iterate all content blocks: concatenate text, collect tool_use → tool_calls.
+    let mut text = String::new();
+    let mut tool_calls: Vec<ToolCall> = Vec::new();
+    if let Some(blocks) = resp.get("content").and_then(|c| c.as_array()) {
+        for block in blocks {
+            match block.get("type").and_then(|t| t.as_str()) {
+                Some("text") => {
+                    text.push_str(block.get("text").and_then(|t| t.as_str()).unwrap_or(""));
+                }
+                Some("tool_use") => {
+                    tool_calls.push(ToolCall {
+                        id: block
+                            .get("id")
+                            .and_then(|i| i.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                        r#type: "function".to_string(),
+                        function: FunctionCall {
+                            name: block
+                                .get("name")
+                                .and_then(|n| n.as_str())
+                                .unwrap_or("")
+                                .to_string(),
+                            arguments: block
+                                .get("input")
+                                .map(|i| i.to_string())
+                                .unwrap_or_else(|| "{}".to_string()),
+                        },
+                    });
+                }
+                _ => {}
+            }
+        }
+    }
 
     let finish_reason = resp
         .get("stop_reason")
@@ -228,6 +351,8 @@ fn bedrock_anthropic_to_openai(resp: &Value, model_id: &str) -> ChatCompletionRe
         .map(|r| match r {
             "end_turn" => "stop".to_string(),
             "max_tokens" => "length".to_string(),
+            "tool_use" => "tool_calls".to_string(),
+            "stop_sequence" => "stop".to_string(),
             other => other.to_string(),
         });
 
@@ -241,9 +366,17 @@ fn bedrock_anthropic_to_openai(resp: &Value, model_id: &str) -> ChatCompletionRe
 
     let message = ChatMessage {
         role: "assistant".to_string(),
-        content: Some(MessageContent::Text(text)),
+        content: if text.is_empty() {
+            None
+        } else {
+            Some(MessageContent::Text(text))
+        },
         name: None,
-        tool_calls: None,
+        tool_calls: if tool_calls.is_empty() {
+            None
+        } else {
+            Some(tool_calls)
+        },
         tool_call_id: None,
         reasoning_content: None,
     };
@@ -260,5 +393,111 @@ fn bedrock_anthropic_to_openai(resp: &Value, model_id: &str) -> ChatCompletionRe
         }],
         usage,
         system_fingerprint: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{Tool, ToolFunction};
+
+    fn req(
+        messages: Vec<ChatMessage>,
+        with_tools: bool,
+        tool_choice: Option<Value>,
+    ) -> ChatCompletionRequest {
+        ChatCompletionRequest {
+            model: "claude".into(),
+            messages,
+            stream: None,
+            temperature: None,
+            max_tokens: None,
+            top_p: None,
+            stop: None,
+            tools: with_tools.then(|| {
+                vec![Tool {
+                    r#type: "function".into(),
+                    function: ToolFunction {
+                        name: "get_weather".into(),
+                        description: Some("w".into()),
+                        parameters: Some(serde_json::json!({"type": "object"})),
+                    },
+                }]
+            }),
+            tool_choice,
+            system: None,
+            extra_headers: Default::default(),
+            raw_anthropic_body: None,
+            extra: Default::default(),
+        }
+    }
+
+    fn asst_tool_call() -> ChatMessage {
+        ChatMessage {
+            role: "assistant".into(),
+            content: None,
+            name: None,
+            tool_calls: Some(vec![ToolCall {
+                id: "t1".into(),
+                r#type: "function".into(),
+                function: FunctionCall {
+                    name: "get_weather".into(),
+                    arguments: r#"{"loc":"NYC"}"#.into(),
+                },
+            }]),
+            tool_call_id: None,
+            reasoning_content: None,
+        }
+    }
+
+    #[test]
+    fn body_includes_tools_and_tool_use_blocks() {
+        let tool_msg = ChatMessage {
+            role: "tool".into(),
+            content: Some(MessageContent::Text("sunny".into())),
+            name: None,
+            tool_calls: None,
+            tool_call_id: Some("t1".into()),
+            reasoning_content: None,
+        };
+        let body = build_anthropic_body(
+            &req(
+                vec![asst_tool_call(), tool_msg],
+                true,
+                Some(serde_json::json!("required")),
+            ),
+            "claude",
+            false,
+        );
+        let dump = body.to_string();
+        assert!(dump.contains("\"tools\""), "tools sent upstream: {dump}");
+        assert!(dump.contains("input_schema"));
+        assert!(
+            dump.contains("tool_use"),
+            "assistant tool_call → tool_use block"
+        );
+        assert!(
+            dump.contains("tool_result"),
+            "tool result → tool_result block"
+        );
+        assert_eq!(body["tool_choice"]["type"], "any");
+    }
+
+    #[test]
+    fn response_tool_use_becomes_tool_calls() {
+        let resp = serde_json::json!({
+            "id": "m",
+            "content": [
+                {"type": "text", "text": "let me check"},
+                {"type": "tool_use", "id": "tu1", "name": "get_weather", "input": {"loc": "NYC"}}
+            ],
+            "stop_reason": "tool_use",
+            "usage": {"input_tokens": 5, "output_tokens": 3}
+        });
+        let out = bedrock_anthropic_to_openai(&resp, "claude");
+        let tc = &out.choices[0].message.tool_calls.as_ref().unwrap()[0];
+        assert_eq!(tc.function.name, "get_weather");
+        assert!(tc.function.arguments.contains("NYC"));
+        assert_eq!(out.choices[0].finish_reason.as_deref(), Some("tool_calls"));
     }
 }
