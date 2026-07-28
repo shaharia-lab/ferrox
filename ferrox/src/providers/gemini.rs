@@ -54,6 +54,49 @@ impl GeminiAdapter {
     }
 }
 
+impl GeminiAdapter {
+    /// Gemini can't fetch an arbitrary image URL, so download any http(s) image
+    /// parts and inline them as `data:` URLs (which `convert_message` turns into
+    /// `inline_data`). A fetch failure leaves the URL untouched.
+    async fn inline_remote_images(&self, req: &ChatCompletionRequest) -> ChatCompletionRequest {
+        let mut resolved = req.clone();
+        for msg in &mut resolved.messages {
+            if let Some(MessageContent::Parts(parts)) = &mut msg.content {
+                for part in parts.iter_mut() {
+                    if let ContentPart::ImageUrl { image_url } = part {
+                        if !image_url.url.starts_with("data:") {
+                            if let Some(data_url) =
+                                self.fetch_image_as_data_url(&image_url.url).await
+                            {
+                                image_url.url = data_url;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        resolved
+    }
+
+    async fn fetch_image_as_data_url(&self, url: &str) -> Option<String> {
+        let resp = self.client.get(url).send().await.ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        let mime = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.split(';').next())
+            .unwrap_or("image/jpeg")
+            .to_string();
+        let bytes = resp.bytes().await.ok()?;
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        Some(format!("data:{mime};base64,{b64}"))
+    }
+}
+
 #[async_trait]
 impl ProviderAdapter for GeminiAdapter {
     fn name(&self) -> &str {
@@ -65,7 +108,8 @@ impl ProviderAdapter for GeminiAdapter {
         req: &ChatCompletionRequest,
         model_id: &str,
     ) -> Result<ChatCompletionResponse, ProxyError> {
-        let body = build_request_body(req);
+        let req = self.inline_remote_images(req).await;
+        let body = build_request_body(&req);
         let url = format!(
             "{}/v1beta/models/{}:generateContent?key={}",
             self.base_url, model_id, self.api_key
@@ -105,7 +149,8 @@ impl ProviderAdapter for GeminiAdapter {
         req: &ChatCompletionRequest,
         model_id: &str,
     ) -> Result<ProviderStream, ProxyError> {
-        let body = build_request_body(req);
+        let req = self.inline_remote_images(req).await;
+        let body = build_request_body(&req);
         let url = format!(
             "{}/v1beta/models/{}:streamGenerateContent?key={}&alt=sse",
             self.base_url, model_id, self.api_key
@@ -663,7 +708,54 @@ fn gemini_to_openai_response(resp: GeminiResponse, model_id: &str) -> ChatComple
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{Tool, ToolFunction};
+    use crate::config::{DefaultsConfig, ProviderConfig, ProviderType};
+    use crate::types::{ImageUrl, Tool, ToolFunction};
+
+    fn adapter() -> GeminiAdapter {
+        GeminiAdapter::new(
+            &ProviderConfig {
+                name: "g".into(),
+                provider_type: ProviderType::Gemini,
+                api_key: Some("k".into()),
+                base_url: None,
+                region: None,
+                timeouts: None,
+                retry: None,
+                circuit_breaker: None,
+            },
+            &DefaultsConfig::default(),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn data_url_images_are_not_refetched() {
+        // A data: image must be left untouched (no network fetch).
+        let a = adapter();
+        let msg = ChatMessage {
+            role: "user".into(),
+            content: Some(MessageContent::Parts(vec![ContentPart::ImageUrl {
+                image_url: ImageUrl {
+                    url: "data:image/png;base64,QUJD".into(),
+                    detail: None,
+                },
+            }])),
+            name: None,
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        };
+        let resolved = a.inline_remote_images(&req(vec![msg], None)).await;
+        if let Some(MessageContent::Parts(parts)) = &resolved.messages[0].content {
+            if let ContentPart::ImageUrl { image_url } = &parts[0] {
+                assert_eq!(image_url.url, "data:image/png;base64,QUJD");
+            } else {
+                panic!("expected image part");
+            }
+        } else {
+            panic!("expected parts");
+        }
+    }
 
     fn req(messages: Vec<ChatMessage>, tool_choice: Option<Value>) -> ChatCompletionRequest {
         ChatCompletionRequest {
