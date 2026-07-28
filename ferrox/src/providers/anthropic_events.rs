@@ -191,10 +191,11 @@ impl AnthropicEventProcessor {
 
 pub fn map_stop_reason(r: &str) -> String {
     match r {
-        "end_turn" => "stop".to_string(),
-        "max_tokens" => "length".to_string(),
+        "end_turn" | "stop_sequence" | "pause_turn" => "stop".to_string(),
+        "max_tokens" | "model_context_window_exceeded" => "length".to_string(),
         "tool_use" => "tool_calls".to_string(),
-        other => other.to_string(),
+        "refusal" => "content_filter".to_string(),
+        _ => "stop".to_string(),
     }
 }
 
@@ -204,6 +205,7 @@ fn parse_usage_from_message_delta(v: &Value, input_tokens: u32) -> Option<Usage>
         prompt_tokens: input_tokens,
         completion_tokens: output,
         total_tokens: input_tokens + output,
+        extra: Default::default(),
     })
 }
 
@@ -498,6 +500,10 @@ mod tests {
         assert_eq!(map_stop_reason("end_turn"), "stop");
         assert_eq!(map_stop_reason("max_tokens"), "length");
         assert_eq!(map_stop_reason("tool_use"), "tool_calls");
-        assert_eq!(map_stop_reason("custom"), "custom");
+        assert_eq!(map_stop_reason("refusal"), "content_filter");
+        assert_eq!(map_stop_reason("pause_turn"), "stop");
+        assert_eq!(map_stop_reason("model_context_window_exceeded"), "length");
+        // Unknown/future reasons default to a valid OpenAI value.
+        assert_eq!(map_stop_reason("custom"), "stop");
     }
 }

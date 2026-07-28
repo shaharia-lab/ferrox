@@ -28,11 +28,9 @@ pub struct AnthropicMessagesRequest {
     pub thinking: Option<serde_json::Value>,
     /// Beta feature strings (body alternative to `anthropic-beta` header) — forwarded.
     pub betas: Option<Vec<String>>,
-    /// Accepted for API compatibility; not forwarded to providers.
-    #[allow(dead_code)]
+    /// `metadata.user_id` is forwarded as OpenAI `user`.
     pub metadata: Option<serde_json::Value>,
-    /// Accepted for API compatibility; not forwarded to providers.
-    #[allow(dead_code)]
+    /// Forwarded as `top_k` (accepted by many OpenAI-compatible backends).
     pub top_k: Option<u32>,
 }
 
@@ -233,6 +231,22 @@ pub fn to_chat_completion_request(req: AnthropicMessagesRequest) -> ChatCompleti
             "_anthropic_betas".to_string(),
             serde_json::Value::Array(betas.into_iter().map(serde_json::Value::String).collect()),
         );
+    }
+    // Anthropic `metadata.user_id` → OpenAI `user`; `top_k` passes through as-is
+    // (many OpenAI-compatible backends, incl. GLM/Kimi, accept it).
+    if let Some(user_id) = req
+        .metadata
+        .as_ref()
+        .and_then(|m| m.get("user_id"))
+        .and_then(|u| u.as_str())
+    {
+        extra.insert(
+            "user".to_string(),
+            serde_json::Value::String(user_id.to_string()),
+        );
+    }
+    if let Some(top_k) = req.top_k {
+        extra.insert("top_k".to_string(), serde_json::Value::from(top_k));
     }
 
     ChatCompletionRequest {
@@ -473,12 +487,8 @@ pub fn to_anthropic_response(resp: ChatCompletionResponse) -> AnthropicMessagesR
         }
     }
 
-    // Always emit at least one content block so the SDK can parse the response.
-    if content.is_empty() {
-        content.push(AnthropicResponseContent::Text {
-            text: String::new(),
-        });
-    }
+    // Anthropic permits an empty `content` array; do NOT synthesize an empty
+    // text block, which some clients reject ("text content blocks must be non-empty").
 
     let stop_reason = choice
         .as_ref()
@@ -1260,6 +1270,31 @@ mod tests {
         );
     }
 
+    #[test]
+    fn usage_details_round_trip() {
+        // Provider usage-detail fields survive the OpenAI-format round-trip.
+        let json = r#"{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15,"prompt_tokens_details":{"cached_tokens":8}}"#;
+        let u: crate::types::Usage = serde_json::from_str(json).unwrap();
+        assert_eq!(u.prompt_tokens, 10);
+        let out = serde_json::to_value(&u).unwrap();
+        assert_eq!(out["prompt_tokens_details"]["cached_tokens"], 8);
+    }
+
+    #[test]
+    fn metadata_user_and_top_k_pass_through() {
+        let json = r#"{"model":"m","max_tokens":10,"metadata":{"user_id":"u123"},"top_k":40,"messages":[{"role":"user","content":"hi"}]}"#;
+        let req: AnthropicMessagesRequest = serde_json::from_str(json).unwrap();
+        let internal = to_chat_completion_request(req);
+        assert_eq!(
+            internal.extra.get("user").and_then(|v| v.as_str()),
+            Some("u123")
+        );
+        assert_eq!(
+            internal.extra.get("top_k").and_then(|v| v.as_u64()),
+            Some(40)
+        );
+    }
+
     // ── to_anthropic_response ─────────────────────────────────────────────────
 
     fn make_openai_response(content: &str, finish_reason: &str) -> ChatCompletionResponse {
@@ -1284,6 +1319,7 @@ mod tests {
                 prompt_tokens: 10,
                 completion_tokens: 5,
                 total_tokens: 15,
+                extra: Default::default(),
             }),
             system_fingerprint: None,
         }
@@ -1737,6 +1773,7 @@ mod tests {
             prompt_tokens: 123,
             completion_tokens: 45,
             total_tokens: 168,
+            extra: Default::default(),
         });
         let chunks: Vec<Result<ChatCompletionChunk, ProxyError>> =
             vec![Ok(make_chunk(Some("hi"), None)), Ok(usage_chunk)];

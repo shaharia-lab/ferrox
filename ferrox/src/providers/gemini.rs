@@ -169,6 +169,7 @@ impl ProviderAdapter for GeminiAdapter {
                     prompt_tokens: u.prompt_token_count,
                     completion_tokens: u.candidates_token_count.unwrap_or(0),
                     total_tokens: u.total_token_count,
+        extra: Default::default(),
                 });
 
                 let candidate = match gemini_resp.candidates.into_iter().next() {
@@ -605,6 +606,7 @@ fn gemini_to_openai_response(resp: GeminiResponse, model_id: &str) -> ChatComple
         prompt_tokens: u.prompt_token_count,
         completion_tokens: u.candidates_token_count.unwrap_or(0),
         total_tokens: u.total_token_count,
+        extra: Default::default(),
     });
 
     let choices = resp

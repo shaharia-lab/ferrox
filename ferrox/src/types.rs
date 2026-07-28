@@ -185,6 +185,15 @@ pub struct Usage {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
     pub total_tokens: u32,
+    /// Pass-through for provider usage details (`prompt_tokens_details`,
+    /// `completion_tokens_details` with cache/reasoning token breakdowns, etc.)
+    /// so they survive the OpenAI-format response round-trip.
+    #[serde(
+        flatten,
+        default,
+        skip_serializing_if = "std::collections::HashMap::is_empty"
+    )]
+    pub extra: std::collections::HashMap<String, serde_json::Value>,
 }
 
 // ── Streaming chunk ──────────────────────────────────────────────────────────
