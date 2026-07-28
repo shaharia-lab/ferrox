@@ -28,11 +28,9 @@ pub struct AnthropicMessagesRequest {
     pub thinking: Option<serde_json::Value>,
     /// Beta feature strings (body alternative to `anthropic-beta` header) — forwarded.
     pub betas: Option<Vec<String>>,
-    /// Accepted for API compatibility; not forwarded to providers.
-    #[allow(dead_code)]
+    /// `metadata.user_id` is forwarded as OpenAI `user`.
     pub metadata: Option<serde_json::Value>,
-    /// Accepted for API compatibility; not forwarded to providers.
-    #[allow(dead_code)]
+    /// Forwarded as `top_k` (accepted by many OpenAI-compatible backends).
     pub top_k: Option<u32>,
 }
 
@@ -234,6 +232,22 @@ pub fn to_chat_completion_request(req: AnthropicMessagesRequest) -> ChatCompleti
             serde_json::Value::Array(betas.into_iter().map(serde_json::Value::String).collect()),
         );
     }
+    // Anthropic `metadata.user_id` → OpenAI `user`; `top_k` passes through as-is
+    // (many OpenAI-compatible backends, incl. GLM/Kimi, accept it).
+    if let Some(user_id) = req
+        .metadata
+        .as_ref()
+        .and_then(|m| m.get("user_id"))
+        .and_then(|u| u.as_str())
+    {
+        extra.insert(
+            "user".to_string(),
+            serde_json::Value::String(user_id.to_string()),
+        );
+    }
+    if let Some(top_k) = req.top_k {
+        extra.insert("top_k".to_string(), serde_json::Value::from(top_k));
+    }
 
     ChatCompletionRequest {
         model: req.model,
@@ -311,12 +325,23 @@ fn convert_blocks(role: String, blocks: Vec<AnthropicContentBlock>, out: &mut Ve
             AnthropicContentBlock::ToolResult {
                 tool_use_id,
                 content,
-                ..
+                is_error,
             } => {
-                tool_results.push((tool_use_id, tool_result_content_to_string(content)));
+                let mut text = tool_result_content_to_string(content);
+                // The OpenAI `tool` role has no `is_error`; annotate so the model
+                // can tell a failed tool call from a successful one.
+                if is_error {
+                    text = format!("[tool error] {text}");
+                }
+                tool_results.push((tool_use_id, text));
             }
-            // Document/thinking/unknown blocks have no OpenAI equivalent — dropped.
-            AnthropicContentBlock::Unknown => {}
+            // Document/thinking/unknown blocks have no OpenAI equivalent. Warn so
+            // a silently-dropped block isn't mistaken for successful handling.
+            AnthropicContentBlock::Unknown => {
+                tracing::warn!(
+                    "dropping unsupported Anthropic content block (no OpenAI equivalent)"
+                );
+            }
         }
     }
 
@@ -473,12 +498,8 @@ pub fn to_anthropic_response(resp: ChatCompletionResponse) -> AnthropicMessagesR
         }
     }
 
-    // Always emit at least one content block so the SDK can parse the response.
-    if content.is_empty() {
-        content.push(AnthropicResponseContent::Text {
-            text: String::new(),
-        });
-    }
+    // Anthropic permits an empty `content` array; do NOT synthesize an empty
+    // text block, which some clients reject ("text content blocks must be non-empty").
 
     let stop_reason = choice
         .as_ref()
@@ -1260,6 +1281,53 @@ mod tests {
         );
     }
 
+    #[test]
+    fn usage_details_round_trip() {
+        // Provider usage-detail fields survive the OpenAI-format round-trip.
+        let json = r#"{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15,"prompt_tokens_details":{"cached_tokens":8}}"#;
+        let u: crate::types::Usage = serde_json::from_str(json).unwrap();
+        assert_eq!(u.prompt_tokens, 10);
+        let out = serde_json::to_value(&u).unwrap();
+        assert_eq!(out["prompt_tokens_details"]["cached_tokens"], 8);
+    }
+
+    #[test]
+    fn metadata_user_and_top_k_pass_through() {
+        let json = r#"{"model":"m","max_tokens":10,"metadata":{"user_id":"u123"},"top_k":40,"messages":[{"role":"user","content":"hi"}]}"#;
+        let req: AnthropicMessagesRequest = serde_json::from_str(json).unwrap();
+        let internal = to_chat_completion_request(req);
+        assert_eq!(
+            internal.extra.get("user").and_then(|v| v.as_str()),
+            Some("u123")
+        );
+        assert_eq!(
+            internal.extra.get("top_k").and_then(|v| v.as_u64()),
+            Some(40)
+        );
+    }
+
+    #[test]
+    fn response_extra_fields_round_trip() {
+        // service_tier + choice logprobs survive the OpenAI-format round-trip.
+        let json = r#"{"id":"c","object":"chat.completion","created":0,"model":"m","service_tier":"default","choices":[{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"stop","logprobs":{"content":[]}}],"usage":null,"system_fingerprint":null}"#;
+        let resp: ChatCompletionResponse = serde_json::from_str(json).unwrap();
+        let out = serde_json::to_value(&resp).unwrap();
+        assert_eq!(out["service_tier"], "default");
+        assert!(out["choices"][0]["logprobs"].is_object());
+    }
+
+    #[test]
+    fn tool_result_is_error_is_annotated() {
+        let json = r#"{"model":"m","max_tokens":10,"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"boom","is_error":true}]}]}"#;
+        let req: AnthropicMessagesRequest = serde_json::from_str(json).unwrap();
+        let internal = to_chat_completion_request(req);
+        let tool_msg = internal.messages.iter().find(|m| m.role == "tool").unwrap();
+        match tool_msg.content.as_ref().unwrap() {
+            MessageContent::Text(t) => assert!(t.starts_with("[tool error] "), "got: {t}"),
+            other => panic!("expected text, got {other:?}"),
+        }
+    }
+
     // ── to_anthropic_response ─────────────────────────────────────────────────
 
     fn make_openai_response(content: &str, finish_reason: &str) -> ChatCompletionResponse {
@@ -1279,13 +1347,16 @@ mod tests {
                     reasoning_content: None,
                 },
                 finish_reason: Some(finish_reason.to_string()),
+                extra: Default::default(),
             }],
             usage: Some(Usage {
                 prompt_tokens: 10,
                 completion_tokens: 5,
                 total_tokens: 15,
+                extra: Default::default(),
             }),
             system_fingerprint: None,
+            extra: Default::default(),
         }
     }
 
@@ -1359,9 +1430,11 @@ mod tests {
                     reasoning_content: None,
                 },
                 finish_reason: Some("tool_calls".to_string()),
+                extra: Default::default(),
             }],
             usage: None,
             system_fingerprint: None,
+            extra: Default::default(),
         };
         let r = to_anthropic_response(resp);
         assert_eq!(r.content.len(), 1);
@@ -1430,8 +1503,10 @@ mod tests {
                     reasoning_content: None,
                 },
                 finish_reason: finish_reason.map(str::to_string),
+                extra: Default::default(),
             }],
             usage: None,
+            extra: Default::default(),
         }
     }
 
@@ -1463,8 +1538,10 @@ mod tests {
                     reasoning_content: None,
                 },
                 finish_reason: finish_reason.map(str::to_string),
+                extra: Default::default(),
             }],
             usage: None,
+            extra: Default::default(),
         }
     }
 
@@ -1498,8 +1575,10 @@ mod tests {
                     reasoning_content: None,
                 },
                 finish_reason: finish.map(str::to_string),
+                extra: Default::default(),
             }],
             usage: None,
+            extra: Default::default(),
         }
     }
 
@@ -1737,6 +1816,7 @@ mod tests {
             prompt_tokens: 123,
             completion_tokens: 45,
             total_tokens: 168,
+            extra: Default::default(),
         });
         let chunks: Vec<Result<ChatCompletionChunk, ProxyError>> =
             vec![Ok(make_chunk(Some("hi"), None)), Ok(usage_chunk)];

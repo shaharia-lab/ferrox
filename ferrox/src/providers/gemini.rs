@@ -169,6 +169,7 @@ impl ProviderAdapter for GeminiAdapter {
                     prompt_tokens: u.prompt_token_count,
                     completion_tokens: u.candidates_token_count.unwrap_or(0),
                     total_tokens: u.total_token_count,
+        extra: Default::default(),
                 });
 
                 let candidate = match gemini_resp.candidates.into_iter().next() {
@@ -216,8 +217,10 @@ impl ProviderAdapter for GeminiAdapter {
                             reasoning_content: None,
                         },
                         finish_reason,
+                        extra: Default::default(),
                     }],
                     usage,
+                    extra: Default::default(),
                 };
                 yield Ok(chunk);
             }
@@ -605,6 +608,7 @@ fn gemini_to_openai_response(resp: GeminiResponse, model_id: &str) -> ChatComple
         prompt_tokens: u.prompt_token_count,
         completion_tokens: u.candidates_token_count.unwrap_or(0),
         total_tokens: u.total_token_count,
+        extra: Default::default(),
     });
 
     let choices = resp
@@ -639,6 +643,7 @@ fn gemini_to_openai_response(resp: GeminiResponse, model_id: &str) -> ChatComple
                 index: i as u32,
                 message,
                 finish_reason,
+                extra: Default::default(),
             }
         })
         .collect();
@@ -651,6 +656,7 @@ fn gemini_to_openai_response(resp: GeminiResponse, model_id: &str) -> ChatComple
         choices,
         usage,
         system_fingerprint: None,
+        extra: Default::default(),
     }
 }
 

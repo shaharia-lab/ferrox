@@ -171,6 +171,14 @@ pub struct ChatCompletionResponse {
     pub choices: Vec<Choice>,
     pub usage: Option<Usage>,
     pub system_fingerprint: Option<String>,
+    /// Pass-through for non-modelled response fields (e.g. choice `logprobs`,
+    /// `service_tier`) so they survive the OpenAI-format round-trip.
+    #[serde(
+        flatten,
+        default,
+        skip_serializing_if = "std::collections::HashMap::is_empty"
+    )]
+    pub extra: std::collections::HashMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -178,6 +186,14 @@ pub struct Choice {
     pub index: u32,
     pub message: ChatMessage,
     pub finish_reason: Option<String>,
+    /// Pass-through for non-modelled response fields (e.g. choice `logprobs`,
+    /// `service_tier`) so they survive the OpenAI-format round-trip.
+    #[serde(
+        flatten,
+        default,
+        skip_serializing_if = "std::collections::HashMap::is_empty"
+    )]
+    pub extra: std::collections::HashMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -185,6 +201,15 @@ pub struct Usage {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
     pub total_tokens: u32,
+    /// Pass-through for provider usage details (`prompt_tokens_details`,
+    /// `completion_tokens_details` with cache/reasoning token breakdowns, etc.)
+    /// so they survive the OpenAI-format response round-trip.
+    #[serde(
+        flatten,
+        default,
+        skip_serializing_if = "std::collections::HashMap::is_empty"
+    )]
+    pub extra: std::collections::HashMap<String, serde_json::Value>,
 }
 
 // ── Streaming chunk ──────────────────────────────────────────────────────────
@@ -197,6 +222,14 @@ pub struct ChatCompletionChunk {
     pub model: String,
     pub choices: Vec<ChunkChoice>,
     pub usage: Option<Usage>,
+    /// Pass-through for non-modelled response fields (e.g. choice `logprobs`,
+    /// `service_tier`) so they survive the OpenAI-format round-trip.
+    #[serde(
+        flatten,
+        default,
+        skip_serializing_if = "std::collections::HashMap::is_empty"
+    )]
+    pub extra: std::collections::HashMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -204,6 +237,14 @@ pub struct ChunkChoice {
     pub index: u32,
     pub delta: ChunkDelta,
     pub finish_reason: Option<String>,
+    /// Pass-through for non-modelled response fields (e.g. choice `logprobs`,
+    /// `service_tier`) so they survive the OpenAI-format round-trip.
+    #[serde(
+        flatten,
+        default,
+        skip_serializing_if = "std::collections::HashMap::is_empty"
+    )]
+    pub extra: std::collections::HashMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -382,6 +382,7 @@ fn bedrock_anthropic_to_openai(resp: &Value, model_id: &str) -> ChatCompletionRe
         total_tokens: (u.get("input_tokens").and_then(|t| t.as_u64()).unwrap_or(0)
             + u.get("output_tokens").and_then(|t| t.as_u64()).unwrap_or(0))
             as u32,
+        extra: Default::default(),
     });
 
     let message = ChatMessage {
@@ -410,9 +411,11 @@ fn bedrock_anthropic_to_openai(resp: &Value, model_id: &str) -> ChatCompletionRe
             index: 0,
             message,
             finish_reason,
+            extra: Default::default(),
         }],
         usage,
         system_fingerprint: None,
+        extra: Default::default(),
     }
 }
 

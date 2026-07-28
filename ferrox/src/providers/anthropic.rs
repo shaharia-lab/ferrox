@@ -554,16 +554,19 @@ fn anthropic_to_openai_response(resp: AnthropicResponse, model_id: &str) -> Chat
     };
 
     let finish_reason = resp.stop_reason.map(|r| match r.as_str() {
-        "end_turn" => "stop".to_string(),
-        "max_tokens" => "length".to_string(),
+        "end_turn" | "stop_sequence" | "pause_turn" => "stop".to_string(),
+        "max_tokens" | "model_context_window_exceeded" => "length".to_string(),
         "tool_use" => "tool_calls".to_string(),
-        other => other.to_string(),
+        "refusal" => "content_filter".to_string(),
+        // Unknown/future Anthropic reasons default to a valid OpenAI value.
+        _ => "stop".to_string(),
     });
 
     let usage = resp.usage.map(|u| Usage {
         prompt_tokens: u.input_tokens,
         completion_tokens: u.output_tokens,
         total_tokens: u.input_tokens + u.output_tokens,
+        extra: Default::default(),
     });
 
     ChatCompletionResponse {
@@ -575,9 +578,11 @@ fn anthropic_to_openai_response(resp: AnthropicResponse, model_id: &str) -> Chat
             index: 0,
             message,
             finish_reason,
+            extra: Default::default(),
         }],
         usage,
         system_fingerprint: None,
+        extra: Default::default(),
     }
 }
 
