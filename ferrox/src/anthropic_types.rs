@@ -1242,15 +1242,13 @@ mod tests {
         assert!(events.iter().all(|e| e.is_ok()));
 
         // Verify no content_block_start with type "text" appears
-        for ev in &events {
-            if let Ok(sse) = ev {
-                let data = format!("{:?}", sse);
-                if data.contains("content_block_start") {
-                    assert!(
-                        !data.contains(r#""type":"text""#),
-                        "tool-only response must not emit a text content block: {data}"
-                    );
-                }
+        for sse in events.iter().flatten() {
+            let data = format!("{:?}", sse);
+            if data.contains("content_block_start") {
+                assert!(
+                    !data.contains(r#""type":"text""#),
+                    "tool-only response must not emit a text content block: {data}"
+                );
             }
         }
     }
