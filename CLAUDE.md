@@ -120,6 +120,7 @@ Project-scoped agents live in `.claude/agents/`. Invoke with `@<name>` in any Cl
 | Quickstart (5-min setup) | `docs/user/quickstart.md` |
 | Full configuration reference | `docs/user/configuration.md` |
 | Provider setup (Anthropic, OpenAI, Gemini, Bedrock) | `docs/user/providers.md` |
+| GLM / Kimi coding plans in Claude Code | `docs/user/coding-plans-in-claude-code.md` |
 | Routing strategies & failover | `docs/user/routing.md` |
 | Virtual keys & rate limiting | `docs/user/virtual-keys.md` |
 | API endpoint reference | `docs/user/api-reference.md` |
