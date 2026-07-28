@@ -219,6 +219,11 @@ struct OpenAIRequest {
     tools: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_choice: Option<Value>,
+    /// Pass-through for standard OpenAI fields Ferrox doesn't model explicitly
+    /// (response_format, seed, n, logprobs, frequency/presence_penalty, user, …),
+    /// so a transparent proxy forwards them instead of silently dropping them.
+    #[serde(flatten)]
+    extra: std::collections::HashMap<String, Value>,
 }
 
 #[derive(Serialize)]
@@ -276,6 +281,14 @@ fn build_request_body(req: &ChatCompletionRequest, model_id: &str, stream: bool)
         stop,
         tools,
         tool_choice: req.tool_choice.clone(),
+        // Forward client-supplied pass-through fields. Internal `_`-prefixed keys
+        // (e.g. `_anthropic_thinking`) are gateway-private and never sent upstream.
+        extra: req
+            .extra
+            .iter()
+            .filter(|(k, _)| !k.starts_with('_'))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect(),
     }
 }
 
@@ -335,6 +348,42 @@ mod tests {
         assert_eq!(
             adapter.completions_url(),
             "https://api.z.ai/api/paas/v4/chat/completions"
+        );
+    }
+
+    #[test]
+    fn extra_fields_pass_through_but_internal_keys_dropped() {
+        let mut extra = std::collections::HashMap::new();
+        extra.insert(
+            "response_format".to_string(),
+            serde_json::json!({"type":"json_object"}),
+        );
+        extra.insert("seed".to_string(), serde_json::json!(42));
+        extra.insert(
+            "_anthropic_thinking".to_string(),
+            serde_json::json!({"type":"enabled"}),
+        );
+        let req = ChatCompletionRequest {
+            model: "m".to_string(),
+            messages: vec![],
+            stream: None,
+            temperature: None,
+            max_tokens: None,
+            top_p: None,
+            stop: None,
+            tools: None,
+            tool_choice: None,
+            system: None,
+            extra_headers: Default::default(),
+            raw_anthropic_body: None,
+            extra,
+        };
+        let json = serde_json::to_value(build_request_body(&req, "m", false)).unwrap();
+        assert_eq!(json["response_format"]["type"], "json_object");
+        assert_eq!(json["seed"], 42);
+        assert!(
+            json.get("_anthropic_thinking").is_none(),
+            "internal `_`-prefixed keys must not leak upstream"
         );
     }
 
