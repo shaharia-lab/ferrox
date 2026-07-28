@@ -298,6 +298,11 @@ fn convert_blocks(role: String, blocks: Vec<AnthropicContentBlock>, out: &mut Ve
     let mut content_parts: Vec<ContentPart> = Vec::new();
     let mut tool_calls: Vec<ToolCall> = Vec::new();
     let mut tool_results: Vec<(String, String)> = Vec::new();
+    // Image parts extracted from `tool_result` blocks. Held separately so they
+    // ride the trailing `user` message (user turns only) rather than leaking
+    // onto an assistant message — mirroring how a `tool_result`'s text is
+    // dropped on the assistant path.
+    let mut tool_result_image_parts: Vec<ContentPart> = Vec::new();
 
     for block in blocks {
         match block {
@@ -330,10 +335,10 @@ fn convert_blocks(role: String, blocks: Vec<AnthropicContentBlock>, out: &mut Ve
                 // OpenAI `tool` messages are text-only, so an image returned
                 // inside a `tool_result` cannot ride on the tool reply. Extract
                 // any image blocks (borrowing before `content` is moved into the
-                // text flattener) and re-home them onto this turn's trailing
-                // `user` message, which is emitted after the `tool` replies —
-                // preserving the tool_call/reply adjacency from #104/#105.
-                let images = tool_result_images(content.as_ref());
+                // text flattener); they're re-homed onto this turn's trailing
+                // `user` message below, after the `tool` replies — preserving
+                // the tool_call/reply adjacency from #104/#105.
+                tool_result_image_parts.extend(tool_result_images(content.as_ref()));
                 let mut text = tool_result_content_to_string(content);
                 // The OpenAI `tool` role has no `is_error`; annotate so the model
                 // can tell a failed tool call from a successful one.
@@ -341,7 +346,6 @@ fn convert_blocks(role: String, blocks: Vec<AnthropicContentBlock>, out: &mut Ve
                     text = format!("[tool error] {text}");
                 }
                 tool_results.push((tool_use_id, text));
-                content_parts.extend(images);
             }
             // Document/thinking/unknown blocks have no OpenAI equivalent. Warn so
             // a silently-dropped block isn't mistaken for successful handling.
@@ -391,6 +395,10 @@ fn convert_blocks(role: String, blocks: Vec<AnthropicContentBlock>, out: &mut Ve
                 reasoning_content: None,
             });
         }
+        // Re-home any tool_result images onto the trailing user message so they
+        // land in a spec-valid position (image_url is invalid on a `tool`
+        // message) after the tool replies.
+        content_parts.extend(tool_result_image_parts);
         if let Some(content) = parts_to_content(content_parts) {
             out.push(ChatMessage {
                 role: role.clone(),
@@ -1550,6 +1558,45 @@ mod tests {
         assert_eq!(roles, vec!["assistant", "tool", "user"]);
         assert!(out.messages[0].tool_calls.is_some());
         assert_eq!(out.messages[1].tool_call_id.as_deref(), Some("tool_shot"));
+    }
+
+    #[test]
+    fn assistant_turn_tool_result_image_does_not_leak_onto_assistant_message() {
+        // tool_result is a user-turn construct; on the (malformed) assistant
+        // path its text is already dropped, so its image must not attach to the
+        // assistant message either — it stays text/no-image, symmetric with the
+        // text handling.
+        let req = AnthropicMessagesRequest {
+            messages: vec![AnthropicMessage {
+                role: "assistant".to_string(),
+                content: AnthropicMessageContent::Blocks(vec![
+                    AnthropicContentBlock::Text {
+                        text: "hi".to_string(),
+                    },
+                    AnthropicContentBlock::ToolResult {
+                        tool_use_id: "t1".to_string(),
+                        content: Some(serde_json::json!([
+                            {"type": "image", "source": {"type": "url", "url": "https://example.com/x.png"}}
+                        ])),
+                        is_error: false,
+                    },
+                ]),
+            }],
+            ..minimal_request("k3")
+        };
+        let out = to_chat_completion_request(req);
+        assert_eq!(out.messages.len(), 1);
+        let msg = &out.messages[0];
+        assert_eq!(msg.role, "assistant");
+        // No image_url part leaked onto the assistant message.
+        if let Some(MessageContent::Parts(parts)) = msg.content.as_ref() {
+            assert!(
+                !parts
+                    .iter()
+                    .any(|p| matches!(p, ContentPart::ImageUrl { .. })),
+                "tool_result image leaked onto assistant message"
+            );
+        }
     }
 
     #[test]
