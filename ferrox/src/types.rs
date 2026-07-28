@@ -125,6 +125,34 @@ pub struct FunctionCall {
     pub arguments: String,
 }
 
+/// A tool call as it appears in a streaming `delta`.
+///
+/// Unlike the non-streaming [`ToolCall`], every field except `index` is
+/// optional: OpenAI-format providers send `id`/`type`/`name` only in the first
+/// fragment for a given `index`, then stream `function.arguments` in pieces.
+/// Modelling those fields as required (as [`ToolCall`] does) makes continuation
+/// fragments fail to deserialize and aborts the whole stream. Consumers
+/// accumulate fragments by `index`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StreamToolCall {
+    #[serde(default)]
+    pub index: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub r#type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub function: Option<StreamFunctionCall>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StreamFunctionCall {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub arguments: Option<String>,
+}
+
 // ── Non-streaming response ───────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -175,7 +203,7 @@ pub struct ChunkChoice {
 pub struct ChunkDelta {
     pub role: Option<String>,
     pub content: Option<String>,
-    pub tool_calls: Option<Vec<ToolCall>>,
+    pub tool_calls: Option<Vec<StreamToolCall>>,
 }
 
 // ── Models list response ─────────────────────────────────────────────────────

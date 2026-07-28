@@ -1,7 +1,10 @@
 use serde_json::Value;
 
 use crate::error::ProxyError;
-use crate::types::{ChatCompletionChunk, ChunkChoice, ChunkDelta, FunctionCall, ToolCall, Usage};
+use crate::types::{
+    ChatCompletionChunk, ChunkChoice, ChunkDelta, FunctionCall, StreamFunctionCall, StreamToolCall,
+    ToolCall, Usage,
+};
 
 // ── Shared Anthropic SSE event processor ──────────────────────────────────────
 
@@ -224,7 +227,17 @@ pub fn make_tool_call_chunk(
             delta: ChunkDelta {
                 role: None,
                 content: None,
-                tool_calls: Some(vec![tool_call]),
+                // Anthropic delivers the whole tool call at content_block_stop,
+                // so emit it as a single complete streaming fragment.
+                tool_calls: Some(vec![StreamToolCall {
+                    index,
+                    id: Some(tool_call.id),
+                    r#type: Some(tool_call.r#type),
+                    function: Some(StreamFunctionCall {
+                        name: Some(tool_call.function.name),
+                        arguments: Some(tool_call.function.arguments),
+                    }),
+                }]),
             },
             finish_reason: None,
         }],
@@ -319,9 +332,10 @@ mod tests {
         assert_eq!(results.len(), 1);
         let chunk = results[0].as_ref().unwrap();
         let tc = &chunk.choices[0].delta.tool_calls.as_ref().unwrap()[0];
-        assert_eq!(tc.id, "tool_1");
-        assert_eq!(tc.function.name, "get_weather");
-        assert_eq!(tc.function.arguments, r#"{"location":"NYC"}"#);
+        assert_eq!(tc.id.as_deref(), Some("tool_1"));
+        let f = tc.function.as_ref().unwrap();
+        assert_eq!(f.name.as_deref(), Some("get_weather"));
+        assert_eq!(f.arguments.as_deref(), Some(r#"{"location":"NYC"}"#));
 
         // pending state is cleared
         assert!(p.pending_tool_id.is_empty());
