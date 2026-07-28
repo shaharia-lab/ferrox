@@ -219,12 +219,32 @@ struct OpenAIRequest {
     tools: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_choice: Option<Value>,
+    /// Pass-through for standard OpenAI fields Ferrox doesn't model explicitly
+    /// (response_format, seed, n, logprobs, frequency/presence_penalty, user, …),
+    /// so a transparent proxy forwards them instead of silently dropping them.
+    #[serde(flatten)]
+    extra: std::collections::HashMap<String, Value>,
 }
 
 #[derive(Serialize)]
 struct StreamOptions {
     include_usage: bool,
 }
+
+/// Keys `OpenAIRequest` serialises explicitly; excluded from the `extra`
+/// flatten pass-through so a client-supplied duplicate can't emit a repeated key.
+const RESERVED_REQUEST_KEYS: &[&str] = &[
+    "model",
+    "messages",
+    "stream",
+    "stream_options",
+    "temperature",
+    "max_tokens",
+    "top_p",
+    "stop",
+    "tools",
+    "tool_choice",
+];
 
 fn build_request_body(req: &ChatCompletionRequest, model_id: &str, stream: bool) -> OpenAIRequest {
     // Build messages: if there's a system convenience field, prepend it as a system message
@@ -276,6 +296,16 @@ fn build_request_body(req: &ChatCompletionRequest, model_id: &str, stream: bool)
         stop,
         tools,
         tool_choice: req.tool_choice.clone(),
+        // Forward client-supplied pass-through fields. Internal `_`-prefixed keys
+        // (e.g. `_anthropic_thinking`) are gateway-private, and keys OpenAIRequest
+        // sets explicitly are skipped so `#[serde(flatten)]` can't emit a duplicate
+        // JSON key (e.g. a client-sent `stream_options`).
+        extra: req
+            .extra
+            .iter()
+            .filter(|(k, _)| !k.starts_with('_') && !RESERVED_REQUEST_KEYS.contains(&k.as_str()))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect(),
     }
 }
 
@@ -336,6 +366,70 @@ mod tests {
             adapter.completions_url(),
             "https://api.z.ai/api/paas/v4/chat/completions"
         );
+    }
+
+    #[test]
+    fn extra_fields_pass_through_but_internal_keys_dropped() {
+        let mut extra = std::collections::HashMap::new();
+        extra.insert(
+            "response_format".to_string(),
+            serde_json::json!({"type":"json_object"}),
+        );
+        extra.insert("seed".to_string(), serde_json::json!(42));
+        extra.insert(
+            "_anthropic_thinking".to_string(),
+            serde_json::json!({"type":"enabled"}),
+        );
+        let req = ChatCompletionRequest {
+            model: "m".to_string(),
+            messages: vec![],
+            stream: None,
+            temperature: None,
+            max_tokens: None,
+            top_p: None,
+            stop: None,
+            tools: None,
+            tool_choice: None,
+            system: None,
+            extra_headers: Default::default(),
+            raw_anthropic_body: None,
+            extra,
+        };
+        let json = serde_json::to_value(build_request_body(&req, "m", false)).unwrap();
+        assert_eq!(json["response_format"]["type"], "json_object");
+        assert_eq!(json["seed"], 42);
+        assert!(
+            json.get("_anthropic_thinking").is_none(),
+            "internal `_`-prefixed keys must not leak upstream"
+        );
+    }
+
+    #[test]
+    fn client_reserved_key_does_not_duplicate() {
+        // A client-sent `stream_options` must not collide with the one we set.
+        let mut extra = std::collections::HashMap::new();
+        extra.insert(
+            "stream_options".to_string(),
+            serde_json::json!({"include_usage": false}),
+        );
+        let req = ChatCompletionRequest {
+            model: "m".to_string(),
+            messages: vec![],
+            stream: None,
+            temperature: None,
+            max_tokens: None,
+            top_p: None,
+            stop: None,
+            tools: None,
+            tool_choice: None,
+            system: None,
+            extra_headers: Default::default(),
+            raw_anthropic_body: None,
+            extra,
+        };
+        // Serialising must not panic on a duplicate key, and streaming keeps our value.
+        let json = serde_json::to_value(build_request_body(&req, "m", true)).unwrap();
+        assert_eq!(json["stream_options"]["include_usage"], true);
     }
 
     #[test]

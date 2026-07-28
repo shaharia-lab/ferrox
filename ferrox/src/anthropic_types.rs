@@ -192,7 +192,9 @@ pub fn to_chat_completion_request(req: AnthropicMessagesRequest) -> ChatCompleti
             .filter(|b| b.block_type == "text")
             .filter_map(|b| b.text)
             .collect::<Vec<_>>()
-            .join(""),
+            // Separate system blocks are distinct lines; joining with "" would
+            // glue e.g. "You are" + "helpful" into "You arehelpful".
+            .join("\n"),
     });
 
     let messages = anthropic_messages_to_internal(req.messages);
@@ -472,7 +474,11 @@ pub fn finish_reason_to_anthropic(reason: &str) -> &str {
         "stop" => "end_turn",
         "length" => "max_tokens",
         "tool_calls" => "tool_use",
-        other => other,
+        // `content_filter` is not a valid Anthropic stop_reason; `refusal` is the
+        // closest. Any other/unknown value defaults to `end_turn` rather than
+        // leaking a non-spec value that strict SDK enums would reject.
+        "content_filter" => "refusal",
+        _ => "end_turn",
     }
 }
 
@@ -593,7 +599,13 @@ pub fn openai_stream_to_anthropic_sse(
                     s.pending.push_back(Ok(make_message_stop_event()));
                     // Loop back to drain pending
                 }
-                Some(Err(e)) => return Some((Err(e), s)),
+                Some(Err(e)) => {
+                    // Emit a proper Anthropic `error` SSE event instead of yielding
+                    // a raw Err (which axum turns into a bare connection close with
+                    // no terminal event). Then end the stream.
+                    s.stream_done = true;
+                    return Some((Ok(make_error_event(&e)), s));
+                }
                 Some(Ok(chunk)) => {
                     // Update accumulated state
                     if let Some(usage) = &chunk.usage {
@@ -776,6 +788,24 @@ fn make_tool_use_block_start_event(index: u32, id: &str, name: &str) -> Event {
     Event::default()
         .event("content_block_start")
         .data(data.to_string())
+}
+
+fn make_error_event(e: &ProxyError) -> Event {
+    let (error_type, message) = match e {
+        ProxyError::Unauthorized(m) => ("authentication_error", m.clone()),
+        ProxyError::Forbidden(m) => ("permission_error", m.clone()),
+        ProxyError::ModelNotFound(m) => ("not_found_error", m.clone()),
+        ProxyError::RateLimited(m) | ProxyError::BudgetExceeded(m) => {
+            ("rate_limit_error", m.clone())
+        }
+        ProxyError::CircuitOpen(m) => ("overloaded_error", m.clone()),
+        other => ("api_error", other.to_string()),
+    };
+    let data = serde_json::json!({
+        "type": "error",
+        "error": {"type": error_type, "message": message}
+    });
+    Event::default().event("error").data(data.to_string())
 }
 
 fn make_thinking_block_start_event(index: u32) -> Event {
@@ -1274,11 +1304,11 @@ mod tests {
     // ── finish_reason_to_anthropic ────────────────────────────────────────────
 
     #[test]
-    fn finish_reason_passthrough_for_unknown() {
-        assert_eq!(
-            finish_reason_to_anthropic("content_filter"),
-            "content_filter"
-        );
+    fn finish_reason_unknowns_do_not_leak() {
+        // content_filter maps to the valid Anthropic `refusal`; anything else
+        // defaults to `end_turn` rather than leaking a non-spec value.
+        assert_eq!(finish_reason_to_anthropic("content_filter"), "refusal");
+        assert_eq!(finish_reason_to_anthropic("mystery"), "end_turn");
     }
 
     // ── tool_result_content_to_string ─────────────────────────────────────────
@@ -1673,8 +1703,41 @@ mod tests {
         assert!(events.iter().all(|e| e.is_ok()));
     }
 
+    #[test]
+    fn finish_reason_maps_content_filter_and_unknowns() {
+        assert_eq!(finish_reason_to_anthropic("content_filter"), "refusal");
+        assert_eq!(finish_reason_to_anthropic("something_new"), "end_turn");
+        assert_eq!(finish_reason_to_anthropic("tool_calls"), "tool_use");
+    }
+
     #[tokio::test]
-    async fn stream_propagates_error() {
+    async fn mid_stream_error_emits_anthropic_error_event() {
+        let chunks: Vec<Result<ChatCompletionChunk, ProxyError>> = vec![
+            Ok(make_chunk(Some("hi"), None)),
+            Err(ProxyError::RateLimited("slow down".to_string())),
+        ];
+        let inner: ProviderStream = Box::pin(futures::stream::iter(chunks));
+        let events: Vec<_> =
+            openai_stream_to_anthropic_sse("m".to_string(), "msg".to_string(), inner)
+                .collect()
+                .await;
+        // Every event is Ok — the error surfaces as an SSE `error` event, not a
+        // raw stream error (which would close the connection with no terminal event).
+        assert!(events.iter().all(|e| e.is_ok()), "no raw stream errors");
+        let dump = events
+            .iter()
+            .map(|e| format!("{:?}", e.as_ref().unwrap()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            dump.contains("event: error"),
+            "an error event is emitted: {dump}"
+        );
+        assert!(dump.contains("rate_limit_error"));
+    }
+
+    #[tokio::test]
+    async fn stream_surfaces_error_as_error_event() {
         let chunks: Vec<Result<ChatCompletionChunk, ProxyError>> = vec![
             Ok(make_chunk(Some("Hi"), None)),
             Err(ProxyError::StreamError("broken".to_string())),
@@ -1686,8 +1749,15 @@ mod tests {
                 .collect()
                 .await;
 
-        // Should contain the error somewhere
-        assert!(events.iter().any(|e| e.is_err()));
+        // The upstream error is surfaced as an Anthropic `error` SSE event, not a
+        // raw stream Err (which would drop the connection with no terminal event).
+        assert!(events.iter().all(|e| e.is_ok()));
+        let dump = events
+            .iter()
+            .map(|e| format!("{:?}", e.as_ref().unwrap()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(dump.contains("event: error"));
     }
 
     #[tokio::test]
