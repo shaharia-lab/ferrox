@@ -1,5 +1,5 @@
 # ── Stage 1: Build ─────────────────────────────────────────────────────────────
-FROM rust:1.94-slim-bookworm@sha256:cf9dd0ec73e75f827fe59123fff9dc65af1a1c8363c3c31ee8d7f8ad0b6a5fb2 AS builder
+FROM rust:1.97-slim-bookworm@sha256:99e09cb2284e2ddbb73a995deee3e91783fd04d177602ccf6eab326d778ee777 AS builder
 
 # protobuf-compiler required by opentelemetry-otlp/tonic build script
 # git required by build.rs (git rev-parse for version embedding)
