@@ -12,8 +12,10 @@ use crate::error::ProxyError;
 use crate::providers::{parse_sse_stream, ProviderAdapter, ProviderStream};
 use crate::types::{
     ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, ChatMessage, Choice,
-    ChunkChoice, ChunkDelta, ContentPart, MessageContent, StopSequences, Usage,
+    ChunkChoice, ChunkDelta, ContentPart, FunctionCall, MessageContent, StopSequences,
+    StreamFunctionCall, StreamToolCall, ToolCall, Usage,
 };
+use std::collections::HashMap;
 
 const DEFAULT_BASE_URL: &str = "https://generativelanguage.googleapis.com";
 
@@ -174,19 +176,27 @@ impl ProviderAdapter for GeminiAdapter {
                     None => continue,
                 };
 
-                let text = candidate
-                    .content
-                    .as_ref()
-                    .and_then(|c| c.parts.first())
-                    .and_then(|p| p.text.as_deref())
-                    .unwrap_or("")
-                    .to_string();
+                let (text, tool_calls) = collect_parts(candidate.content.as_ref());
+                // Gemini streams each functionCall whole; emit as a complete
+                // streaming tool-call fragment (id/name/args all present).
+                let stream_tool_calls: Vec<StreamToolCall> = tool_calls
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, tc)| StreamToolCall {
+                        index: i as i32,
+                        id: Some(tc.id),
+                        r#type: Some(tc.r#type),
+                        function: Some(StreamFunctionCall {
+                            name: Some(tc.function.name),
+                            arguments: Some(tc.function.arguments),
+                        }),
+                    })
+                    .collect();
 
-                let finish_reason = candidate.finish_reason.map(|r| match r.as_str() {
-                    "STOP" => "stop".to_string(),
-                    "MAX_TOKENS" => "length".to_string(),
-                    other => other.to_lowercase(),
-                });
+                let finish_reason = candidate
+                    .finish_reason
+                    .as_deref()
+                    .map(|r| map_gemini_finish_reason(r, !stream_tool_calls.is_empty()));
 
                 let chunk = ChatCompletionChunk {
                     id: msg_id.clone(),
@@ -198,7 +208,11 @@ impl ProviderAdapter for GeminiAdapter {
                         delta: ChunkDelta {
                             role: None,
                             content: if text.is_empty() { None } else { Some(text) },
-                            tool_calls: None,
+                            tool_calls: if stream_tool_calls.is_empty() {
+                                None
+                            } else {
+                                Some(stream_tool_calls)
+                            },
                             reasoning_content: None,
                         },
                         finish_reason,
@@ -224,6 +238,21 @@ struct GeminiRequest {
     generation_config: Option<GeminiGenerationConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<GeminiTool>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_config: Option<GeminiToolConfig>,
+}
+
+#[derive(Serialize)]
+struct GeminiToolConfig {
+    function_calling_config: GeminiFunctionCallingConfig,
+}
+
+#[derive(Serialize)]
+struct GeminiFunctionCallingConfig {
+    /// AUTO | ANY | NONE.
+    mode: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    allowed_function_names: Option<Vec<String>>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -243,6 +272,25 @@ struct GeminiPart {
     text: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     inline_data: Option<GeminiInlineData>,
+    // Gemini uses camelCase in responses; rename so `functionCall`/`functionResponse`
+    // both deserialize (from responses) and serialize (canonical for requests).
+    #[serde(rename = "functionCall", skip_serializing_if = "Option::is_none")]
+    function_call: Option<GeminiFunctionCall>,
+    #[serde(rename = "functionResponse", skip_serializing_if = "Option::is_none")]
+    function_response: Option<GeminiFunctionResponse>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct GeminiFunctionCall {
+    name: String,
+    #[serde(default)]
+    args: Value,
+}
+
+#[derive(Serialize, Deserialize)]
+struct GeminiFunctionResponse {
+    name: String,
+    response: Value,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -280,18 +328,26 @@ struct GeminiFunctionDeclaration {
 fn build_request_body(req: &ChatCompletionRequest) -> GeminiRequest {
     let system = req.system_message();
 
+    // Map each assistant tool_call id → function name so `role:"tool"` results can
+    // be rendered as Gemini `functionResponse` parts (which key on name, not id).
+    let mut tool_names: HashMap<String, String> = HashMap::new();
+    for m in &req.messages {
+        if let Some(tcs) = &m.tool_calls {
+            for tc in tcs {
+                tool_names.insert(tc.id.clone(), tc.function.name.clone());
+            }
+        }
+    }
+
     let contents: Vec<GeminiContent> = req
         .messages
         .iter()
         .filter(|m| m.role != "system")
-        .map(convert_message)
+        .map(|m| convert_message(m, &tool_names))
         .collect();
 
     let system_instruction = system.map(|s| GeminiSystemInstruction {
-        parts: vec![GeminiPart {
-            text: Some(s),
-            inline_data: None,
-        }],
+        parts: vec![text_part(s)],
     });
 
     let stop_sequences = req.stop.as_ref().map(|s| match s {
@@ -327,68 +383,153 @@ fn build_request_body(req: &ChatCompletionRequest) -> GeminiRequest {
         }]
     });
 
+    let tool_config = req.tool_choice.as_ref().and_then(gemini_tool_config);
+
     GeminiRequest {
         contents,
         system_instruction,
         generation_config,
         tools,
+        tool_config,
     }
 }
 
-fn convert_message(msg: &ChatMessage) -> GeminiContent {
-    let role = match msg.role.as_str() {
-        "assistant" => "model",
-        _ => "user",
+/// Map an OpenAI `tool_choice` to a Gemini `functionCallingConfig`.
+fn gemini_tool_config(tc: &Value) -> Option<GeminiToolConfig> {
+    let (mode, allowed) = match tc {
+        Value::String(s) => match s.as_str() {
+            "auto" => ("AUTO", None),
+            "none" => ("NONE", None),
+            "required" => ("ANY", None),
+            _ => return None,
+        },
+        Value::Object(o) => {
+            let name = o
+                .get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(|n| n.as_str())?;
+            ("ANY", Some(vec![name.to_string()]))
+        }
+        _ => return None,
     };
+    Some(GeminiToolConfig {
+        function_calling_config: GeminiFunctionCallingConfig {
+            mode: mode.to_string(),
+            allowed_function_names: allowed,
+        },
+    })
+}
 
-    let parts = match &msg.content {
-        None => vec![GeminiPart {
-            text: Some(String::new()),
-            inline_data: None,
-        }],
-        Some(MessageContent::Text(t)) => vec![GeminiPart {
-            text: Some(t.clone()),
-            inline_data: None,
-        }],
-        Some(MessageContent::Parts(parts)) => parts
-            .iter()
-            .map(|p| match p {
-                ContentPart::Text { text } => GeminiPart {
-                    text: Some(text.clone()),
-                    inline_data: None,
-                },
-                ContentPart::ImageUrl { image_url } => {
-                    // For data URLs, extract base64; otherwise use text placeholder
-                    if image_url.url.starts_with("data:") {
-                        let mut split = image_url.url.splitn(2, ',');
-                        let header = split.next().unwrap_or("");
-                        let data = split.next().unwrap_or("").to_string();
-                        let mime_type = header
-                            .strip_prefix("data:")
-                            .unwrap_or("image/jpeg")
-                            .split(';')
-                            .next()
-                            .unwrap_or("image/jpeg")
-                            .to_string();
-                        GeminiPart {
-                            text: None,
-                            inline_data: Some(GeminiInlineData { mime_type, data }),
-                        }
-                    } else {
-                        GeminiPart {
-                            text: Some(image_url.url.clone()),
-                            inline_data: None,
+fn text_part(text: String) -> GeminiPart {
+    GeminiPart {
+        text: Some(text),
+        inline_data: None,
+        function_call: None,
+        function_response: None,
+    }
+}
+
+/// Convert one internal message. `tool_names` maps a tool_call id to the function
+/// name (Gemini's `functionResponse` needs the name, not the OpenAI id).
+fn convert_message(msg: &ChatMessage, tool_names: &HashMap<String, String>) -> GeminiContent {
+    // A `role:"tool"` result → a user turn carrying a `functionResponse` part.
+    if msg.role == "tool" {
+        let name = msg
+            .tool_call_id
+            .as_ref()
+            .and_then(|id| tool_names.get(id))
+            .cloned()
+            .unwrap_or_default();
+        let result = match &msg.content {
+            Some(MessageContent::Text(t)) => t.clone(),
+            _ => String::new(),
+        };
+        return GeminiContent {
+            role: "user".to_string(),
+            parts: vec![GeminiPart {
+                text: None,
+                inline_data: None,
+                function_call: None,
+                function_response: Some(GeminiFunctionResponse {
+                    name,
+                    response: serde_json::json!({ "result": result }),
+                }),
+            }],
+        };
+    }
+
+    let role = if msg.role == "assistant" {
+        "model"
+    } else {
+        "user"
+    };
+    let mut parts: Vec<GeminiPart> = Vec::new();
+
+    match &msg.content {
+        None => {}
+        Some(MessageContent::Text(t)) => {
+            if !t.is_empty() {
+                parts.push(text_part(t.clone()));
+            }
+        }
+        Some(MessageContent::Parts(cparts)) => {
+            for p in cparts {
+                match p {
+                    ContentPart::Text { text } => parts.push(text_part(text.clone())),
+                    ContentPart::ImageUrl { image_url } => {
+                        if let Some((mime_type, data)) = parse_data_url(&image_url.url) {
+                            parts.push(GeminiPart {
+                                text: None,
+                                inline_data: Some(GeminiInlineData { mime_type, data }),
+                                function_call: None,
+                                function_response: None,
+                            });
+                        } else {
+                            parts.push(text_part(image_url.url.clone()));
                         }
                     }
                 }
-            })
-            .collect(),
-    };
+            }
+        }
+    }
+
+    // Assistant tool calls → `functionCall` parts.
+    if let Some(tcs) = &msg.tool_calls {
+        for tc in tcs {
+            let args: Value = serde_json::from_str(&tc.function.arguments)
+                .unwrap_or_else(|_| Value::Object(Default::default()));
+            parts.push(GeminiPart {
+                text: None,
+                inline_data: None,
+                function_call: Some(GeminiFunctionCall {
+                    name: tc.function.name.clone(),
+                    args,
+                }),
+                function_response: None,
+            });
+        }
+    }
+
+    // Gemini rejects empty parts arrays.
+    if parts.is_empty() {
+        parts.push(text_part(String::new()));
+    }
 
     GeminiContent {
         role: role.to_string(),
         parts,
     }
+}
+
+/// Parse a `data:<mime>;base64,<data>` URL into (mime, base64). Returns None for
+/// non-data URLs.
+fn parse_data_url(url: &str) -> Option<(String, String)> {
+    let rest = url.strip_prefix("data:")?;
+    let mut split = rest.splitn(2, ',');
+    let header = split.next().unwrap_or("");
+    let data = split.next()?.to_string();
+    let mime_type = header.split(';').next().unwrap_or("image/jpeg").to_string();
+    Some((mime_type, data))
 }
 
 // ── Response types ────────────────────────────────────────────────────────────
@@ -417,6 +558,46 @@ struct GeminiUsageMetadata {
     total_token_count: u32,
 }
 
+/// Collect all of a candidate's parts into concatenated text + tool calls
+/// (Gemini can return several parts, including multiple `functionCall`s).
+fn collect_parts(content: Option<&GeminiContent>) -> (String, Vec<ToolCall>) {
+    let mut text = String::new();
+    let mut tool_calls = Vec::new();
+    if let Some(c) = content {
+        for p in &c.parts {
+            if let Some(t) = &p.text {
+                text.push_str(t);
+            }
+            if let Some(fc) = &p.function_call {
+                tool_calls.push(ToolCall {
+                    id: format!("call_{}", Uuid::new_v4().simple()),
+                    r#type: "function".to_string(),
+                    function: FunctionCall {
+                        name: fc.name.clone(),
+                        arguments: fc.args.to_string(),
+                    },
+                });
+            }
+        }
+    }
+    (text, tool_calls)
+}
+
+/// Map a Gemini `finishReason` to an OpenAI `finish_reason`. A turn that produced
+/// tool calls always reports `tool_calls`.
+fn map_gemini_finish_reason(reason: &str, has_tool_calls: bool) -> String {
+    if has_tool_calls {
+        return "tool_calls".to_string();
+    }
+    match reason {
+        "STOP" => "stop",
+        "MAX_TOKENS" => "length",
+        "SAFETY" | "RECITATION" | "BLOCKLIST" | "PROHIBITED_CONTENT" | "SPII" => "content_filter",
+        _ => "stop",
+    }
+    .to_string()
+}
+
 fn gemini_to_openai_response(resp: GeminiResponse, model_id: &str) -> ChatCompletionResponse {
     let id = Uuid::new_v4().to_string();
 
@@ -431,25 +612,25 @@ fn gemini_to_openai_response(resp: GeminiResponse, model_id: &str) -> ChatComple
         .into_iter()
         .enumerate()
         .map(|(i, candidate)| {
-            let text = candidate
-                .content
-                .as_ref()
-                .and_then(|c| c.parts.first())
-                .and_then(|p| p.text.as_deref())
-                .unwrap_or("")
-                .to_string();
-
-            let finish_reason = candidate.finish_reason.map(|r| match r.as_str() {
-                "STOP" => "stop".to_string(),
-                "MAX_TOKENS" => "length".to_string(),
-                other => other.to_lowercase(),
-            });
+            let (text, tool_calls) = collect_parts(candidate.content.as_ref());
+            let finish_reason = candidate
+                .finish_reason
+                .as_deref()
+                .map(|r| map_gemini_finish_reason(r, !tool_calls.is_empty()));
 
             let message = ChatMessage {
                 role: "assistant".to_string(),
-                content: Some(MessageContent::Text(text)),
+                content: if text.is_empty() {
+                    None
+                } else {
+                    Some(MessageContent::Text(text))
+                },
                 name: None,
-                tool_calls: None,
+                tool_calls: if tool_calls.is_empty() {
+                    None
+                } else {
+                    Some(tool_calls)
+                },
                 tool_call_id: None,
                 reasoning_content: None,
             };
@@ -470,5 +651,120 @@ fn gemini_to_openai_response(resp: GeminiResponse, model_id: &str) -> ChatComple
         choices,
         usage,
         system_fingerprint: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{Tool, ToolFunction};
+
+    fn req(messages: Vec<ChatMessage>, tool_choice: Option<Value>) -> ChatCompletionRequest {
+        ChatCompletionRequest {
+            model: "gemini".into(),
+            messages,
+            stream: None,
+            temperature: None,
+            max_tokens: None,
+            top_p: None,
+            stop: None,
+            tools: Some(vec![Tool {
+                r#type: "function".into(),
+                function: ToolFunction {
+                    name: "get_weather".into(),
+                    description: None,
+                    parameters: Some(serde_json::json!({"type": "object"})),
+                },
+            }]),
+            tool_choice,
+            system: None,
+            extra_headers: Default::default(),
+            raw_anthropic_body: None,
+            extra: Default::default(),
+        }
+    }
+
+    fn asst_tool_call() -> ChatMessage {
+        ChatMessage {
+            role: "assistant".into(),
+            content: None,
+            name: None,
+            tool_calls: Some(vec![ToolCall {
+                id: "t1".into(),
+                r#type: "function".into(),
+                function: FunctionCall {
+                    name: "get_weather".into(),
+                    arguments: r#"{"loc":"NYC"}"#.into(),
+                },
+            }]),
+            tool_call_id: None,
+            reasoning_content: None,
+        }
+    }
+
+    fn tool_result() -> ChatMessage {
+        ChatMessage {
+            role: "tool".into(),
+            content: Some(MessageContent::Text("sunny".into())),
+            name: None,
+            tool_calls: None,
+            tool_call_id: Some("t1".into()),
+            reasoning_content: None,
+        }
+    }
+
+    #[test]
+    fn request_tool_history_maps_to_function_call_and_response() {
+        let body = serde_json::to_value(build_request_body(&req(
+            vec![asst_tool_call(), tool_result()],
+            None,
+        )))
+        .unwrap();
+        let dump = body.to_string();
+        assert!(
+            dump.contains("functionCall"),
+            "assistant tool_call → functionCall: {dump}"
+        );
+        assert!(
+            dump.contains("functionResponse"),
+            "tool result → functionResponse"
+        );
+        assert!(dump.contains("get_weather"));
+    }
+
+    #[test]
+    fn tool_choice_named_becomes_any_with_allowed() {
+        let body = serde_json::to_value(build_request_body(&req(
+            vec![],
+            Some(serde_json::json!({"type":"function","function":{"name":"get_weather"}})),
+        )))
+        .unwrap();
+        assert_eq!(
+            body["tool_config"]["function_calling_config"]["mode"],
+            "ANY"
+        );
+        assert_eq!(
+            body["tool_config"]["function_calling_config"]["allowed_function_names"][0],
+            "get_weather"
+        );
+    }
+
+    #[test]
+    fn response_function_call_becomes_tool_call() {
+        let resp: GeminiResponse = serde_json::from_str(
+            r#"{"candidates":[{"content":{"role":"model","parts":[{"functionCall":{"name":"get_weather","args":{"loc":"NYC"}}}]},"finishReason":"STOP"}]}"#,
+        )
+        .unwrap();
+        let out = gemini_to_openai_response(resp, "gemini");
+        let tc = &out.choices[0].message.tool_calls.as_ref().unwrap()[0];
+        assert_eq!(tc.function.name, "get_weather");
+        assert!(tc.function.arguments.contains("NYC"));
+        assert_eq!(out.choices[0].finish_reason.as_deref(), Some("tool_calls"));
+    }
+
+    #[test]
+    fn safety_finish_reason_maps_to_content_filter() {
+        assert_eq!(map_gemini_finish_reason("SAFETY", false), "content_filter");
+        assert_eq!(map_gemini_finish_reason("STOP", true), "tool_calls");
     }
 }
