@@ -18,6 +18,10 @@ pub struct AnthropicEventProcessor {
     pending_tool_index: u32,
     pub stop_reason: Option<String>,
     pub usage: Option<Usage>,
+    /// Prompt tokens from the `message_start` event. Anthropic reports
+    /// `input_tokens` there, not in `message_delta`, so we capture it up front
+    /// and fold it into the final usage.
+    input_tokens: u32,
 }
 
 impl AnthropicEventProcessor {
@@ -30,6 +34,7 @@ impl AnthropicEventProcessor {
             pending_tool_index: 0,
             stop_reason: None,
             usage: None,
+            input_tokens: 0,
         }
     }
 
@@ -56,6 +61,14 @@ impl AnthropicEventProcessor {
             "message_start" => {
                 if let Some(id) = v.pointer("/message/id").and_then(|v| v.as_str()) {
                     self.message_id = id.to_string();
+                }
+                // Anthropic delivers prompt tokens in `message_start`, not the
+                // trailing `message_delta`; capture it for the final usage.
+                if let Some(input) = v
+                    .pointer("/message/usage/input_tokens")
+                    .and_then(|t| t.as_u64())
+                {
+                    self.input_tokens = input as u32;
                 }
             }
             "content_block_start" => {
@@ -127,7 +140,7 @@ impl AnthropicEventProcessor {
                     .pointer("/delta/stop_reason")
                     .and_then(|r| r.as_str())
                     .map(map_stop_reason);
-                self.usage = parse_usage_from_message_delta(&v);
+                self.usage = parse_usage_from_message_delta(&v, self.input_tokens);
             }
             "message_stop" => {
                 results.push(Ok(make_final_chunk(
@@ -167,12 +180,12 @@ pub fn map_stop_reason(r: &str) -> String {
     }
 }
 
-fn parse_usage_from_message_delta(v: &Value) -> Option<Usage> {
+fn parse_usage_from_message_delta(v: &Value, input_tokens: u32) -> Option<Usage> {
     let output = v.pointer("/usage/output_tokens").and_then(|t| t.as_u64())? as u32;
     Some(Usage {
-        prompt_tokens: 0,
+        prompt_tokens: input_tokens,
         completion_tokens: output,
-        total_tokens: output,
+        total_tokens: input_tokens + output,
     })
 }
 
@@ -322,6 +335,24 @@ mod tests {
         assert!(results.is_empty());
         assert_eq!(p.stop_reason.as_deref(), Some("stop"));
         assert_eq!(p.usage.as_ref().unwrap().completion_tokens, 42);
+    }
+
+    #[test]
+    fn message_start_input_tokens_flow_into_final_usage() {
+        let mut p = make_processor();
+        // Anthropic reports prompt tokens in message_start, not message_delta.
+        let start =
+            r#"{"type":"message_start","message":{"id":"msg_1","usage":{"input_tokens":123}}}"#;
+        p.process("message_start", start, "claude-3", "anthropic");
+        let delta = r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":7}}"#;
+        p.process("message_delta", delta, "claude-3", "anthropic");
+        let usage = p.usage.as_ref().unwrap();
+        assert_eq!(
+            usage.prompt_tokens, 123,
+            "prompt tokens must come from message_start"
+        );
+        assert_eq!(usage.completion_tokens, 7);
+        assert_eq!(usage.total_tokens, 130);
     }
 
     #[test]
