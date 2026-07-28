@@ -230,7 +230,7 @@ pub fn make_tool_call_chunk(
                 // Anthropic delivers the whole tool call at content_block_stop,
                 // so emit it as a single complete streaming fragment.
                 tool_calls: Some(vec![StreamToolCall {
-                    index,
+                    index: index as i32,
                     id: Some(tool_call.id),
                     r#type: Some(tool_call.r#type),
                     function: Some(StreamFunctionCall {

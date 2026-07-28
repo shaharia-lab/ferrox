@@ -135,8 +135,10 @@ pub struct FunctionCall {
 /// accumulate fragments by `index`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamToolCall {
+    /// Signed because some OpenAI-compatible providers send `-1` for a single
+    /// tool call; consumers clamp negatives to 0 (matching the official SDKs).
     #[serde(default)]
-    pub index: u32,
+    pub index: i32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
     #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
