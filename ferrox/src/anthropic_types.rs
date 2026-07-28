@@ -360,17 +360,19 @@ fn convert_blocks(role: String, blocks: Vec<AnthropicContentBlock>, out: &mut Ve
             reasoning_content: None,
         });
     } else {
-        // User turn: content (text + images) first, then each tool result.
-        if let Some(content) = parts_to_content(content_parts) {
-            out.push(ChatMessage {
-                role: role.clone(),
-                content: Some(content),
-                name: None,
-                tool_calls: None,
-                tool_call_id: None,
-                reasoning_content: None,
-            });
-        }
+        // User turn: emit the `tool` result messages FIRST, then any user
+        // text/images.
+        //
+        // OpenAI-format backends require every `tool` message to immediately
+        // follow the assistant message that issued the matching `tool_calls`.
+        // Anthropic lets a single user turn mix `tool_result` blocks with plain
+        // text (Claude Code does this — e.g. a skill result plus a "Base
+        // directory for this skill: …" note). If we emitted that user text
+        // before the tool results, it would wedge a `user` message between the
+        // assistant `tool_calls` and its `tool` replies, and strict upstreams
+        // (Kimi/Moonshot, OpenAI) reject the request with "tool_call_ids did
+        // not have response messages". So tool replies come first; the user
+        // text follows as its own message after them.
         for (tool_use_id, content) in tool_results {
             out.push(ChatMessage {
                 role: "tool".to_string(),
@@ -378,6 +380,16 @@ fn convert_blocks(role: String, blocks: Vec<AnthropicContentBlock>, out: &mut Ve
                 name: None,
                 tool_calls: None,
                 tool_call_id: Some(tool_use_id),
+                reasoning_content: None,
+            });
+        }
+        if let Some(content) = parts_to_content(content_parts) {
+            out.push(ChatMessage {
+                role: role.clone(),
+                content: Some(content),
+                name: None,
+                tool_calls: None,
+                tool_call_id: None,
                 reasoning_content: None,
             });
         }
@@ -1222,8 +1234,78 @@ mod tests {
         };
         let out = to_chat_completion_request(req);
         assert_eq!(out.messages.len(), 2);
-        assert_eq!(out.messages[0].role, "user");
+        // The `tool` reply must come FIRST so it can immediately follow the
+        // preceding assistant `tool_calls`; the user text follows it.
+        assert_eq!(out.messages[0].role, "tool");
+        assert_eq!(out.messages[1].role, "user");
+    }
+
+    /// Regression for the Kimi/OpenAI "tool_call_ids did not have response
+    /// messages" 400: an assistant `tool_use` followed by a user turn that mixes
+    /// a `tool_result` with plain text (Claude Code's skill-result pattern) must
+    /// NOT wedge a `user` message between the assistant `tool_calls` and its
+    /// `tool` reply. The `tool` message must sit immediately after the assistant.
+    #[test]
+    fn tool_reply_immediately_follows_assistant_tool_call_despite_user_text() {
+        let req = AnthropicMessagesRequest {
+            messages: vec![
+                AnthropicMessage {
+                    role: "assistant".to_string(),
+                    content: AnthropicMessageContent::Blocks(vec![
+                        AnthropicContentBlock::ToolUse {
+                            id: "tool_0NRZ".to_string(),
+                            name: "Skill".to_string(),
+                            input: serde_json::json!({"command": "github-issue-refining"}),
+                        },
+                    ]),
+                },
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    // Same-turn mix: the tool result AND a trailing user note,
+                    // exactly as Claude Code sends after invoking a skill.
+                    content: AnthropicMessageContent::Blocks(vec![
+                        AnthropicContentBlock::ToolResult {
+                            tool_use_id: "tool_0NRZ".to_string(),
+                            content: Some(serde_json::json!("Launching skill: …")),
+                            is_error: false,
+                        },
+                        AnthropicContentBlock::Text {
+                            text: "Base directory for this skill: /home/x".to_string(),
+                        },
+                    ]),
+                },
+            ],
+            ..minimal_request("k3")
+        };
+        let out = to_chat_completion_request(req);
+        let roles: Vec<&str> = out.messages.iter().map(|m| m.role.as_str()).collect();
+        assert_eq!(roles, vec!["assistant", "tool", "user"]);
+
+        // Every assistant tool_call id must have a `tool` reply immediately after
+        // the assistant message — the invariant strict OpenAI backends enforce.
+        assert!(out.messages[0].tool_calls.is_some());
         assert_eq!(out.messages[1].role, "tool");
+        assert_eq!(out.messages[1].tool_call_id.as_deref(), Some("tool_0NRZ"));
+
+        // General invariant: no `user`/`assistant` message may separate an
+        // assistant `tool_calls` from the `tool` reply answering one of its ids.
+        for (i, m) in out.messages.iter().enumerate() {
+            if let Some(tcs) = &m.tool_calls {
+                let want: Vec<&str> = tcs.iter().map(|tc| tc.id.as_str()).collect();
+                let replies: Vec<&str> = out.messages[i + 1..]
+                    .iter()
+                    .take_while(|m| m.role == "tool")
+                    .filter_map(|m| m.tool_call_id.as_deref())
+                    .collect();
+                for id in want {
+                    assert!(
+                        replies.contains(&id),
+                        "tool_call id {id:?} not answered by a `tool` message \
+                         immediately following its assistant turn (roles: {roles:?})"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
