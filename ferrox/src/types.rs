@@ -70,6 +70,11 @@ pub struct ChatMessage {
     pub name: Option<String>,
     pub tool_calls: Option<Vec<ToolCall>>,
     pub tool_call_id: Option<String>,
+    /// Chain-of-thought / extended-thinking text. Reasoning models on
+    /// OpenAI-compatible APIs (Kimi, GLM, DeepSeek) return this alongside
+    /// `content`; preserved so it round-trips instead of being dropped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -206,6 +211,9 @@ pub struct ChunkDelta {
     pub role: Option<String>,
     pub content: Option<String>,
     pub tool_calls: Option<Vec<StreamToolCall>>,
+    /// Streaming chain-of-thought delta (Kimi/GLM/DeepSeek emit `reasoning_content`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
 }
 
 // ── Models list response ─────────────────────────────────────────────────────
@@ -299,6 +307,7 @@ mod tests {
             name: None,
             tool_calls: None,
             tool_call_id: None,
+            reasoning_content: None,
         }
     }
 
@@ -346,6 +355,7 @@ mod tests {
             name: None,
             tool_calls: None,
             tool_call_id: None,
+            reasoning_content: None,
         });
         assert_eq!(r.system_message(), Some("Part1 Part2".to_string()));
     }
@@ -359,6 +369,7 @@ mod tests {
             name: None,
             tool_calls: None,
             tool_call_id: None,
+            reasoning_content: None,
         });
         assert_eq!(r.system_message(), None);
     }

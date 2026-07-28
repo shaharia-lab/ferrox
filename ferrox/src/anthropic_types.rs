@@ -142,6 +142,11 @@ pub struct AnthropicMessagesResponse {
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AnthropicResponseContent {
+    /// Extended-thinking block (emitted before text when a reasoning model
+    /// returned `reasoning_content`).
+    Thinking {
+        thinking: String,
+    },
     Text {
         text: String,
     },
@@ -261,6 +266,7 @@ fn anthropic_messages_to_internal(messages: Vec<AnthropicMessage>) -> Vec<ChatMe
                     name: None,
                     tool_calls: None,
                     tool_call_id: None,
+                    reasoning_content: None,
                 });
             }
             AnthropicMessageContent::Blocks(blocks) => {
@@ -323,6 +329,7 @@ fn convert_blocks(role: String, blocks: Vec<AnthropicContentBlock>, out: &mut Ve
                 Some(tool_calls)
             },
             tool_call_id: None,
+            reasoning_content: None,
         });
     } else {
         // User turn: text first, then each tool result as a separate "tool" message.
@@ -334,6 +341,7 @@ fn convert_blocks(role: String, blocks: Vec<AnthropicContentBlock>, out: &mut Ve
                 name: None,
                 tool_calls: None,
                 tool_call_id: None,
+                reasoning_content: None,
             });
         }
         for (tool_use_id, content) in tool_results {
@@ -343,6 +351,7 @@ fn convert_blocks(role: String, blocks: Vec<AnthropicContentBlock>, out: &mut Ve
                 name: None,
                 tool_calls: None,
                 tool_call_id: Some(tool_use_id),
+                reasoning_content: None,
             });
         }
     }
@@ -383,6 +392,15 @@ pub fn to_anthropic_response(resp: ChatCompletionResponse) -> AnthropicMessagesR
     let mut content: Vec<AnthropicResponseContent> = Vec::new();
 
     if let Some(ref c) = choice {
+        // Thinking block first (reasoning models return reasoning_content).
+        if let Some(thinking) = c.message.reasoning_content.as_ref() {
+            if !thinking.is_empty() {
+                content.push(AnthropicResponseContent::Thinking {
+                    thinking: thinking.clone(),
+                });
+            }
+        }
+
         // Text content
         if let Some(msg_content) = c.message.content.as_ref() {
             let text = match msg_content {
@@ -486,6 +504,16 @@ struct StreamState {
     /// `index`; we open one Anthropic block per distinct index, stream its
     /// argument fragments as `input_json_delta`, and close them all at the end.
     tool_blocks: Vec<(u32, u32)>,
+    /// Block index assigned to the text content block (0 unless a thinking block
+    /// precedes it). Text is no longer hard-coded to index 0 because a `thinking`
+    /// block, when present, must come first.
+    text_block_index: u32,
+    /// Thinking (reasoning) block state. Reasoning models stream chain-of-thought
+    /// via `reasoning_content`; it is surfaced as an Anthropic `thinking` block
+    /// that precedes text/tool blocks.
+    thinking_started: bool,
+    thinking_closed: bool,
+    thinking_index: u32,
 }
 
 /// Wraps a `ProviderStream` (OpenAI chunk format) and re-emits events in the
@@ -514,6 +542,10 @@ pub fn openai_stream_to_anthropic_sse(
         text_block_closed: false,
         next_block_index: 0,
         tool_blocks: Vec::new(),
+        text_block_index: 0,
+        thinking_started: false,
+        thinking_closed: false,
+        thinking_index: 0,
     };
 
     futures::stream::unfold(state, |mut s| async move {
@@ -537,10 +569,16 @@ pub fn openai_stream_to_anthropic_sse(
                             .push_back(Ok(make_message_start_event(&s.msg_id, &s.model, 0)));
                         s.pending.push_back(Ok(make_ping_event()));
                     }
-                    // Close the text block only if it was actually opened
+                    // Close any still-open thinking/text block.
+                    if s.thinking_started && !s.thinking_closed {
+                        s.thinking_closed = true;
+                        s.pending
+                            .push_back(Ok(make_content_block_stop_event(s.thinking_index)));
+                    }
                     if s.text_block_started && !s.text_block_closed {
                         s.text_block_closed = true;
-                        s.pending.push_back(Ok(make_content_block_stop_event(0)));
+                        s.pending
+                            .push_back(Ok(make_content_block_stop_event(s.text_block_index)));
                     }
                     // Close every open tool_use block (in the order opened).
                     for (_, block_index) in std::mem::take(&mut s.tool_blocks) {
@@ -582,6 +620,12 @@ pub fn openai_stream_to_anthropic_sse(
                         .and_then(|c| c.delta.tool_calls.clone())
                         .unwrap_or_default();
 
+                    let reasoning = chunk
+                        .choices
+                        .first()
+                        .and_then(|c| c.delta.reasoning_content.clone())
+                        .unwrap_or_default();
+
                     if s.is_first {
                         s.is_first = false;
                         let input_tokens =
@@ -596,15 +640,41 @@ pub fn openai_stream_to_anthropic_sse(
                         // so tool-only responses never produce an empty text block.
                     }
 
+                    // Thinking (reasoning) block — opened first, before text/tools.
+                    // Ignore reasoning that arrives after the block was closed
+                    // (e.g. reasoning interleaved after text) to avoid emitting a
+                    // delta into a stopped block.
+                    if !reasoning.is_empty() && !s.thinking_closed {
+                        if !s.thinking_started {
+                            s.thinking_started = true;
+                            s.thinking_index = s.next_block_index;
+                            s.next_block_index += 1;
+                            s.pending
+                                .push_back(Ok(make_thinking_block_start_event(s.thinking_index)));
+                        }
+                        s.pending
+                            .push_back(Ok(make_thinking_delta_event(s.thinking_index, &reasoning)));
+                    }
+
                     if !text.is_empty() {
+                        // Thinking always closes before the text block opens.
+                        if s.thinking_started && !s.thinking_closed {
+                            s.thinking_closed = true;
+                            s.pending
+                                .push_back(Ok(make_content_block_stop_event(s.thinking_index)));
+                        }
                         // Open the text block on first actual text content.
                         if !s.text_block_started {
                             s.text_block_started = true;
-                            s.pending.push_back(Ok(make_content_block_start_event(0)));
-                            s.next_block_index = 1;
+                            s.text_block_index = s.next_block_index;
+                            s.next_block_index += 1;
+                            s.pending
+                                .push_back(Ok(make_content_block_start_event(s.text_block_index)));
                         }
-                        s.pending
-                            .push_back(Ok(make_content_block_delta_event(0, &text)));
+                        s.pending.push_back(Ok(make_content_block_delta_event(
+                            s.text_block_index,
+                            &text,
+                        )));
                     }
 
                     // Accumulate fragmented tool-call deltas by `index`: open one
@@ -620,11 +690,18 @@ pub fn openai_stream_to_anthropic_sse(
 
                         // Open the block on first sighting of this tool index.
                         if !s.tool_blocks.iter().any(|(oi, _)| *oi == idx) {
-                            // Close the text block before the first tool_use block,
-                            // but only if it was actually opened.
+                            // Close any open thinking/text block before the first
+                            // tool_use block.
+                            if s.thinking_started && !s.thinking_closed {
+                                s.thinking_closed = true;
+                                s.pending
+                                    .push_back(Ok(make_content_block_stop_event(s.thinking_index)));
+                            }
                             if s.text_block_started && !s.text_block_closed {
                                 s.text_block_closed = true;
-                                s.pending.push_back(Ok(make_content_block_stop_event(0)));
+                                s.pending.push_back(Ok(make_content_block_stop_event(
+                                    s.text_block_index,
+                                )));
                             }
                             let block_index = s.next_block_index;
                             s.next_block_index += 1;
@@ -698,6 +775,28 @@ fn make_tool_use_block_start_event(index: u32, id: &str, name: &str) -> Event {
     });
     Event::default()
         .event("content_block_start")
+        .data(data.to_string())
+}
+
+fn make_thinking_block_start_event(index: u32) -> Event {
+    let data = serde_json::json!({
+        "type": "content_block_start",
+        "index": index,
+        "content_block": {"type": "thinking", "thinking": ""}
+    });
+    Event::default()
+        .event("content_block_start")
+        .data(data.to_string())
+}
+
+fn make_thinking_delta_event(index: u32, thinking: &str) -> Event {
+    let data = serde_json::json!({
+        "type": "content_block_delta",
+        "index": index,
+        "delta": {"type": "thinking_delta", "thinking": thinking}
+    });
+    Event::default()
+        .event("content_block_delta")
         .data(data.to_string())
 }
 
@@ -1076,6 +1175,7 @@ mod tests {
                     name: None,
                     tool_calls: None,
                     tool_call_id: None,
+                    reasoning_content: None,
                 },
                 finish_reason: Some(finish_reason.to_string()),
             }],
@@ -1155,6 +1255,7 @@ mod tests {
                         },
                     }]),
                     tool_call_id: None,
+                    reasoning_content: None,
                 },
                 finish_reason: Some("tool_calls".to_string()),
             }],
@@ -1225,6 +1326,7 @@ mod tests {
                     role: None,
                     content: content.map(str::to_string),
                     tool_calls: None,
+                    reasoning_content: None,
                 },
                 finish_reason: finish_reason.map(str::to_string),
             }],
@@ -1257,6 +1359,7 @@ mod tests {
                             arguments: Some(args.to_string()),
                         }),
                     }]),
+                    reasoning_content: None,
                 },
                 finish_reason: finish_reason.map(str::to_string),
             }],
@@ -1291,6 +1394,7 @@ mod tests {
                             arguments: args.map(str::to_string),
                         }),
                     }]),
+                    reasoning_content: None,
                 },
                 finish_reason: finish.map(str::to_string),
             }],
@@ -1429,6 +1533,40 @@ mod tests {
             .join("\n");
         assert_eq!(dump.matches("event: content_block_start").count(), 1);
         assert!(dump.contains("Bash"));
+    }
+
+    #[tokio::test]
+    async fn reasoning_content_emits_thinking_block_before_text() {
+        let mut r_chunk = make_chunk(None, None);
+        r_chunk.choices[0].delta.reasoning_content = Some("pondering".to_string());
+        let chunks: Vec<Result<ChatCompletionChunk, ProxyError>> = vec![
+            Ok(r_chunk),
+            Ok(make_chunk(Some("answer"), None)),
+            Ok(make_chunk(None, Some("stop"))),
+        ];
+        let inner: ProviderStream = Box::pin(futures::stream::iter(chunks));
+        let events: Vec<_> =
+            openai_stream_to_anthropic_sse("m".to_string(), "msg".to_string(), inner)
+                .collect()
+                .await;
+        assert!(events.iter().all(|e| e.is_ok()));
+        let dump = events
+            .iter()
+            .map(|e| format!("{:?}", e.as_ref().unwrap()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        // A thinking block with a thinking_delta is emitted.
+        assert!(
+            dump.contains("thinking_delta"),
+            "thinking_delta emitted: {dump}"
+        );
+        assert!(dump.contains("pondering"));
+        // Thinking precedes text; two content blocks open (thinking + text).
+        assert!(
+            dump.find("pondering").unwrap() < dump.find("answer").unwrap(),
+            "thinking must precede text"
+        );
+        assert_eq!(dump.matches("event: content_block_start").count(), 2);
     }
 
     /// Tool-only stream must NOT produce an empty text block.

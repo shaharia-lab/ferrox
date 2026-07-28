@@ -114,6 +114,21 @@ impl AnthropicEventProcessor {
                             .unwrap_or("");
                         self.pending_tool_args.push_str(partial);
                     }
+                    "thinking_delta" => {
+                        // Extended-thinking text → OpenAI-style reasoning_content.
+                        let thinking = v
+                            .pointer("/delta/thinking")
+                            .and_then(|t| t.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        if !thinking.is_empty() {
+                            results.push(Ok(make_reasoning_chunk(
+                                &self.message_id,
+                                model_id,
+                                thinking,
+                            )));
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -204,6 +219,27 @@ pub fn make_text_chunk(id: &str, model: &str, text: String) -> ChatCompletionChu
                 role: None,
                 content: Some(text),
                 tool_calls: None,
+                reasoning_content: None,
+            },
+            finish_reason: None,
+        }],
+        usage: None,
+    }
+}
+
+pub fn make_reasoning_chunk(id: &str, model: &str, thinking: String) -> ChatCompletionChunk {
+    ChatCompletionChunk {
+        id: id.to_string(),
+        object: "chat.completion.chunk".to_string(),
+        created: chrono::Utc::now().timestamp() as u64,
+        model: model.to_string(),
+        choices: vec![ChunkChoice {
+            index: 0,
+            delta: ChunkDelta {
+                role: None,
+                content: None,
+                tool_calls: None,
+                reasoning_content: Some(thinking),
             },
             finish_reason: None,
         }],
@@ -238,6 +274,7 @@ pub fn make_tool_call_chunk(
                         arguments: Some(tool_call.function.arguments),
                     }),
                 }]),
+                reasoning_content: None,
             },
             finish_reason: None,
         }],
@@ -262,6 +299,7 @@ pub fn make_final_chunk(
                 role: None,
                 content: None,
                 tool_calls: None,
+                reasoning_content: None,
             },
             finish_reason: stop_reason,
         }],
@@ -339,6 +377,18 @@ mod tests {
 
         // pending state is cleared
         assert!(p.pending_tool_id.is_empty());
+    }
+
+    #[test]
+    fn thinking_delta_yields_reasoning_chunk() {
+        let mut p = make_processor();
+        let data =
+            r#"{"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":"hmm"}}"#;
+        let results = p.process("content_block_delta", data, "claude-3", "anthropic");
+        assert_eq!(results.len(), 1);
+        let delta = &results[0].as_ref().unwrap().choices[0].delta;
+        assert_eq!(delta.reasoning_content.as_deref(), Some("hmm"));
+        assert!(delta.content.is_none());
     }
 
     #[test]

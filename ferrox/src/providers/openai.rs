@@ -240,6 +240,7 @@ fn build_request_body(req: &ChatCompletionRequest, model_id: &str, stream: bool)
                     name: None,
                     tool_calls: None,
                     tool_call_id: None,
+                    reasoning_content: None,
                 },
             );
         }

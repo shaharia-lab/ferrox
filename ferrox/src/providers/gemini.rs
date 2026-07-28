@@ -199,6 +199,7 @@ impl ProviderAdapter for GeminiAdapter {
                             role: None,
                             content: if text.is_empty() { None } else { Some(text) },
                             tool_calls: None,
+                            reasoning_content: None,
                         },
                         finish_reason,
                     }],
@@ -450,6 +451,7 @@ fn gemini_to_openai_response(resp: GeminiResponse, model_id: &str) -> ChatComple
                 name: None,
                 tool_calls: None,
                 tool_call_id: None,
+                reasoning_content: None,
             };
 
             Choice {
