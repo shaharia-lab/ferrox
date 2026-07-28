@@ -298,6 +298,11 @@ fn convert_blocks(role: String, blocks: Vec<AnthropicContentBlock>, out: &mut Ve
     let mut content_parts: Vec<ContentPart> = Vec::new();
     let mut tool_calls: Vec<ToolCall> = Vec::new();
     let mut tool_results: Vec<(String, String)> = Vec::new();
+    // Image parts extracted from `tool_result` blocks. Held separately so they
+    // ride the trailing `user` message (user turns only) rather than leaking
+    // onto an assistant message — mirroring how a `tool_result`'s text is
+    // dropped on the assistant path.
+    let mut tool_result_image_parts: Vec<ContentPart> = Vec::new();
 
     for block in blocks {
         match block {
@@ -327,6 +332,13 @@ fn convert_blocks(role: String, blocks: Vec<AnthropicContentBlock>, out: &mut Ve
                 content,
                 is_error,
             } => {
+                // OpenAI `tool` messages are text-only, so an image returned
+                // inside a `tool_result` cannot ride on the tool reply. Extract
+                // any image blocks (borrowing before `content` is moved into the
+                // text flattener); they're re-homed onto this turn's trailing
+                // `user` message below, after the `tool` replies — preserving
+                // the tool_call/reply adjacency from #104/#105.
+                tool_result_image_parts.extend(tool_result_images(content.as_ref()));
                 let mut text = tool_result_content_to_string(content);
                 // The OpenAI `tool` role has no `is_error`; annotate so the model
                 // can tell a failed tool call from a successful one.
@@ -383,6 +395,10 @@ fn convert_blocks(role: String, blocks: Vec<AnthropicContentBlock>, out: &mut Ve
                 reasoning_content: None,
             });
         }
+        // Re-home any tool_result images onto the trailing user message so they
+        // land in a spec-valid position (image_url is invalid on a `tool`
+        // message) after the tool replies.
+        content_parts.extend(tool_result_image_parts);
         if let Some(content) = parts_to_content(content_parts) {
             out.push(ChatMessage {
                 role: role.clone(),
@@ -451,10 +467,14 @@ fn tool_result_content_to_string(v: Option<serde_json::Value>) -> String {
                     .get("text")
                     .and_then(|t| t.as_str())
                     .map(str::to_string),
+                // `image` blocks are re-homed onto the trailing `user` message
+                // by `tool_result_images()`, so they're not dropped here — stay
+                // silent for them.
+                Some("image") => None,
                 other => {
-                    // OpenAI `tool` role messages are text-only, so non-text tool
-                    // result blocks (e.g. images) can't be represented — warn
-                    // instead of dropping silently.
+                    // Other non-text blocks (e.g. `document`) have no OpenAI
+                    // tool-message representation — warn instead of dropping
+                    // silently.
                     tracing::warn!(
                         block = other.unwrap_or("unknown"),
                         "dropping non-text tool_result block (OpenAI tool messages are text-only)"
@@ -465,6 +485,33 @@ fn tool_result_content_to_string(v: Option<serde_json::Value>) -> String {
             .collect::<Vec<_>>()
             .join(""),
         Some(other) => other.to_string(),
+    }
+}
+
+/// Extract `image` blocks from a `tool_result` content value as OpenAI
+/// `image_url` content parts.
+///
+/// OpenAI's `tool` role is text-only, so tool-result images can't ride on the
+/// tool reply; the caller re-homes these onto the trailing `user` message (a
+/// spec-valid position for `image_url`). Only array-form content can carry
+/// blocks; string/absent content yields no images. Reuses
+/// `anthropic_image_source_to_url()` so base64 (`data:` URL) and remote-URL
+/// sources are handled identically to top-level image blocks.
+fn tool_result_images(v: Option<&serde_json::Value>) -> Vec<ContentPart> {
+    match v {
+        Some(serde_json::Value::Array(arr)) => arr
+            .iter()
+            .filter_map(|item| match item.get("type").and_then(|t| t.as_str()) {
+                Some("image") => item
+                    .get("source")
+                    .and_then(anthropic_image_source_to_url)
+                    .map(|url| ContentPart::ImageUrl {
+                        image_url: crate::types::ImageUrl { url, detail: None },
+                    }),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
     }
 }
 
@@ -1406,16 +1453,149 @@ mod tests {
     }
 
     #[test]
-    fn tool_result_non_text_dropped_text_kept() {
-        // A tool_result with text + image: text preserved, image dropped (OpenAI
-        // tool messages are text-only).
+    fn tool_result_mixed_text_image_keeps_text_rehomes_image() {
+        // A tool_result with text + image: text stays on the (text-only) `tool`
+        // message; the image is re-homed as an `image_url` part on the trailing
+        // `user` message (#106).
         let json = r#"{"model":"m","max_tokens":10,"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":[{"type":"text","text":"see this:"},{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAA"}}]}]}]}"#;
         let req: AnthropicMessagesRequest = serde_json::from_str(json).unwrap();
         let internal = to_chat_completion_request(req);
+
+        // tool message: text only, no image part.
         let tool_msg = internal.messages.iter().find(|m| m.role == "tool").unwrap();
         match tool_msg.content.as_ref().unwrap() {
             MessageContent::Text(t) => assert_eq!(t, "see this:"),
             other => panic!("expected text, got {other:?}"),
+        }
+
+        // user message: carries the image as an image_url part, after the tool
+        // reply.
+        let roles: Vec<&str> = internal.messages.iter().map(|m| m.role.as_str()).collect();
+        assert_eq!(roles, vec!["tool", "user"]);
+        let user_msg = internal.messages.iter().find(|m| m.role == "user").unwrap();
+        match user_msg.content.as_ref().unwrap() {
+            MessageContent::Parts(parts) => {
+                let imgs: Vec<&crate::types::ImageUrl> = parts
+                    .iter()
+                    .filter_map(|p| match p {
+                        ContentPart::ImageUrl { image_url } => Some(image_url),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(imgs.len(), 1);
+                assert_eq!(imgs[0].url, "data:image/png;base64,AAAA");
+            }
+            other => panic!("expected image parts on user message, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tool_result_image_only_rehomes_to_user_message() {
+        // An image-only tool_result: the `tool` message has empty text, and the
+        // image lands on the trailing `user` message (#106).
+        let json = r#"{"model":"m","max_tokens":10,"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":[{"type":"image","source":{"type":"url","url":"https://example.com/a.png"}}]}]}]}"#;
+        let req: AnthropicMessagesRequest = serde_json::from_str(json).unwrap();
+        let internal = to_chat_completion_request(req);
+        let roles: Vec<&str> = internal.messages.iter().map(|m| m.role.as_str()).collect();
+        assert_eq!(roles, vec!["tool", "user"]);
+
+        // tool reply text-only (empty here) — never an image part.
+        let tool_msg = &internal.messages[0];
+        assert_eq!(tool_msg.tool_call_id.as_deref(), Some("t1"));
+        assert!(matches!(
+            tool_msg.content.as_ref().unwrap(),
+            MessageContent::Text(t) if t.is_empty()
+        ));
+
+        let user_msg = &internal.messages[1];
+        match user_msg.content.as_ref().unwrap() {
+            MessageContent::Parts(parts) => {
+                assert_eq!(parts.len(), 1);
+                assert!(matches!(
+                    &parts[0],
+                    ContentPart::ImageUrl { image_url } if image_url.url == "https://example.com/a.png"
+                ));
+            }
+            other => panic!("expected image parts, got {other:?}"),
+        }
+    }
+
+    /// The #104/#105 invariant must hold when a tool_result carries an image:
+    /// assistant `tool_calls` → `tool` reply → `user`(image), with no user
+    /// message wedged before the tool reply.
+    #[test]
+    fn tool_result_image_preserves_tool_reply_adjacency() {
+        let req = AnthropicMessagesRequest {
+            messages: vec![
+                AnthropicMessage {
+                    role: "assistant".to_string(),
+                    content: AnthropicMessageContent::Blocks(vec![
+                        AnthropicContentBlock::ToolUse {
+                            id: "tool_shot".to_string(),
+                            name: "Screenshot".to_string(),
+                            input: serde_json::json!({}),
+                        },
+                    ]),
+                },
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: AnthropicMessageContent::Blocks(vec![
+                        AnthropicContentBlock::ToolResult {
+                            tool_use_id: "tool_shot".to_string(),
+                            content: Some(serde_json::json!([
+                                {"type": "text", "text": "captured"},
+                                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "ZZ"}}
+                            ])),
+                            is_error: false,
+                        },
+                    ]),
+                },
+            ],
+            ..minimal_request("k3")
+        };
+        let out = to_chat_completion_request(req);
+        let roles: Vec<&str> = out.messages.iter().map(|m| m.role.as_str()).collect();
+        assert_eq!(roles, vec!["assistant", "tool", "user"]);
+        assert!(out.messages[0].tool_calls.is_some());
+        assert_eq!(out.messages[1].tool_call_id.as_deref(), Some("tool_shot"));
+    }
+
+    #[test]
+    fn assistant_turn_tool_result_image_does_not_leak_onto_assistant_message() {
+        // tool_result is a user-turn construct; on the (malformed) assistant
+        // path its text is already dropped, so its image must not attach to the
+        // assistant message either — it stays text/no-image, symmetric with the
+        // text handling.
+        let req = AnthropicMessagesRequest {
+            messages: vec![AnthropicMessage {
+                role: "assistant".to_string(),
+                content: AnthropicMessageContent::Blocks(vec![
+                    AnthropicContentBlock::Text {
+                        text: "hi".to_string(),
+                    },
+                    AnthropicContentBlock::ToolResult {
+                        tool_use_id: "t1".to_string(),
+                        content: Some(serde_json::json!([
+                            {"type": "image", "source": {"type": "url", "url": "https://example.com/x.png"}}
+                        ])),
+                        is_error: false,
+                    },
+                ]),
+            }],
+            ..minimal_request("k3")
+        };
+        let out = to_chat_completion_request(req);
+        assert_eq!(out.messages.len(), 1);
+        let msg = &out.messages[0];
+        assert_eq!(msg.role, "assistant");
+        // No image_url part leaked onto the assistant message.
+        if let Some(MessageContent::Parts(parts)) = msg.content.as_ref() {
+            assert!(
+                !parts
+                    .iter()
+                    .any(|p| matches!(p, ContentPart::ImageUrl { .. })),
+                "tool_result image leaked onto assistant message"
+            );
         }
     }
 
@@ -1584,6 +1764,34 @@ mod tests {
         let v =
             serde_json::json!([{"type": "image", "source": {}}, {"type": "text", "text": "only"}]);
         assert_eq!(tool_result_content_to_string(Some(v)), "only");
+    }
+
+    #[test]
+    fn tool_result_images_extracts_base64_and_url_sources() {
+        let v = serde_json::json!([
+            {"type": "text", "text": "ignored"},
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}},
+            {"type": "image", "source": {"type": "url", "url": "https://example.com/b.jpg"}},
+            {"type": "document", "source": {}}
+        ]);
+        let imgs = tool_result_images(Some(&v));
+        let urls: Vec<&str> = imgs
+            .iter()
+            .filter_map(|p| match p {
+                ContentPart::ImageUrl { image_url } => Some(image_url.url.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            urls,
+            vec!["data:image/png;base64,AAAA", "https://example.com/b.jpg"]
+        );
+    }
+
+    #[test]
+    fn tool_result_images_empty_for_string_and_absent() {
+        assert!(tool_result_images(None).is_empty());
+        assert!(tool_result_images(Some(&serde_json::json!("plain text"))).is_empty());
     }
 
     // ── openai_stream_to_anthropic_sse ────────────────────────────────────────
