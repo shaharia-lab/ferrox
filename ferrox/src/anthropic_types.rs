@@ -281,14 +281,22 @@ fn anthropic_messages_to_internal(messages: Vec<AnthropicMessage>) -> Vec<ChatMe
 
 /// Expand one Anthropic message (block content) into ≥1 internal messages.
 fn convert_blocks(role: String, blocks: Vec<AnthropicContentBlock>, out: &mut Vec<ChatMessage>) {
-    let mut text_parts: Vec<String> = Vec::new();
+    let mut content_parts: Vec<ContentPart> = Vec::new();
     let mut tool_calls: Vec<ToolCall> = Vec::new();
     let mut tool_results: Vec<(String, String)> = Vec::new();
 
     for block in blocks {
         match block {
             AnthropicContentBlock::Text { text } => {
-                text_parts.push(text);
+                content_parts.push(ContentPart::Text { text });
+            }
+            AnthropicContentBlock::Image { source } => {
+                // Translate to an OpenAI image_url part instead of dropping it.
+                if let Some(url) = anthropic_image_source_to_url(&source) {
+                    content_parts.push(ContentPart::ImageUrl {
+                        image_url: crate::types::ImageUrl { url, detail: None },
+                    });
+                }
             }
             AnthropicContentBlock::ToolUse { id, name, input } => {
                 tool_calls.push(ToolCall {
@@ -307,23 +315,16 @@ fn convert_blocks(role: String, blocks: Vec<AnthropicContentBlock>, out: &mut Ve
             } => {
                 tool_results.push((tool_use_id, tool_result_content_to_string(content)));
             }
-            // Image, document, thinking, and Unknown blocks are dropped;
-            // the downstream provider handles images natively via the
-            // pass-through adapters if needed.
-            AnthropicContentBlock::Image { .. } | AnthropicContentBlock::Unknown => {}
+            // Document/thinking/unknown blocks have no OpenAI equivalent — dropped.
+            AnthropicContentBlock::Unknown => {}
         }
     }
 
     if role == "assistant" {
-        // Assistant turn: combine text + tool_calls into one message.
-        let content = if text_parts.is_empty() {
-            None
-        } else {
-            Some(MessageContent::Text(text_parts.join("")))
-        };
+        // Assistant turn: combine text/image + tool_calls into one message.
         out.push(ChatMessage {
             role,
-            content,
+            content: parts_to_content(content_parts),
             name: None,
             tool_calls: if tool_calls.is_empty() {
                 None
@@ -334,12 +335,11 @@ fn convert_blocks(role: String, blocks: Vec<AnthropicContentBlock>, out: &mut Ve
             reasoning_content: None,
         });
     } else {
-        // User turn: text first, then each tool result as a separate "tool" message.
-        let combined_text = text_parts.join("");
-        if !combined_text.is_empty() {
+        // User turn: content (text + images) first, then each tool result.
+        if let Some(content) = parts_to_content(content_parts) {
             out.push(ChatMessage {
                 role: role.clone(),
-                content: Some(MessageContent::Text(combined_text)),
+                content: Some(content),
                 name: None,
                 tool_calls: None,
                 tool_call_id: None,
@@ -356,6 +356,44 @@ fn convert_blocks(role: String, blocks: Vec<AnthropicContentBlock>, out: &mut Ve
                 reasoning_content: None,
             });
         }
+    }
+}
+
+/// Collapse collected content parts into a message content: a single `Text` when
+/// everything is text (the common case), `Parts` when any image is present, or
+/// `None` when empty.
+fn parts_to_content(parts: Vec<ContentPart>) -> Option<MessageContent> {
+    if parts.is_empty() {
+        return None;
+    }
+    if parts.iter().all(|p| matches!(p, ContentPart::Text { .. })) {
+        let text = parts
+            .into_iter()
+            .filter_map(|p| match p {
+                ContentPart::Text { text } => Some(text),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("");
+        return Some(MessageContent::Text(text));
+    }
+    Some(MessageContent::Parts(parts))
+}
+
+/// Convert an Anthropic image `source` object to an OpenAI `image_url` URL.
+/// `base64` sources become a `data:` URL; `url` sources pass through.
+fn anthropic_image_source_to_url(source: &serde_json::Value) -> Option<String> {
+    match source.get("type").and_then(|t| t.as_str()) {
+        Some("base64") => {
+            let media = source
+                .get("media_type")
+                .and_then(|m| m.as_str())
+                .unwrap_or("image/jpeg");
+            let data = source.get("data").and_then(|d| d.as_str())?;
+            Some(format!("data:{media};base64,{data}"))
+        }
+        Some("url") => source.get("url").and_then(|u| u.as_str()).map(String::from),
+        _ => None,
     }
 }
 
@@ -1187,6 +1225,39 @@ mod tests {
             r#"{"type": "document", "source": {"type": "url", "url": "https://example.com"}}"#;
         let block: AnthropicContentBlock = serde_json::from_str(block_json).unwrap();
         assert!(matches!(block, AnthropicContentBlock::Unknown));
+    }
+
+    #[test]
+    fn image_block_is_preserved_as_image_url_part() {
+        // Regression: image blocks were dropped, so providers hallucinated.
+        let json = r#"{"model":"m","max_tokens":10,"messages":[{"role":"user","content":[
+            {"type":"text","text":"what is this?"},
+            {"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAA"}}
+        ]}]}"#;
+        let req: AnthropicMessagesRequest = serde_json::from_str(json).unwrap();
+        let internal = to_chat_completion_request(req);
+        match internal.messages[0].content.as_ref().unwrap() {
+            MessageContent::Parts(parts) => {
+                assert!(
+                    parts
+                        .iter()
+                        .any(|p| matches!(p, ContentPart::ImageUrl { image_url }
+                        if image_url.url == "data:image/png;base64,AAAA")),
+                    "image preserved as a data URL"
+                );
+                assert!(parts.iter().any(|p| matches!(p, ContentPart::Text { .. })));
+            }
+            other => panic!("expected multimodal Parts, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn url_image_source_passes_through() {
+        let src = serde_json::json!({"type":"url","url":"https://x/i.png"});
+        assert_eq!(
+            anthropic_image_source_to_url(&src).as_deref(),
+            Some("https://x/i.png")
+        );
     }
 
     // ── to_anthropic_response ─────────────────────────────────────────────────
