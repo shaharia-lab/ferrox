@@ -2,8 +2,7 @@ use serde_json::Value;
 
 use crate::error::ProxyError;
 use crate::types::{
-    ChatCompletionChunk, ChunkChoice, ChunkDelta, FunctionCall, StreamFunctionCall, StreamToolCall,
-    ToolCall, Usage,
+    ChatCompletionChunk, ChunkChoice, ChunkDelta, StreamFunctionCall, StreamToolCall, Usage,
 };
 
 // ── Shared Anthropic SSE event processor ──────────────────────────────────────
@@ -17,7 +16,6 @@ pub struct AnthropicEventProcessor {
     pub message_id: String,
     pending_tool_id: String,
     pending_tool_name: String,
-    pending_tool_args: String,
     pending_tool_index: u32,
     pub stop_reason: Option<String>,
     pub usage: Option<Usage>,
@@ -33,7 +31,6 @@ impl AnthropicEventProcessor {
             message_id,
             pending_tool_id: String::new(),
             pending_tool_name: String::new(),
-            pending_tool_args: String::new(),
             pending_tool_index: 0,
             stop_reason: None,
             usage: None,
@@ -86,9 +83,17 @@ impl AnthropicEventProcessor {
                         .and_then(|v| v.as_str())
                         .unwrap_or("")
                         .to_string();
-                    self.pending_tool_args.clear();
                     self.pending_tool_index =
                         v.pointer("/index").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                    // Emit the opening fragment (id + name) so consumers get the
+                    // tool call's identity before its arguments stream in.
+                    results.push(Ok(make_tool_call_start_chunk(
+                        &self.message_id,
+                        model_id,
+                        self.pending_tool_index,
+                        &self.pending_tool_id,
+                        &self.pending_tool_name,
+                    )));
                 }
             }
             "content_block_delta" => {
@@ -112,7 +117,15 @@ impl AnthropicEventProcessor {
                             .pointer("/delta/partial_json")
                             .and_then(|t| t.as_str())
                             .unwrap_or("");
-                        self.pending_tool_args.push_str(partial);
+                        // Stream each argument fragment incrementally.
+                        if !self.pending_tool_id.is_empty() && !partial.is_empty() {
+                            results.push(Ok(make_tool_call_args_chunk(
+                                &self.message_id,
+                                model_id,
+                                self.pending_tool_index,
+                                partial,
+                            )));
+                        }
                     }
                     "thinking_delta" => {
                         // Extended-thinking text → OpenAI-style reasoning_content.
@@ -133,24 +146,11 @@ impl AnthropicEventProcessor {
                 }
             }
             "content_block_stop" => {
+                // Tool-call fragments were streamed incrementally on start/delta;
+                // just clear the pending state here.
                 if !self.pending_tool_id.is_empty() {
-                    let tool_call = ToolCall {
-                        id: self.pending_tool_id.clone(),
-                        r#type: "function".to_string(),
-                        function: FunctionCall {
-                            name: self.pending_tool_name.clone(),
-                            arguments: self.pending_tool_args.clone(),
-                        },
-                    };
-                    results.push(Ok(make_tool_call_chunk(
-                        &self.message_id,
-                        model_id,
-                        self.pending_tool_index,
-                        tool_call,
-                    )));
                     self.pending_tool_id.clear();
                     self.pending_tool_name.clear();
-                    self.pending_tool_args.clear();
                 }
             }
             "message_delta" => {
@@ -247,39 +247,69 @@ pub fn make_reasoning_chunk(id: &str, model: &str, thinking: String) -> ChatComp
     }
 }
 
-pub fn make_tool_call_chunk(
-    id: &str,
-    model: &str,
-    index: u32,
-    tool_call: ToolCall,
-) -> ChatCompletionChunk {
+fn stream_tool_chunk(id: &str, model: &str, stc: StreamToolCall) -> ChatCompletionChunk {
     ChatCompletionChunk {
         id: id.to_string(),
         object: "chat.completion.chunk".to_string(),
         created: chrono::Utc::now().timestamp() as u64,
         model: model.to_string(),
         choices: vec![ChunkChoice {
-            index,
+            index: 0,
             delta: ChunkDelta {
                 role: None,
                 content: None,
-                // Anthropic delivers the whole tool call at content_block_stop,
-                // so emit it as a single complete streaming fragment.
-                tool_calls: Some(vec![StreamToolCall {
-                    index: index as i32,
-                    id: Some(tool_call.id),
-                    r#type: Some(tool_call.r#type),
-                    function: Some(StreamFunctionCall {
-                        name: Some(tool_call.function.name),
-                        arguments: Some(tool_call.function.arguments),
-                    }),
-                }]),
+                tool_calls: Some(vec![stc]),
                 reasoning_content: None,
             },
             finish_reason: None,
         }],
         usage: None,
     }
+}
+
+/// Opening fragment of a streaming tool call: id + name, empty arguments.
+pub fn make_tool_call_start_chunk(
+    id: &str,
+    model: &str,
+    index: u32,
+    tool_id: &str,
+    tool_name: &str,
+) -> ChatCompletionChunk {
+    stream_tool_chunk(
+        id,
+        model,
+        StreamToolCall {
+            index: index as i32,
+            id: Some(tool_id.to_string()),
+            r#type: Some("function".to_string()),
+            function: Some(StreamFunctionCall {
+                name: Some(tool_name.to_string()),
+                arguments: Some(String::new()),
+            }),
+        },
+    )
+}
+
+/// Continuation fragment: an `arguments` piece for an already-opened tool call.
+pub fn make_tool_call_args_chunk(
+    id: &str,
+    model: &str,
+    index: u32,
+    args: &str,
+) -> ChatCompletionChunk {
+    stream_tool_chunk(
+        id,
+        model,
+        StreamToolCall {
+            index: index as i32,
+            id: None,
+            r#type: None,
+            function: Some(StreamFunctionCall {
+                name: None,
+                arguments: Some(args.to_string()),
+            }),
+        },
+    )
 }
 
 pub fn make_final_chunk(
@@ -345,37 +375,54 @@ mod tests {
     }
 
     #[test]
-    fn tool_call_accumulation_and_emit() {
+    fn tool_call_streams_incrementally() {
         let mut p = make_processor();
 
-        // Start tool use block
+        // Start → opening fragment: id + name, empty args, no arg data yet.
         let start = r#"{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"tool_1","name":"get_weather"}}"#;
-        assert!(p
-            .process("content_block_start", start, "claude-3", "anthropic")
-            .is_empty());
-
-        // Accumulate input JSON
-        let delta1 = r#"{"type":"content_block_delta","delta":{"type":"input_json_delta","partial_json":"{\"loc"}}"#;
-        assert!(p
-            .process("content_block_delta", delta1, "claude-3", "anthropic")
-            .is_empty());
-        let delta2 = r#"{"type":"content_block_delta","delta":{"type":"input_json_delta","partial_json":"ation\":\"NYC\"}"}}"#;
-        assert!(p
-            .process("content_block_delta", delta2, "claude-3", "anthropic")
-            .is_empty());
-
-        // Stop block — should emit tool call chunk
-        let stop = r#"{"type":"content_block_stop"}"#;
-        let results = p.process("content_block_stop", stop, "claude-3", "anthropic");
-        assert_eq!(results.len(), 1);
-        let chunk = results[0].as_ref().unwrap();
-        let tc = &chunk.choices[0].delta.tool_calls.as_ref().unwrap()[0];
+        let r = p.process("content_block_start", start, "claude-3", "anthropic");
+        assert_eq!(r.len(), 1);
+        let tc = &r[0].as_ref().unwrap().choices[0]
+            .delta
+            .tool_calls
+            .as_ref()
+            .unwrap()[0];
         assert_eq!(tc.id.as_deref(), Some("tool_1"));
         let f = tc.function.as_ref().unwrap();
         assert_eq!(f.name.as_deref(), Some("get_weather"));
-        assert_eq!(f.arguments.as_deref(), Some(r#"{"location":"NYC"}"#));
+        assert_eq!(f.arguments.as_deref(), Some("")); // empty at open
 
-        // pending state is cleared
+        // Each input_json_delta → an arguments fragment (no id/name).
+        let delta1 = r#"{"type":"content_block_delta","delta":{"type":"input_json_delta","partial_json":"{\"loc"}}"#;
+        let r = p.process("content_block_delta", delta1, "claude-3", "anthropic");
+        assert_eq!(r.len(), 1);
+        let tc = &r[0].as_ref().unwrap().choices[0]
+            .delta
+            .tool_calls
+            .as_ref()
+            .unwrap()[0];
+        assert!(tc.id.is_none(), "continuation fragment carries no id");
+        assert_eq!(
+            tc.function.as_ref().unwrap().arguments.as_deref(),
+            Some("{\"loc")
+        );
+
+        let delta2 = r#"{"type":"content_block_delta","delta":{"type":"input_json_delta","partial_json":"ation\":\"NYC\"}"}}"#;
+        assert_eq!(
+            p.process("content_block_delta", delta2, "claude-3", "anthropic")
+                .len(),
+            1
+        );
+
+        // Stop emits nothing (fragments already streamed) and clears state.
+        assert!(p
+            .process(
+                "content_block_stop",
+                r#"{"type":"content_block_stop"}"#,
+                "claude-3",
+                "anthropic"
+            )
+            .is_empty());
         assert!(p.pending_tool_id.is_empty());
     }
 
