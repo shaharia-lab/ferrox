@@ -91,8 +91,26 @@ providers:
 
   - name: bedrock-primary
     type: bedrock
-    region: "${AWS_REGION:-us-east-1}"
-    # No api_key — uses AWS credential chain (env vars, instance role, IRSA)
+    aws:
+      region: "${AWS_REGION:-us-east-1}"
+      # `auth` is optional. Omit it entirely to use the AWS default credential
+      # chain (env vars, ~/.aws, SSO cache, EC2/ECS/EKS instance roles, IRSA).
+      # Otherwise pick exactly one base source below; `assume_role` may layer on
+      # top of any of them. Always supply secrets via env-var interpolation.
+      #
+      # auth:
+      #   # 1) Static credentials
+      #   access_key_id: "${AWS_ACCESS_KEY_ID}"
+      #   secret_access_key: "${AWS_SECRET_ACCESS_KEY}"
+      #   session_token: "${AWS_SESSION_TOKEN:-}"   # optional
+      #   # 2) Named profile / SSO (mutually exclusive with static keys)
+      #   # profile: "my-sso-profile"
+      #   # 3) Assume an IAM role (STS) on top of the base source
+      #   # assume_role:
+      #   #   role_arn: "arn:aws:iam::123456789012:role/ferrox"
+      #   #   session_name: "ferrox"
+      #   #   external_id: "${AWS_EXTERNAL_ID:-}"
+      #   #   duration_secs: 3600
 
   - name: glm-primary
     type: glm

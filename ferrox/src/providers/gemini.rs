@@ -776,7 +776,7 @@ mod tests {
                 provider_type: ProviderType::Gemini,
                 api_key: Some("k".into()),
                 base_url: None,
-                region: None,
+                aws: None,
                 timeouts: None,
                 retry: None,
                 circuit_breaker: None,

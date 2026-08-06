@@ -63,24 +63,92 @@ Ferrox maps the OpenAI message format to Gemini's `generateContent` / `streamGen
 
 ## AWS Bedrock
 
+Ferrox talks to Bedrock through the **Converse API**, so it supports **all
+Bedrock model families** — Anthropic Claude, Amazon Nova/Titan, Meta Llama,
+Mistral, Cohere, and others — not just Claude. Tool calling, multimodal image
+inputs (see note below), and streaming all translate through the same path.
+
+### Minimal (default credential chain)
+
 ```yaml
 providers:
   - name: bedrock-us
     type: bedrock
-    region: "${AWS_REGION:-us-east-1}"
-    # No api_key field; uses AWS credential chain
+    aws:
+      region: "${AWS_REGION:-us-east-1}"
 ```
 
-Credentials are loaded from the standard AWS credential chain:
+With no `aws.auth` block, credentials come from the standard AWS default chain:
+environment variables (`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` /
+`AWS_SESSION_TOKEN`), `~/.aws/credentials` + `~/.aws/config` (incl. SSO), and
+EC2/ECS/EKS instance roles / IRSA — the same resolution as the AWS CLI/SDKs.
 
-1. Environment variables (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`)
-2. AWS credentials file (`~/.aws/credentials`)
-3. EC2 instance metadata / ECS task role
-4. IAM role attached to the compute instance or task
+### Authentication modes
 
-Currently supports Anthropic models on Bedrock (`anthropic.*` model IDs) using the `anthropic_version: "bedrock-2023-05-31"` format.
+Set **exactly one** base source under `aws.auth` (or omit `auth` for the default
+chain). `assume_role` can layer an STS AssumeRole on top of any base source.
+Always pass secrets via environment-variable interpolation — never inline them.
 
-**No API key required**
+**Static credentials**
+
+```yaml
+    aws:
+      region: us-east-1
+      auth:
+        access_key_id: "${AWS_ACCESS_KEY_ID}"
+        secret_access_key: "${AWS_SECRET_ACCESS_KEY}"
+        session_token: "${AWS_SESSION_TOKEN:-}"   # optional (temporary creds)
+```
+
+**Named profile / SSO**
+
+```yaml
+    aws:
+      region: us-east-1
+      auth:
+        profile: "my-sso-profile"   # ~/.aws profile, incl. SSO / credential_process
+```
+
+**STS AssumeRole** (cross-account, least-privilege; temporary credentials are
+auto-refreshed). Layers on top of the base source — static keys, a profile, or
+the default chain when no base source is given:
+
+```yaml
+    aws:
+      region: us-east-1
+      auth:
+        assume_role:
+          role_arn: "arn:aws:iam::123456789012:role/ferrox"
+          session_name: "ferrox"               # optional
+          external_id: "${AWS_EXTERNAL_ID:-}"  # optional
+          duration_secs: 3600                  # optional
+```
+
+### Model IDs and inference profiles
+
+Use the Bedrock model ID as the `model_id` on a routing target. Many newer
+models are only invocable through a **cross-region inference profile**, whose ID
+is region-prefixed — pass that ID verbatim and Ferrox forwards it as-is:
+
+```yaml
+models:
+  - alias: claude
+    routing:
+      strategy: failover
+      targets:
+        - provider: bedrock-us
+          model_id: "eu.anthropic.claude-sonnet-4-5-20250929-v1:0"  # inference profile
+        - provider: bedrock-us
+          model_id: "amazon.nova-pro-v1:0"                          # on-demand model
+```
+
+**Notes**
+
+- `endpoint_url` under `aws` overrides the Bedrock runtime endpoint (VPC
+  endpoints / testing); rarely needed.
+- Image inputs must be inline base64 `data:` URLs — Converse takes image
+  **bytes**, so remote `http(s)` image URLs are skipped (logged as a warning).
+- No `api_key` field is used for Bedrock.
 
 ---
 
