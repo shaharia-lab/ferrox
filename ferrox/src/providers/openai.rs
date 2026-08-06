@@ -326,7 +326,7 @@ mod tests {
             provider_type: ProviderType::OpenAI,
             api_key: Some("sk-test".to_string()),
             base_url: base_url.map(str::to_string),
-            region: None,
+            aws: None,
             timeouts: None,
             retry: None,
             circuit_breaker: None,

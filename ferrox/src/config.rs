@@ -307,10 +307,65 @@ pub struct ProviderConfig {
     pub provider_type: ProviderType,
     pub api_key: Option<String>,
     pub base_url: Option<String>,
-    pub region: Option<String>,
+    /// AWS-specific configuration (region + credentials). Used by the `bedrock`
+    /// provider; ignored by every other provider type.
+    pub aws: Option<AwsConfig>,
     pub timeouts: Option<TimeoutsConfig>,
     pub retry: Option<RetryConfig>,
     pub circuit_breaker: Option<CircuitBreakerConfig>,
+}
+
+/// AWS configuration for a `bedrock` provider: the region and how to obtain
+/// credentials. When `auth` is omitted, the standard AWS default credential
+/// chain is used (environment variables, `~/.aws`, SSO cache, and EC2/ECS/EKS
+/// instance roles) — the same behaviour as the AWS CLI/SDKs.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AwsConfig {
+    /// AWS region, e.g. `us-east-1`. Falls back to the default chain
+    /// (`AWS_REGION`, profile) when omitted.
+    pub region: Option<String>,
+    /// Explicit credential source. Omit to use the default credential chain.
+    pub auth: Option<AwsAuthConfig>,
+    /// Override the Bedrock runtime endpoint (VPC endpoints, testing). Rarely
+    /// needed; the SDK derives the correct regional endpoint otherwise.
+    pub endpoint_url: Option<String>,
+}
+
+/// How Ferrox obtains AWS credentials for a Bedrock provider. Exactly one base
+/// source may be set (static keys **or** a named profile); leaving both unset
+/// uses the default credential chain. `assume_role` optionally layers an STS
+/// AssumeRole on top of whichever base source is resolved.
+///
+/// Secrets should be supplied via environment-variable interpolation
+/// (`${AWS_SECRET_ACCESS_KEY}`) rather than inline literals.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AwsAuthConfig {
+    /// Static access key id. Requires `secret_access_key`.
+    pub access_key_id: Option<String>,
+    /// Static secret access key. Requires `access_key_id`.
+    pub secret_access_key: Option<String>,
+    /// Optional session token, for temporary/STS-issued static credentials.
+    pub session_token: Option<String>,
+    /// Named profile from `~/.aws/config` / `~/.aws/credentials` (incl. SSO and
+    /// `credential_process`). Mutually exclusive with the static keys above.
+    pub profile: Option<String>,
+    /// Optionally assume an IAM role (STS) on top of the resolved base source.
+    pub assume_role: Option<AwsAssumeRoleConfig>,
+}
+
+/// STS AssumeRole parameters. The base credentials (static, profile, or default
+/// chain) are used to call STS; the resulting temporary credentials are
+/// auto-refreshed by the SDK.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AwsAssumeRoleConfig {
+    /// ARN of the role to assume, e.g. `arn:aws:iam::123456789012:role/ferrox`.
+    pub role_arn: String,
+    /// Role session name (defaults to `ferrox` when omitted).
+    pub session_name: Option<String>,
+    /// External ID, when the trust policy requires one.
+    pub external_id: Option<String>,
+    /// Session duration in seconds (STS default is 3600 when omitted).
+    pub duration_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -624,6 +679,25 @@ pub(crate) fn validate(config: &Config) -> Result<(), anyhow::Error> {
         }
     }
 
+    // Validate AWS credential configuration for Bedrock providers.
+    for p in &config.providers {
+        if let Some(auth) = p.aws.as_ref().and_then(|a| a.auth.as_ref()) {
+            let has_static = auth.access_key_id.is_some() || auth.secret_access_key.is_some();
+            if auth.access_key_id.is_some() != auth.secret_access_key.is_some() {
+                bail!(
+                    "Provider '{}': aws.auth requires both access_key_id and secret_access_key together",
+                    p.name
+                );
+            }
+            if has_static && auth.profile.is_some() {
+                bail!(
+                    "Provider '{}': aws.auth sets both static credentials and a profile; use exactly one base source",
+                    p.name
+                );
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -706,7 +780,7 @@ mod tests {
                 provider_type: ProviderType::OpenAI,
                 api_key: None,
                 base_url: None,
-                region: None,
+                aws: None,
                 timeouts: None,
                 retry: None,
                 circuit_breaker: None,
@@ -746,7 +820,7 @@ mod tests {
             provider_type: ProviderType::OpenAI,
             api_key: None,
             base_url: None,
-            region: None,
+            aws: None,
             timeouts: None,
             retry: None,
             circuit_breaker: None,

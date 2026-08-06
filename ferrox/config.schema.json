@@ -160,10 +160,51 @@
           "format": "uri",
           "description": "API base URL including the version prefix. The adapter appends /chat/completions (OpenAI/GLM) or the provider-specific path. Must NOT end with /chat/completions. Examples: 'https://api.openai.com/v1', 'https://api.z.ai/api/paas/v4'."
         },
-        "region": { "type": "string" },
+        "aws": { "$ref": "#/definitions/AwsConfig" },
         "timeouts": { "$ref": "#/definitions/TimeoutsConfig" },
         "retry": { "$ref": "#/definitions/RetryConfig" },
         "circuit_breaker": { "$ref": "#/definitions/CircuitBreakerConfig" }
+      }
+    },
+    "AwsConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "AWS configuration for a 'bedrock' provider (region + credentials). Ignored by other provider types.",
+      "properties": {
+        "region": {
+          "type": "string",
+          "description": "AWS region, e.g. 'us-east-1'. Falls back to AWS_REGION / profile when omitted."
+        },
+        "endpoint_url": {
+          "type": "string",
+          "format": "uri",
+          "description": "Override the Bedrock runtime endpoint (VPC endpoints, testing). Rarely needed."
+        },
+        "auth": { "$ref": "#/definitions/AwsAuthConfig" }
+      }
+    },
+    "AwsAuthConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "How Ferrox obtains AWS credentials. Omit to use the default credential chain. Set exactly one base source (static keys OR profile); assume_role optionally layers on top. Supply secrets via env-var interpolation (${AWS_SECRET_ACCESS_KEY}).",
+      "properties": {
+        "access_key_id": { "type": "string", "description": "Static access key id. Requires secret_access_key." },
+        "secret_access_key": { "type": "string", "description": "Static secret access key. Requires access_key_id." },
+        "session_token": { "type": "string", "description": "Optional session token for temporary/STS-issued static credentials." },
+        "profile": { "type": "string", "description": "Named profile from ~/.aws (incl. SSO / credential_process). Mutually exclusive with static keys." },
+        "assume_role": { "$ref": "#/definitions/AwsAssumeRoleConfig" }
+      }
+    },
+    "AwsAssumeRoleConfig": {
+      "type": "object",
+      "required": ["role_arn"],
+      "additionalProperties": false,
+      "description": "STS AssumeRole layered on top of the base credential source. Temporary credentials are auto-refreshed.",
+      "properties": {
+        "role_arn": { "type": "string", "description": "ARN of the role to assume, e.g. 'arn:aws:iam::123456789012:role/ferrox'." },
+        "session_name": { "type": "string", "description": "Role session name (defaults to 'ferrox')." },
+        "external_id": { "type": "string", "description": "External ID, when the trust policy requires one." },
+        "duration_secs": { "type": "integer", "minimum": 900, "description": "Session duration in seconds (STS default 3600)." }
       }
     },
     "RoutingStrategy": {

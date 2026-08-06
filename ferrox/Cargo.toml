@@ -80,6 +80,8 @@ sqlx = { version = "0.8", default-features = false, features = [
 # AWS Bedrock
 aws-config = { version = "1", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio", "credentials-process", "sso"] }
 aws-sdk-bedrockruntime = { version = "1", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
+aws-credential-types = { version = "1", features = ["hardcoded-credentials"] }
+aws-smithy-types = "1"
 
 [lints.rust]
 unsafe_code = "forbid"
