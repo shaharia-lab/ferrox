@@ -210,7 +210,7 @@ ferrox/src/
     anthropic.rs      Anthropic Messages API adapter
     openai.rs         OpenAI Chat Completions adapter
     gemini.rs         Gemini generateContent adapter
-    bedrock.rs        AWS Bedrock invoke_model adapter
+    bedrock.rs        AWS Bedrock Converse adapter (all model families)
 
   lb/
     mod.rs            RoutePool, RouteTarget, select_target

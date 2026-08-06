@@ -113,21 +113,25 @@ providers:
       failure_threshold: 3
 ```
 
-For Bedrock, omit `api_key` and set `region`. Credentials come from the AWS credential chain (environment variables, instance role, IRSA).
+For Bedrock, omit `api_key` and configure the `aws` block. With no `aws.auth`,
+credentials come from the AWS default chain (environment variables, `~/.aws` /
+SSO, instance roles, IRSA). See [providers.md](providers.md#aws-bedrock) for the
+static-keys / profile / AssumeRole auth modes.
 
 ```yaml
   - name: bedrock-us
     type: bedrock
-    region: "${AWS_REGION:-us-east-1}"
+    aws:
+      region: "${AWS_REGION:-us-east-1}"
 ```
 
 | Field | Required | Description |
 |---|---|---|
 | `name` | yes | Unique identifier used in model routing |
-| `type` | yes | Provider type: `anthropic`, `openai`, `gemini`, `bedrock` |
+| `type` | yes | Provider type: `anthropic`, `openai`, `gemini`, `bedrock`, `glm` |
 | `api_key` | yes* | API key (*not required for Bedrock) |
 | `base_url` | no | Override the default endpoint. Must include the API version prefix (e.g. `https://api.openai.com/v1`). The adapter appends only `/chat/completions`. |
-| `region` | no | AWS region (Bedrock only) |
+| `aws` | no | AWS config (Bedrock only): `region`, optional `endpoint_url`, and `auth` (static keys / `profile` / `assume_role`). |
 | `timeouts` | no | Per-provider timeout overrides |
 | `retry` | no | Per-provider retry overrides |
 | `circuit_breaker` | no | Per-provider circuit breaker overrides |

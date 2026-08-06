@@ -29,6 +29,31 @@ pub fn is_retryable(e: &ProxyError) -> bool {
     }
 }
 
+/// Determines whether a primary-target failure should degrade to the fallback
+/// chain (and count as a circuit-breaker failure).
+///
+/// This is deliberately broader than [`is_retryable`]: every transient error
+/// that is worth retrying on the *same* target is also worth failing over, but
+/// in addition an upstream **403** triggers failover here while staying
+/// non-retryable above.
+///
+/// Why 403: some providers report plan/quota exhaustion with 403 rather than
+/// 429 (e.g. Moonshot Kimi's `access_terminated_error` when a coding-plan
+/// billing cycle is used up). Retrying the *same* provider is pointless — it
+/// will keep returning 403 — so [`is_retryable`] leaves it alone and we avoid
+/// wasting backoff sleeps on a provider we know is exhausted. But we DO want to
+/// serve the request from the other provider, and we want the repeated 403s to
+/// trip the circuit breaker so subsequent requests skip the dead provider
+/// entirely until it recovers.
+///
+/// This matches on the UPSTREAM provider's status (`ProviderError`). The
+/// gateway's own auth rejection is `ProxyError::Forbidden`, which must NOT
+/// trigger failover — a client's bad virtual key should fail closed, not burn
+/// the fallback provider's quota.
+pub fn should_failover(e: &ProxyError) -> bool {
+    is_retryable(e) || matches!(e, ProxyError::ProviderError { status: 403, .. })
+}
+
 /// Execute an async operation with retries on the **same target**.
 ///
 /// `provider` and `model_alias` are used for the `ferrox_retries_total` metric.
@@ -203,12 +228,71 @@ mod tests {
     }
 
     #[test]
-    fn provider_4xx_non_429_is_not_retryable() {
+    fn provider_403_is_not_retryable_on_same_target() {
+        // Retrying an exhausted provider is pointless — it keeps returning 403.
         assert!(!is_retryable(&ProxyError::ProviderError {
             provider: "p".into(),
-            status: 400,
-            message: "bad req".into(),
+            status: 403,
+            message: "access_terminated_error".into(),
         }));
+    }
+
+    #[test]
+    fn provider_4xx_non_retryable_status_is_not_retryable() {
+        for status in [400, 404, 422] {
+            assert!(!is_retryable(&ProxyError::ProviderError {
+                provider: "p".into(),
+                status,
+                message: "client error".into(),
+            }));
+        }
+    }
+
+    // ── should_failover ────────────────────────────────────────────────────────
+
+    #[test]
+    fn provider_403_triggers_failover() {
+        // Plan/quota exhaustion reported as 403 (e.g. Kimi's
+        // access_terminated_error) must degrade to the fallback provider and
+        // count toward the circuit breaker.
+        assert!(should_failover(&ProxyError::ProviderError {
+            provider: "p".into(),
+            status: 403,
+            message: "access_terminated_error".into(),
+        }));
+    }
+
+    #[test]
+    fn gateway_forbidden_does_not_trigger_failover() {
+        // The gateway's own auth rejection (bad virtual key) must fail closed,
+        // never burn the fallback provider's quota.
+        assert!(!should_failover(&ProxyError::Forbidden("bad key".into())));
+    }
+
+    #[test]
+    fn retryable_errors_also_trigger_failover() {
+        assert!(should_failover(&ProxyError::UpstreamTimeout("t".into())));
+        assert!(should_failover(&ProxyError::ProviderError {
+            provider: "p".into(),
+            status: 503,
+            message: "down".into(),
+        }));
+        assert!(should_failover(&ProxyError::ProviderError {
+            provider: "p".into(),
+            status: 429,
+            message: "rate".into(),
+        }));
+    }
+
+    #[test]
+    fn provider_4xx_non_403_does_not_trigger_failover() {
+        for status in [400, 401, 404, 422] {
+            assert!(!should_failover(&ProxyError::ProviderError {
+                provider: "p".into(),
+                status,
+                message: "client error".into(),
+            }));
+        }
     }
 
     #[test]

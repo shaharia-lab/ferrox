@@ -14,7 +14,7 @@ use crate::error::ProxyError;
 use crate::event_dispatcher::TokenUsageEvent;
 use crate::lb::{RoutePool, RouteTarget};
 use crate::providers::ProviderStream;
-use crate::retry::{execute_with_retry, is_retryable};
+use crate::retry::{execute_with_retry, should_failover};
 use crate::state::AppState;
 use crate::telemetry::metrics::{
     self, ACTIVE_STREAMS, ERRORS_TOTAL, FALLBACK_TOTAL, REQUESTS_TOTAL, REQUEST_DURATION_SECONDS,
@@ -366,7 +366,7 @@ pub(crate) async fn dispatch_non_stream(
                 target.circuit_breaker.record_success();
                 return Ok((resp, provider_name, model_id));
             }
-            Err(e) if is_retryable(&e) => {
+            Err(e) if should_failover(&e) => {
                 target.circuit_breaker.record_failure();
                 tracing::warn!(
                     provider = %provider_name,
@@ -447,7 +447,7 @@ pub(crate) async fn dispatch_stream(
                 target.circuit_breaker.record_success();
                 return Ok((stream, provider_name, model_id));
             }
-            Err(e) if is_retryable(&e) => {
+            Err(e) if should_failover(&e) => {
                 target.circuit_breaker.record_failure();
                 tracing::warn!(
                     provider = %provider_name,
