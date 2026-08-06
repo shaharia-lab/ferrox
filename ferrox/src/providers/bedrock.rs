@@ -493,6 +493,12 @@ fn build_tool_config(
     if tools.is_empty() {
         return Ok(None);
     }
+    // OpenAI `tool_choice: "none"` means the model must not call a tool. Converse
+    // has no "none", so omit the whole toolConfig: with no tools advertised the
+    // model can't call one, which is the faithful behaviour for this turn.
+    if req.tool_choice.as_ref().and_then(|v| v.as_str()) == Some("none") {
+        return Ok(None);
+    }
 
     let mut tc = ToolConfiguration::builder();
     for t in tools {
@@ -850,6 +856,21 @@ mod tests {
         .expect("tool config present");
         assert_eq!(cfg.tools().len(), 1);
         assert!(matches!(cfg.tool_choice(), Some(ToolChoice::Any(_))));
+    }
+
+    #[test]
+    fn tool_choice_none_omits_tool_config() {
+        // "none" must suppress tool use — no toolConfig is sent at all.
+        let cfg = build_tool_config(
+            &req(
+                vec![text_msg("user", "hi")],
+                true,
+                Some(serde_json::json!("none")),
+            ),
+            "claude",
+        )
+        .unwrap();
+        assert!(cfg.is_none(), "tool_choice=none drops the tool config");
     }
 
     #[test]
