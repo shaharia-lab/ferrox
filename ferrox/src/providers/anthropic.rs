@@ -503,6 +503,12 @@ enum AnthropicResponseContent {
 struct AnthropicUsage {
     input_tokens: u32,
     output_tokens: u32,
+    /// Prompt-cache counters. Absent on upstreams that do not support caching,
+    /// so both are optional and default to `None`.
+    #[serde(default)]
+    cache_creation_input_tokens: Option<u32>,
+    #[serde(default)]
+    cache_read_input_tokens: Option<u32>,
 }
 
 fn anthropic_to_openai_response(resp: AnthropicResponse, model_id: &str) -> ChatCompletionResponse {
@@ -566,7 +572,10 @@ fn anthropic_to_openai_response(resp: AnthropicResponse, model_id: &str) -> Chat
         prompt_tokens: u.input_tokens,
         completion_tokens: u.output_tokens,
         total_tokens: u.input_tokens + u.output_tokens,
-        extra: Default::default(),
+        extra: crate::types::cache_usage_extra(
+            u.cache_creation_input_tokens,
+            u.cache_read_input_tokens,
+        ),
     });
 
     ChatCompletionResponse {
@@ -644,6 +653,47 @@ mod tests {
         assert!(
             matches!(&msg.content, Some(crate::types::MessageContent::Text(t)) if t == "answer")
         );
+    }
+
+    #[test]
+    fn cache_counters_land_in_usage_extra() {
+        let json = r#"{"id":"m","model":"glm","content":[{"type":"text","text":"hi"}],"stop_reason":"end_turn","usage":{"input_tokens":47,"output_tokens":2,"cache_creation_input_tokens":100,"cache_read_input_tokens":3968}}"#;
+        let resp: AnthropicResponse = serde_json::from_str(json).unwrap();
+        let out = anthropic_to_openai_response(resp, "glm");
+        let usage = out.usage.expect("usage must be present");
+        assert_eq!(usage.prompt_tokens, 47);
+        assert_eq!(usage.extra["cache_read_input_tokens"], 3968);
+        assert_eq!(usage.extra["cache_creation_input_tokens"], 100);
+        // OpenAI-canonical view of the same cache reads.
+        assert_eq!(usage.extra["prompt_tokens_details"]["cached_tokens"], 3968);
+    }
+
+    #[test]
+    fn absent_cache_counters_leave_usage_extra_empty() {
+        // A non-caching upstream must serialize exactly as it did before cache
+        // support existed — no null or zero-valued keys.
+        let json = r#"{"id":"m","model":"glm","content":[{"type":"text","text":"hi"}],"stop_reason":"end_turn","usage":{"input_tokens":5,"output_tokens":3}}"#;
+        let resp: AnthropicResponse = serde_json::from_str(json).unwrap();
+        let out = anthropic_to_openai_response(resp, "glm");
+        let usage = out.usage.expect("usage must be present");
+        assert!(
+            usage.extra.is_empty(),
+            "no cache fields upstream must mean no extra keys: {:?}",
+            usage.extra
+        );
+        assert_eq!(
+            serde_json::to_string(&usage).unwrap(),
+            r#"{"prompt_tokens":5,"completion_tokens":3,"total_tokens":8}"#
+        );
+    }
+
+    #[test]
+    fn cache_read_only_omits_creation_key() {
+        let json = r#"{"id":"m","model":"glm","content":[{"type":"text","text":"hi"}],"stop_reason":"end_turn","usage":{"input_tokens":47,"output_tokens":2,"cache_read_input_tokens":3968}}"#;
+        let resp: AnthropicResponse = serde_json::from_str(json).unwrap();
+        let usage = anthropic_to_openai_response(resp, "glm").usage.unwrap();
+        assert_eq!(usage.extra["cache_read_input_tokens"], 3968);
+        assert!(!usage.extra.contains_key("cache_creation_input_tokens"));
     }
 
     #[test]

@@ -25,6 +25,10 @@ pub struct AnthropicEventProcessor {
     /// `input_tokens: 0` in `message_start` and the real count in the trailing
     /// `message_delta`, which takes precedence when non-zero.
     input_tokens: u32,
+    /// Prompt-cache counters captured at `message_start`. Like `input_tokens`,
+    /// a value present on the trailing `message_delta` takes precedence.
+    cache_creation_input_tokens: Option<u32>,
+    cache_read_input_tokens: Option<u32>,
 }
 
 impl AnthropicEventProcessor {
@@ -37,6 +41,8 @@ impl AnthropicEventProcessor {
             stop_reason: None,
             usage: None,
             input_tokens: 0,
+            cache_creation_input_tokens: None,
+            cache_read_input_tokens: None,
         }
     }
 
@@ -72,6 +78,12 @@ impl AnthropicEventProcessor {
                 {
                     self.input_tokens = input as u32;
                 }
+                // api.anthropic.com reports the cache counters here; Z.AI/GLM
+                // report them on the trailing `message_delta` instead.
+                self.cache_creation_input_tokens =
+                    read_u32(&v, "/message/usage/cache_creation_input_tokens");
+                self.cache_read_input_tokens =
+                    read_u32(&v, "/message/usage/cache_read_input_tokens");
             }
             "content_block_start" => {
                 if v.pointer("/content_block/type").and_then(|t| t.as_str()) == Some("tool_use") {
@@ -160,7 +172,7 @@ impl AnthropicEventProcessor {
                     .pointer("/delta/stop_reason")
                     .and_then(|r| r.as_str())
                     .map(map_stop_reason);
-                self.usage = parse_usage_from_message_delta(&v, self.input_tokens);
+                self.usage = self.usage_from_message_delta(&v);
             }
             "message_stop" => {
                 results.push(Ok(make_final_chunk(
@@ -187,6 +199,29 @@ impl AnthropicEventProcessor {
 
         results
     }
+
+    /// Build the final usage from the trailing `message_delta`.
+    ///
+    /// Values captured at `message_start` are the fallback; anything the delta
+    /// itself reports wins, because some Anthropic-protocol upstreams (Z.AI/GLM)
+    /// only populate usage there. Counters are never summed across the two
+    /// events — whichever source is authoritative is used whole.
+    fn usage_from_message_delta(&self, v: &Value) -> Option<Usage> {
+        let output = v.pointer("/usage/output_tokens").and_then(|t| t.as_u64())? as u32;
+        let input = read_u32(v, "/usage/input_tokens")
+            .filter(|&t| t > 0)
+            .unwrap_or(self.input_tokens);
+        let cache_creation =
+            read_u32(v, "/usage/cache_creation_input_tokens").or(self.cache_creation_input_tokens);
+        let cache_read =
+            read_u32(v, "/usage/cache_read_input_tokens").or(self.cache_read_input_tokens);
+        Some(Usage {
+            prompt_tokens: input,
+            completion_tokens: output,
+            total_tokens: input + output,
+            extra: crate::types::cache_usage_extra(cache_creation, cache_read),
+        })
+    }
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -201,26 +236,11 @@ pub fn map_stop_reason(r: &str) -> String {
     }
 }
 
-/// Build the final usage from the trailing `message_delta`.
-///
-/// `input_tokens` is the value captured at `message_start`. A non-zero
-/// `usage.input_tokens` on the delta itself wins — some Anthropic-protocol
-/// upstreams (Z.AI/GLM) only report prompt tokens there. The two values are
-/// never summed: whichever is authoritative is used whole.
-fn parse_usage_from_message_delta(v: &Value, input_tokens: u32) -> Option<Usage> {
-    let output = v.pointer("/usage/output_tokens").and_then(|t| t.as_u64())? as u32;
-    let input = v
-        .pointer("/usage/input_tokens")
+/// Read an unsigned token count at `pointer`, if present.
+fn read_u32(v: &Value, pointer: &str) -> Option<u32> {
+    v.pointer(pointer)
         .and_then(|t| t.as_u64())
         .map(|t| t as u32)
-        .filter(|&t| t > 0)
-        .unwrap_or(input_tokens);
-    Some(Usage {
-        prompt_tokens: input,
-        completion_tokens: output,
-        total_tokens: input + output,
-        extra: Default::default(),
-    })
 }
 
 pub fn make_text_chunk(id: &str, model: &str, text: String) -> ChatCompletionChunk {
@@ -523,6 +543,64 @@ mod tests {
         );
         assert_eq!(usage.completion_tokens, 7);
         assert_eq!(usage.total_tokens, 130);
+    }
+
+    #[test]
+    fn cache_counters_from_message_start_only() {
+        // api.anthropic.com shape: cache counters arrive with message_start.
+        let mut p = make_processor();
+        let start = r#"{"type":"message_start","message":{"id":"m","usage":{"input_tokens":47,"cache_creation_input_tokens":100,"cache_read_input_tokens":3968}}}"#;
+        p.process("message_start", start, "claude-3", "anthropic");
+        let delta = r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":2}}"#;
+        p.process("message_delta", delta, "claude-3", "anthropic");
+        let usage = p.usage.as_ref().unwrap();
+        assert_eq!(usage.prompt_tokens, 47);
+        assert_eq!(usage.extra["cache_read_input_tokens"], 3968);
+        assert_eq!(usage.extra["cache_creation_input_tokens"], 100);
+        assert_eq!(usage.extra["prompt_tokens_details"]["cached_tokens"], 3968);
+    }
+
+    #[test]
+    fn cache_counters_from_message_delta_only() {
+        // Z.AI/GLM shape: message_start is empty, everything lands on the delta.
+        let mut p = make_processor();
+        let start = r#"{"type":"message_start","message":{"id":"m","usage":{"input_tokens":0}}}"#;
+        p.process("message_start", start, "glm-4.5-air", "zai");
+        let delta = r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":47,"output_tokens":2,"cache_read_input_tokens":3968}}"#;
+        p.process("message_delta", delta, "glm-4.5-air", "zai");
+        let usage = p.usage.as_ref().unwrap();
+        assert_eq!(usage.prompt_tokens, 47);
+        assert_eq!(usage.extra["cache_read_input_tokens"], 3968);
+        assert!(!usage.extra.contains_key("cache_creation_input_tokens"));
+    }
+
+    #[test]
+    fn message_delta_cache_counters_win_over_message_start() {
+        let mut p = make_processor();
+        let start = r#"{"type":"message_start","message":{"id":"m","usage":{"input_tokens":47,"cache_read_input_tokens":10}}}"#;
+        p.process("message_start", start, "claude-3", "anthropic");
+        let delta = r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":2,"cache_read_input_tokens":3968}}"#;
+        p.process("message_delta", delta, "claude-3", "anthropic");
+        let usage = p.usage.as_ref().unwrap();
+        assert_eq!(
+            usage.extra["cache_read_input_tokens"], 3968,
+            "the delta's counter must win, never be summed with message_start's"
+        );
+    }
+
+    #[test]
+    fn no_cache_counters_leaves_usage_extra_empty() {
+        let mut p = make_processor();
+        let start = r#"{"type":"message_start","message":{"id":"m","usage":{"input_tokens":123}}}"#;
+        p.process("message_start", start, "claude-3", "anthropic");
+        let delta = r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":7}}"#;
+        p.process("message_delta", delta, "claude-3", "anthropic");
+        let usage = p.usage.as_ref().unwrap();
+        assert!(
+            usage.extra.is_empty(),
+            "a non-caching stream must carry no extra keys: {:?}",
+            usage.extra
+        );
     }
 
     #[test]

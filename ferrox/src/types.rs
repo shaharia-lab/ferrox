@@ -212,6 +212,69 @@ pub struct Usage {
     pub extra: std::collections::HashMap<String, serde_json::Value>,
 }
 
+// ── Prompt-cache token counters carried in `Usage.extra` ─────────────────────
+
+/// Anthropic-native key for tokens written to the prompt cache.
+pub const CACHE_CREATION_INPUT_TOKENS: &str = "cache_creation_input_tokens";
+/// Anthropic-native key for tokens served from the prompt cache.
+pub const CACHE_READ_INPUT_TOKENS: &str = "cache_read_input_tokens";
+/// OpenAI-canonical container for input-token breakdowns.
+pub const PROMPT_TOKENS_DETAILS: &str = "prompt_tokens_details";
+/// OpenAI-canonical key for cache reads, nested under [`PROMPT_TOKENS_DETAILS`].
+pub const CACHED_TOKENS: &str = "cached_tokens";
+
+/// Build the [`Usage::extra`] entries for a pair of prompt-cache counters.
+///
+/// Cache **reads** are represented twice on purpose: once under the
+/// Anthropic-native `cache_read_input_tokens` key and once as OpenAI's
+/// `prompt_tokens_details.cached_tokens`, so both API surfaces report them
+/// without a second translation step. **They are the same tokens — a consumer
+/// must read exactly one of the two and never sum them.** Cache *creation* has
+/// no OpenAI equivalent and is emitted only under its native key.
+///
+/// Returns an empty map when neither counter is present, which keeps the
+/// no-cache path allocation-free (`HashMap::new` does not allocate) and makes
+/// the serialized response byte-identical to one without cache support.
+pub fn cache_usage_extra(
+    creation: Option<u32>,
+    read: Option<u32>,
+) -> HashMap<String, serde_json::Value> {
+    let mut extra = HashMap::new();
+    if let Some(creation) = creation {
+        extra.insert(CACHE_CREATION_INPUT_TOKENS.to_string(), creation.into());
+    }
+    if let Some(read) = read {
+        extra.insert(CACHE_READ_INPUT_TOKENS.to_string(), read.into());
+        extra.insert(
+            PROMPT_TOKENS_DETAILS.to_string(),
+            serde_json::json!({ CACHED_TOKENS: read }),
+        );
+    }
+    extra
+}
+
+/// Recover `(cache_creation, cache_read)` from [`Usage::extra`].
+///
+/// The Anthropic-native keys win; `prompt_tokens_details.cached_tokens` is the
+/// fallback for reads so usage that originated from an OpenAI-format upstream
+/// still round-trips onto the Anthropic surface.
+pub fn cache_tokens_from_extra(
+    extra: &HashMap<String, serde_json::Value>,
+) -> (Option<u32>, Option<u32>) {
+    let as_u32 = |v: &serde_json::Value| v.as_u64().map(|t| t as u32);
+    let creation = extra.get(CACHE_CREATION_INPUT_TOKENS).and_then(as_u32);
+    let read = extra
+        .get(CACHE_READ_INPUT_TOKENS)
+        .and_then(as_u32)
+        .or_else(|| {
+            extra
+                .get(PROMPT_TOKENS_DETAILS)
+                .and_then(|d| d.get(CACHED_TOKENS))
+                .and_then(as_u32)
+        });
+    (creation, read)
+}
+
 // ── Streaming chunk ──────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

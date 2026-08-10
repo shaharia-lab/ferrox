@@ -159,6 +159,13 @@ pub enum AnthropicResponseContent {
 pub struct AnthropicUsage {
     pub input_tokens: u32,
     pub output_tokens: u32,
+    /// Prompt-cache counters, omitted entirely when the upstream did not report
+    /// them so a non-caching response stays byte-identical to one from before
+    /// cache support existed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_creation_input_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_read_input_tokens: Option<u32>,
 }
 
 // ── Models list response ─────────────────────────────────────────────────────
@@ -581,6 +588,12 @@ pub fn to_anthropic_response(resp: ChatCompletionResponse) -> AnthropicMessagesR
 
     let id = format!("msg_{}", resp.id.trim_start_matches("chatcmpl-"));
 
+    let (cache_creation, cache_read) = resp
+        .usage
+        .as_ref()
+        .map(|u| crate::types::cache_tokens_from_extra(&u.extra))
+        .unwrap_or((None, None));
+
     AnthropicMessagesResponse {
         id,
         response_type: "message".to_string(),
@@ -596,6 +609,8 @@ pub fn to_anthropic_response(resp: ChatCompletionResponse) -> AnthropicMessagesR
                 .as_ref()
                 .map(|u| u.completion_tokens)
                 .unwrap_or(0),
+            cache_creation_input_tokens: cache_creation,
+            cache_read_input_tokens: cache_read,
         },
     }
 }
@@ -626,6 +641,10 @@ struct StreamState {
     /// chunk's usage (via `stream_options.include_usage`), so we capture it
     /// whenever a chunk carries usage and emit it in `message_delta`.
     input_tokens: u32,
+    /// Prompt-cache counters recovered from the chunk usage's `extra`, emitted
+    /// alongside `input_tokens` in `message_delta` when present.
+    cache_creation_input_tokens: Option<u32>,
+    cache_read_input_tokens: Option<u32>,
     stop_reason: String,
     stream_done: bool,
     /// Whether the text content_block (index 0) has been opened.
@@ -673,6 +692,8 @@ pub fn openai_stream_to_anthropic_sse(
         pending: VecDeque::new(),
         output_tokens: 0,
         input_tokens: 0,
+        cache_creation_input_tokens: None,
+        cache_read_input_tokens: None,
         stop_reason: "end_turn".to_string(),
         stream_done: false,
         text_block_started: false,
@@ -726,6 +747,8 @@ pub fn openai_stream_to_anthropic_sse(
                         &s.stop_reason,
                         s.input_tokens,
                         s.output_tokens,
+                        s.cache_creation_input_tokens,
+                        s.cache_read_input_tokens,
                     )));
                     s.pending.push_back(Ok(make_message_stop_event()));
                     // Loop back to drain pending
@@ -744,6 +767,10 @@ pub fn openai_stream_to_anthropic_sse(
                         if usage.prompt_tokens > 0 {
                             s.input_tokens = usage.prompt_tokens;
                         }
+                        let (creation, read) = crate::types::cache_tokens_from_extra(&usage.extra);
+                        // Keep the last chunk that actually reported each counter.
+                        s.cache_creation_input_tokens = creation.or(s.cache_creation_input_tokens);
+                        s.cache_read_input_tokens = read.or(s.cache_read_input_tokens);
                     }
                     if let Some(choice) = chunk.choices.first() {
                         if let Some(reason) = &choice.finish_reason {
@@ -995,16 +1022,36 @@ fn make_content_block_stop_event(index: u32) -> Event {
         .data(serde_json::json!({"type": "content_block_stop", "index": index}).to_string())
 }
 
-fn make_message_delta_event(stop_reason: &str, input_tokens: u32, output_tokens: u32) -> Event {
+fn make_message_delta_event(
+    stop_reason: &str,
+    input_tokens: u32,
+    output_tokens: u32,
+    cache_creation_input_tokens: Option<u32>,
+    cache_read_input_tokens: Option<u32>,
+) -> Event {
     // Anthropic clients read the authoritative `input_tokens` from `message_delta`
     // (message_start only carries a placeholder), so surface it here.
+    let mut usage = serde_json::json!({
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+    });
+    // Only present when the upstream reported them, so a non-caching stream is
+    // byte-identical to one from before cache support existed.
+    if let Some(map) = usage.as_object_mut() {
+        if let Some(creation) = cache_creation_input_tokens {
+            map.insert("cache_creation_input_tokens".to_string(), creation.into());
+        }
+        if let Some(read) = cache_read_input_tokens {
+            map.insert("cache_read_input_tokens".to_string(), read.into());
+        }
+    }
     let data = serde_json::json!({
         "type": "message_delta",
         "delta": {
             "stop_reason": stop_reason,
             "stop_sequence": null
         },
-        "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens}
+        "usage": usage
     });
     Event::default()
         .event("message_delta")
@@ -2155,6 +2202,103 @@ mod tests {
             "message_delta must carry input_tokens: {dump}"
         );
         assert!(dump.contains(r#"output_tokens\":45"#));
+    }
+
+    #[tokio::test]
+    async fn message_delta_includes_cache_counters_from_usage_extra() {
+        let mut usage_chunk = make_chunk(None, Some("stop"));
+        usage_chunk.usage = Some(crate::types::Usage {
+            prompt_tokens: 47,
+            completion_tokens: 2,
+            total_tokens: 49,
+            extra: crate::types::cache_usage_extra(Some(100), Some(3968)),
+        });
+        let chunks: Vec<Result<ChatCompletionChunk, ProxyError>> = vec![Ok(usage_chunk)];
+        let inner: ProviderStream = Box::pin(futures::stream::iter(chunks));
+
+        let events: Vec<_> =
+            openai_stream_to_anthropic_sse("m".to_string(), "msg_c".to_string(), inner)
+                .collect()
+                .await;
+        let dump = events
+            .iter()
+            .map(|e| format!("{:?}", e.as_ref().unwrap()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            dump.contains(r#"cache_read_input_tokens\":3968"#),
+            "message_delta must carry cache_read_input_tokens: {dump}"
+        );
+        assert!(
+            dump.contains(r#"cache_creation_input_tokens\":100"#),
+            "message_delta must carry cache_creation_input_tokens: {dump}"
+        );
+    }
+
+    #[tokio::test]
+    async fn message_delta_omits_cache_counters_when_absent() {
+        let mut usage_chunk = make_chunk(None, Some("stop"));
+        usage_chunk.usage = Some(crate::types::Usage {
+            prompt_tokens: 123,
+            completion_tokens: 45,
+            total_tokens: 168,
+            extra: Default::default(),
+        });
+        let chunks: Vec<Result<ChatCompletionChunk, ProxyError>> = vec![Ok(usage_chunk)];
+        let inner: ProviderStream = Box::pin(futures::stream::iter(chunks));
+
+        let events: Vec<_> =
+            openai_stream_to_anthropic_sse("m".to_string(), "msg_n".to_string(), inner)
+                .collect()
+                .await;
+        let dump = events
+            .iter()
+            .map(|e| format!("{:?}", e.as_ref().unwrap()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !dump.contains("cache_read_input_tokens") && !dump.contains("cache_creation"),
+            "a non-caching stream must emit no cache keys: {dump}"
+        );
+    }
+
+    #[test]
+    fn response_usage_round_trips_cache_counters() {
+        let mut resp = make_openai_response("x", "stop");
+        resp.usage.as_mut().unwrap().extra = crate::types::cache_usage_extra(Some(100), Some(3968));
+        let r = to_anthropic_response(resp);
+        assert_eq!(r.usage.cache_read_input_tokens, Some(3968));
+        assert_eq!(r.usage.cache_creation_input_tokens, Some(100));
+        let json = serde_json::to_string(&r.usage).unwrap();
+        assert!(json.contains(r#""cache_read_input_tokens":3968"#), "{json}");
+        assert!(
+            json.contains(r#""cache_creation_input_tokens":100"#),
+            "{json}"
+        );
+    }
+
+    #[test]
+    fn response_usage_round_trips_openai_cached_tokens() {
+        // Usage that only speaks OpenAI (prompt_tokens_details.cached_tokens)
+        // must still surface on the Anthropic-native surface.
+        let mut resp = make_openai_response("x", "stop");
+        resp.usage.as_mut().unwrap().extra = std::collections::HashMap::from([(
+            "prompt_tokens_details".to_string(),
+            serde_json::json!({"cached_tokens": 512}),
+        )]);
+        let r = to_anthropic_response(resp);
+        assert_eq!(r.usage.cache_read_input_tokens, Some(512));
+        assert_eq!(r.usage.cache_creation_input_tokens, None);
+    }
+
+    #[test]
+    fn response_usage_without_cache_serializes_unchanged() {
+        // Byte-identical to the pre-cache-support wire format.
+        let r = to_anthropic_response(make_openai_response("x", "stop"));
+        assert_eq!(
+            serde_json::to_string(&r.usage).unwrap(),
+            r#"{"input_tokens":10,"output_tokens":5}"#
+        );
     }
 
     #[tokio::test]
