@@ -14,11 +14,12 @@
 use async_trait::async_trait;
 use aws_config::Region;
 use aws_sdk_bedrockruntime::types::{
-    AnyToolChoice, AutoToolChoice, ContentBlock, ContentBlockDelta, ContentBlockStart,
-    ConversationRole, ConverseOutput, ConverseStreamOutput, ImageBlock, ImageFormat, ImageSource,
-    InferenceConfiguration, Message, ReasoningContentBlockDelta, SpecificToolChoice, StopReason,
-    SystemContentBlock, TokenUsage, Tool, ToolChoice, ToolConfiguration, ToolInputSchema,
-    ToolResultBlock, ToolResultContentBlock, ToolSpecification, ToolUseBlock,
+    AnyToolChoice, AutoToolChoice, CachePointBlock, CachePointType, ContentBlock,
+    ContentBlockDelta, ContentBlockStart, ConversationRole, ConverseOutput, ConverseStreamOutput,
+    ImageBlock, ImageFormat, ImageSource, InferenceConfiguration, Message,
+    ReasoningContentBlockDelta, SpecificToolChoice, StopReason, SystemContentBlock, TokenUsage,
+    Tool, ToolChoice, ToolConfiguration, ToolInputSchema, ToolResultBlock, ToolResultContentBlock,
+    ToolSpecification, ToolUseBlock,
 };
 use aws_smithy_types::{Blob, Document, Number};
 use serde_json::Value;
@@ -283,12 +284,116 @@ fn build_converse_request(
     req: &ChatCompletionRequest,
     model_id: &str,
 ) -> Result<ConverseRequest, ProxyError> {
+    let mut system = build_system(req);
+    let mut entries = build_message_entries(req)?;
+    apply_cache_point_policy(&mut system, &mut entries, model_id);
+
+    let messages = entries
+        .into_iter()
+        .map(|(role, blocks)| {
+            Message::builder()
+                .role(role)
+                .set_content(Some(blocks))
+                .build()
+                .map_err(build_err)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
     Ok(ConverseRequest {
-        system: build_system(req),
-        messages: build_messages(req)?,
+        system,
+        messages,
         inference: Some(build_inference(req, model_id)),
         tools: build_tool_config(req, model_id)?,
     })
+}
+
+// ── Prompt caching (`cachePoint`) ────────────────────────────────────────────
+
+/// Bedrock accepts at most this many cache points per request.
+const MAX_CACHE_POINTS: usize = 4;
+
+/// A `cachePoint` block. The only required field is the type, which is always
+/// set here, so construction cannot fail.
+fn cache_point() -> CachePointBlock {
+    CachePointBlock::builder()
+        .r#type(CachePointType::Default)
+        .build()
+        .expect("CachePointBlock requires only `type`, which is set above")
+}
+
+/// Whether this model family accepts `cachePoint` blocks.
+///
+/// An **allowlist**, deliberately: a family that does not support caching
+/// rejects the block outright, turning a would-be optimisation into a hard
+/// request failure. An unrecognised model must therefore default to *not*
+/// sending one.
+fn supports_cache_points(model_id: &str) -> bool {
+    let id = model_id.to_ascii_lowercase();
+    id.contains("anthropic.claude") || id.contains("amazon.nova")
+}
+
+/// Enforce the capability gate and the 4-point cap across the whole request.
+///
+/// When more than four breakpoints are requested the **last** four are kept:
+/// caching is prefix-based, so a later breakpoint covers everything an earlier
+/// one would have, and is strictly more valuable.
+fn apply_cache_point_policy(
+    system: &mut Vec<SystemContentBlock>,
+    entries: &mut [(ConversationRole, Vec<ContentBlock>)],
+    model_id: &str,
+) {
+    let total = system
+        .iter()
+        .filter(|b| matches!(b, SystemContentBlock::CachePoint(_)))
+        .count()
+        + entries
+            .iter()
+            .flat_map(|(_, blocks)| blocks.iter())
+            .filter(|b| matches!(b, ContentBlock::CachePoint(_)))
+            .count();
+
+    if total == 0 {
+        return;
+    }
+
+    let mut to_drop = if supports_cache_points(model_id) {
+        if total <= MAX_CACHE_POINTS {
+            return;
+        }
+        tracing::debug!(
+            requested = total,
+            kept = MAX_CACHE_POINTS,
+            "more cache points than Bedrock allows; keeping the last {MAX_CACHE_POINTS}"
+        );
+        total - MAX_CACHE_POINTS
+    } else {
+        tracing::debug!(
+            model_id,
+            dropped = total,
+            "model family does not support Bedrock cache points; omitting them"
+        );
+        total
+    };
+
+    // Drop from the front, in request order: system blocks precede messages.
+    system.retain(|b| {
+        if to_drop > 0 && matches!(b, SystemContentBlock::CachePoint(_)) {
+            to_drop -= 1;
+            false
+        } else {
+            true
+        }
+    });
+    for (_, blocks) in entries.iter_mut() {
+        blocks.retain(|b| {
+            if to_drop > 0 && matches!(b, ContentBlock::CachePoint(_)) {
+                to_drop -= 1;
+                false
+            } else {
+                true
+            }
+        });
+    }
 }
 
 /// System prompt(s) → Converse `system` blocks. Both the dedicated `system`
@@ -298,6 +403,15 @@ fn build_system(req: &ChatCompletionRequest) -> Vec<SystemContentBlock> {
     if let Some(s) = &req.system {
         if !s.is_empty() {
             blocks.push(SystemContentBlock::Text(s.clone()));
+            // A breakpoint on the system prompt arrives at request level (the
+            // internal `system` is a flat string) — see `types::
+            // ANTHROPIC_SYSTEM_CACHE_CONTROL`. Terminate the span here.
+            if req
+                .extra
+                .contains_key(crate::types::ANTHROPIC_SYSTEM_CACHE_CONTROL)
+            {
+                blocks.push(SystemContentBlock::CachePoint(cache_point()));
+            }
         }
     }
     for m in &req.messages {
@@ -305,6 +419,9 @@ fn build_system(req: &ChatCompletionRequest) -> Vec<SystemContentBlock> {
             let text = text_of(&m.content);
             if !text.is_empty() {
                 blocks.push(SystemContentBlock::Text(text));
+                if m.extra.contains_key(crate::types::CACHE_CONTROL) {
+                    blocks.push(SystemContentBlock::CachePoint(cache_point()));
+                }
             }
         }
     }
@@ -315,7 +432,10 @@ fn build_system(req: &ChatCompletionRequest) -> Vec<SystemContentBlock> {
 /// user/assistant turns, so adjacent same-role blocks are coalesced into one
 /// message. `role: "tool"` results become a `toolResult` block on a **user**
 /// turn; assistant `tool_calls` become `toolUse` blocks.
-fn build_messages(req: &ChatCompletionRequest) -> Result<Vec<Message>, ProxyError> {
+#[allow(clippy::type_complexity)]
+fn build_message_entries(
+    req: &ChatCompletionRequest,
+) -> Result<Vec<(ConversationRole, Vec<ContentBlock>)>, ProxyError> {
     // (role, blocks) entries, coalescing adjacent same-role entries.
     let mut entries: Vec<(ConversationRole, Vec<ContentBlock>)> = Vec::new();
     let mut push = |role: ConversationRole, blocks: Vec<ContentBlock>| {
@@ -374,16 +494,7 @@ fn build_messages(req: &ChatCompletionRequest) -> Result<Vec<Message>, ProxyErro
         }
     }
 
-    entries
-        .into_iter()
-        .map(|(role, blocks)| {
-            Message::builder()
-                .role(role)
-                .set_content(Some(blocks))
-                .build()
-                .map_err(build_err)
-        })
-        .collect()
+    Ok(entries)
 }
 
 /// A user message's content → Converse content blocks (text + images).
@@ -398,12 +509,24 @@ fn user_content_blocks(content: &Option<MessageContent>) -> Vec<ContentBlock> {
         }
         Some(MessageContent::Parts(parts)) => parts
             .iter()
-            .filter_map(|p| match p {
-                ContentPart::Text { text, .. } if !text.is_empty() => {
-                    Some(ContentBlock::Text(text.clone()))
-                }
-                ContentPart::Text { .. } => None,
-                ContentPart::ImageUrl { image_url, .. } => image_block(&image_url.url),
+            .flat_map(|p| {
+                // A cache point terminates the span it applies to, so it is
+                // emitted immediately *after* the block carrying the breakpoint.
+                let (block, extra) = match p {
+                    ContentPart::Text { text, extra } if !text.is_empty() => {
+                        (Some(ContentBlock::Text(text.clone())), extra)
+                    }
+                    ContentPart::Text { extra, .. } => (None, extra),
+                    ContentPart::ImageUrl { image_url, extra } => {
+                        (image_block(&image_url.url), extra)
+                    }
+                };
+                // A breakpoint only means anything if a block was actually
+                // emitted for it to terminate.
+                let breakpoint = block.is_some() && extra.contains_key(crate::types::CACHE_CONTROL);
+                block
+                    .into_iter()
+                    .chain(breakpoint.then(|| ContentBlock::CachePoint(cache_point())))
             })
             .collect(),
         None => Vec::new(),
@@ -633,11 +756,16 @@ fn map_stop_reason(reason: &StopReason) -> String {
 fn convert_usage(u: &TokenUsage) -> Usage {
     let prompt = u.input_tokens().max(0) as u32;
     let completion = u.output_tokens().max(0) as u32;
+    // Bedrock names them cacheRead/cacheWrite; they carry the same meaning as
+    // Anthropic's cache_read/cache_creation and must land in the same
+    // `Usage.extra` shape, or the observability layer would have two sources.
+    let cache_read = u.cache_read_input_tokens().map(|t| t.max(0) as u32);
+    let cache_write = u.cache_write_input_tokens().map(|t| t.max(0) as u32);
     Usage {
         prompt_tokens: prompt,
         completion_tokens: completion,
         total_tokens: prompt + completion,
-        extra: Default::default(),
+        extra: crate::types::cache_usage_extra(cache_write, cache_read),
     }
 }
 
@@ -726,6 +854,21 @@ fn text_of(content: &Option<MessageContent>) -> String {
 mod tests {
     use super::*;
     use crate::types::{ContentPart, ImageUrl, Tool, ToolFunction};
+
+    /// Entries → `Message`s, mirroring what `build_converse_request` does, so
+    /// message-shape tests can assert on the built SDK type.
+    fn build_messages(req: &ChatCompletionRequest) -> Result<Vec<Message>, ProxyError> {
+        Ok(build_message_entries(req)?
+            .into_iter()
+            .map(|(role, blocks)| {
+                Message::builder()
+                    .role(role)
+                    .set_content(Some(blocks))
+                    .build()
+                    .expect("role and content are set")
+            })
+            .collect())
+    }
 
     fn req(
         messages: Vec<ChatMessage>,
@@ -1025,5 +1168,211 @@ mod tests {
         assert_eq!(got.prompt_tokens, 5);
         assert_eq!(got.completion_tokens, 3);
         assert_eq!(got.total_tokens, 8);
+        assert!(
+            got.extra.is_empty(),
+            "no cache fields upstream must mean no extra keys: {:?}",
+            got.extra
+        );
+    }
+
+    // ── Prompt caching: read side ────────────────────────────────────────────
+
+    #[test]
+    fn usage_conversion_surfaces_cache_counters() {
+        let u = TokenUsage::builder()
+            .input_tokens(47)
+            .output_tokens(2)
+            .total_tokens(49)
+            .cache_read_input_tokens(3968)
+            .cache_write_input_tokens(100)
+            .build()
+            .unwrap();
+        let got = convert_usage(&u);
+        // Same key shape as the Anthropic adapter (#125), so the observability
+        // layer has exactly one representation to read.
+        assert_eq!(got.extra["cache_read_input_tokens"], 3968);
+        assert_eq!(got.extra["cache_creation_input_tokens"], 100);
+        assert_eq!(got.extra["prompt_tokens_details"]["cached_tokens"], 3968);
+    }
+
+    // ── Prompt caching: write side ───────────────────────────────────────────
+
+    fn ephemeral() -> std::collections::HashMap<String, Value> {
+        std::collections::HashMap::from([(
+            "cache_control".to_string(),
+            serde_json::json!({"type": "ephemeral"}),
+        )])
+    }
+
+    /// A user message whose Nth text part carries a breakpoint.
+    fn msg_with_breakpoints(texts: &[(&str, bool)]) -> ChatMessage {
+        ChatMessage {
+            role: "user".into(),
+            content: Some(MessageContent::Parts(
+                texts
+                    .iter()
+                    .map(|(t, cached)| ContentPart::Text {
+                        text: (*t).into(),
+                        extra: if *cached {
+                            ephemeral()
+                        } else {
+                            Default::default()
+                        },
+                    })
+                    .collect(),
+            )),
+            name: None,
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+            extra: Default::default(),
+        }
+    }
+
+    fn count_cache_points(built: &ConverseRequest) -> usize {
+        built
+            .system
+            .iter()
+            .filter(|b| matches!(b, SystemContentBlock::CachePoint(_)))
+            .count()
+            + built
+                .messages
+                .iter()
+                .flat_map(|m| m.content().iter())
+                .filter(|b| matches!(b, ContentBlock::CachePoint(_)))
+                .count()
+    }
+
+    #[test]
+    fn no_breakpoints_emit_no_cache_points() {
+        let built = build_converse_request(
+            &req(vec![text_msg("user", "hello")], false, None),
+            "anthropic.claude-sonnet-4",
+        )
+        .unwrap();
+        assert_eq!(count_cache_points(&built), 0);
+        // Byte-identical to today: a plain text block and nothing else.
+        assert_eq!(built.messages[0].content().len(), 1);
+        assert!(matches!(
+            built.messages[0].content()[0],
+            ContentBlock::Text(_)
+        ));
+    }
+
+    #[test]
+    fn breakpoint_emits_cache_point_after_its_block() {
+        let built = build_converse_request(
+            &req(
+                vec![msg_with_breakpoints(&[("cached", true), ("fresh", false)])],
+                false,
+                None,
+            ),
+            "anthropic.claude-sonnet-4",
+        )
+        .unwrap();
+
+        let blocks = built.messages[0].content();
+        assert_eq!(blocks.len(), 3, "text, cachePoint, text");
+        assert!(matches!(blocks[0], ContentBlock::Text(_)));
+        assert!(
+            matches!(blocks[1], ContentBlock::CachePoint(_)),
+            "cache point must terminate the span it applies to"
+        );
+        assert!(matches!(blocks[2], ContentBlock::Text(_)));
+    }
+
+    #[test]
+    fn system_breakpoint_emits_a_system_cache_point() {
+        let mut r = req(vec![text_msg("user", "hi")], false, None);
+        r.system = Some("You are helpful.".into());
+        r.extra.insert(
+            crate::types::ANTHROPIC_SYSTEM_CACHE_CONTROL.to_string(),
+            serde_json::json!({"type": "ephemeral"}),
+        );
+
+        let built = build_converse_request(&r, "anthropic.claude-sonnet-4").unwrap();
+        assert_eq!(built.system.len(), 2, "text + cachePoint");
+        assert!(matches!(built.system[0], SystemContentBlock::Text(_)));
+        assert!(matches!(built.system[1], SystemContentBlock::CachePoint(_)));
+    }
+
+    #[test]
+    fn more_than_four_breakpoints_keeps_the_last_four() {
+        // Prefix caching makes later breakpoints strictly more valuable.
+        let built = build_converse_request(
+            &req(
+                vec![msg_with_breakpoints(&[
+                    ("a", true),
+                    ("b", true),
+                    ("c", true),
+                    ("d", true),
+                    ("e", true),
+                    ("f", true),
+                ])],
+                false,
+                None,
+            ),
+            "anthropic.claude-sonnet-4",
+        )
+        .unwrap();
+
+        assert_eq!(count_cache_points(&built), MAX_CACHE_POINTS);
+        // The survivors must be the *last* four: the first two texts have no
+        // cache point following them.
+        let blocks = built.messages[0].content();
+        assert!(matches!(blocks[0], ContentBlock::Text(_)));
+        assert!(matches!(blocks[1], ContentBlock::Text(_)));
+        assert!(matches!(blocks[2], ContentBlock::Text(_)));
+        assert!(matches!(blocks[3], ContentBlock::CachePoint(_)));
+    }
+
+    #[test]
+    fn system_cache_point_is_dropped_first_when_over_cap() {
+        // System blocks come first in request order, so they are the earliest
+        // and therefore the least valuable to keep.
+        let mut r = req(
+            vec![msg_with_breakpoints(&[
+                ("a", true),
+                ("b", true),
+                ("c", true),
+                ("d", true),
+            ])],
+            false,
+            None,
+        );
+        r.system = Some("sys".into());
+        r.extra.insert(
+            crate::types::ANTHROPIC_SYSTEM_CACHE_CONTROL.to_string(),
+            serde_json::json!({"type": "ephemeral"}),
+        );
+
+        let built = build_converse_request(&r, "anthropic.claude-sonnet-4").unwrap();
+        assert_eq!(count_cache_points(&built), MAX_CACHE_POINTS);
+        assert_eq!(built.system.len(), 1, "system cache point dropped first");
+        assert!(matches!(built.system[0], SystemContentBlock::Text(_)));
+    }
+
+    #[test]
+    fn unsupported_model_family_emits_no_cache_points() {
+        // Sending a cachePoint to a family that rejects it would turn an
+        // optimisation into a hard 4xx.
+        let built = build_converse_request(
+            &req(vec![msg_with_breakpoints(&[("cached", true)])], false, None),
+            "meta.llama3-70b-instruct-v1:0",
+        )
+        .unwrap();
+        assert_eq!(count_cache_points(&built), 0);
+        assert_eq!(built.messages[0].content().len(), 1, "text only");
+    }
+
+    #[test]
+    fn cache_point_capability_allowlist() {
+        assert!(supports_cache_points("anthropic.claude-sonnet-4-20250514"));
+        assert!(supports_cache_points("us.anthropic.claude-3-5-haiku-v1:0"));
+        assert!(supports_cache_points("amazon.nova-pro-v1:0"));
+        // Unknown families must default to unsupported.
+        assert!(!supports_cache_points("meta.llama3-70b-instruct-v1:0"));
+        assert!(!supports_cache_points("mistral.mistral-large-2407-v1:0"));
+        assert!(!supports_cache_points("some.future-model-v1:0"));
     }
 }
