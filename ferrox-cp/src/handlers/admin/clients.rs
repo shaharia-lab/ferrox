@@ -788,6 +788,8 @@ mod tests {
                 prompt_tokens: 100,
                 completion_tokens: 50,
                 total_tokens: 150,
+                cache_read_tokens: None,
+                cache_write_tokens: None,
                 latency_ms: Some(200),
             })
             .collect();
@@ -899,6 +901,8 @@ mod tests {
                 prompt_tokens: 100,
                 completion_tokens: 50,
                 total_tokens: 150,
+                cache_read_tokens: None,
+                cache_write_tokens: None,
                 latency_ms: Some(200),
             })
             .collect();

@@ -14,6 +14,10 @@ pub struct UsageRecord {
     pub prompt_tokens: i32,
     pub completion_tokens: i32,
     pub total_tokens: i32,
+    /// Prompt-cache counters. `NULL` on rows written before cache accounting
+    /// existed — distinct from a recorded `0` (provider reported no cache use).
+    pub cache_read_tokens: Option<i32>,
+    pub cache_write_tokens: Option<i32>,
     pub latency_ms: Option<i32>,
     pub created_at: DateTime<Utc>,
 }

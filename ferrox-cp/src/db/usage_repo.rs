@@ -39,15 +39,20 @@ impl<'a> UsageRepository<'a> {
         let prompt_tokens: Vec<i32> = records.iter().map(|r| r.prompt_tokens).collect();
         let completion_tokens: Vec<i32> = records.iter().map(|r| r.completion_tokens).collect();
         let total_tokens: Vec<i32> = records.iter().map(|r| r.total_tokens).collect();
+        let cache_read_tokens: Vec<Option<i32>> =
+            records.iter().map(|r| r.cache_read_tokens).collect();
+        let cache_write_tokens: Vec<Option<i32>> =
+            records.iter().map(|r| r.cache_write_tokens).collect();
         let latency_ms: Vec<Option<i32>> = records.iter().map(|r| r.latency_ms).collect();
 
         sqlx::query(
             r#"
             INSERT INTO usage_log
-                (client_id, request_id, model, provider, prompt_tokens, completion_tokens, total_tokens, latency_ms)
+                (client_id, request_id, model, provider, prompt_tokens, completion_tokens, total_tokens,
+                 cache_read_tokens, cache_write_tokens, latency_ms)
             SELECT * FROM UNNEST(
                 $1::uuid[], $2::text[], $3::text[], $4::text[],
-                $5::int[], $6::int[], $7::int[], $8::int[]
+                $5::int[], $6::int[], $7::int[], $8::int[], $9::int[], $10::int[]
             )
             "#,
         )
@@ -58,6 +63,8 @@ impl<'a> UsageRepository<'a> {
         .bind(&prompt_tokens)
         .bind(&completion_tokens)
         .bind(&total_tokens)
+        .bind(&cache_read_tokens)
+        .bind(&cache_write_tokens)
         .bind(&latency_ms)
         .execute(self.db)
         .await
@@ -110,6 +117,7 @@ impl<'a> UsageRepository<'a> {
             r#"
             SELECT id, client_id, request_id, model, provider,
                    prompt_tokens, completion_tokens, total_tokens,
+                   cache_read_tokens, cache_write_tokens,
                    latency_ms, created_at
             FROM usage_log
             WHERE client_id = $1
@@ -145,6 +153,9 @@ pub struct UsageInsert {
     pub prompt_tokens: i32,
     pub completion_tokens: i32,
     pub total_tokens: i32,
+    /// `None` writes SQL `NULL`, meaning "not recorded" rather than "zero".
+    pub cache_read_tokens: Option<i32>,
+    pub cache_write_tokens: Option<i32>,
     pub latency_ms: Option<i32>,
 }
 
@@ -181,6 +192,8 @@ mod tests {
             prompt_tokens: prompt,
             completion_tokens: completion,
             total_tokens: prompt + completion,
+            cache_read_tokens: None,
+            cache_write_tokens: None,
             latency_ms: Some(150),
         }
     }
@@ -201,6 +214,76 @@ mod tests {
         assert_eq!(summary.total_completion_tokens, 150);
         assert_eq!(summary.total_tokens, 450);
         assert_eq!(summary.request_count, 2);
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn insert_batch_round_trips_cache_tokens(pool: sqlx::PgPool) {
+        let cid = create_client(&pool, "cache-tokens").await;
+        let repo = UsageRepository::new(&pool);
+
+        let mut cached = sample_insert(cid, "claude-sonnet", 47, 2);
+        cached.cache_read_tokens = Some(3968);
+        cached.cache_write_tokens = Some(100);
+        // A provider that reports no cache usage records an explicit zero.
+        let mut uncached = sample_insert(cid, "claude-sonnet", 100, 50);
+        uncached.cache_read_tokens = Some(0);
+        uncached.cache_write_tokens = Some(0);
+        // A gateway predating cache accounting records NULL.
+        let legacy = sample_insert(cid, "claude-sonnet", 10, 5);
+
+        repo.insert_batch(&[cached, uncached, legacy])
+            .await
+            .expect("insert ok");
+
+        let rows = repo
+            .list(UsageFilter {
+                client_id: cid,
+                ..Default::default()
+            })
+            .await
+            .expect("list ok");
+        assert_eq!(rows.len(), 3);
+
+        let by_prompt = |p: i32| {
+            rows.iter()
+                .find(|r| r.prompt_tokens == p)
+                .unwrap_or_else(|| panic!("row with prompt_tokens={p}"))
+        };
+        assert_eq!(by_prompt(47).cache_read_tokens, Some(3968));
+        assert_eq!(by_prompt(47).cache_write_tokens, Some(100));
+        assert_eq!(by_prompt(100).cache_read_tokens, Some(0));
+        assert_eq!(
+            by_prompt(10).cache_read_tokens,
+            None,
+            "NULL must stay distinct from a recorded 0"
+        );
+    }
+
+    /// Decided behaviour for a gateway running against an unmigrated database:
+    /// the insert **fails loudly** rather than silently dropping the cache
+    /// columns. The gateway's flush logs the error and drops that batch, so the
+    /// operator sees it; the fix is to deploy the control plane (which applies
+    /// migrations at startup) before the gateway.
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn insert_batch_fails_loudly_on_unmigrated_schema(pool: sqlx::PgPool) {
+        sqlx::query(
+            "ALTER TABLE usage_log DROP COLUMN cache_read_tokens, DROP COLUMN cache_write_tokens",
+        )
+        .execute(&pool)
+        .await
+        .expect("simulate pre-migration schema");
+
+        let cid = create_client(&pool, "unmigrated").await;
+        let repo = UsageRepository::new(&pool);
+
+        let err = repo
+            .insert_batch(&[sample_insert(cid, "gpt-4", 100, 50)])
+            .await
+            .expect_err("insert must fail, not silently succeed");
+        assert!(
+            matches!(err, RepoError::Database(_)),
+            "expected a database error naming the missing column, got {err:?}"
+        );
     }
 
     #[sqlx::test(migrator = "crate::MIGRATOR")]

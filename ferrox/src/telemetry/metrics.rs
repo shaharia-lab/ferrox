@@ -209,12 +209,18 @@ pub fn gather() -> String {
 }
 
 /// Record an observed token usage from a completed request.
+///
+/// `cache_read` / `cache_write` are the prompt-cache counters. They are recorded
+/// only when non-zero, so providers that do not support caching never create the
+/// extra time series — cardinality grows only where there is something to see.
 pub fn record_tokens(
     provider: &str,
     model_alias: &str,
     key_name: &str,
     prompt: u32,
     completion: u32,
+    cache_read: u32,
+    cache_write: u32,
 ) {
     TOKENS_TOTAL
         .with_label_values(&[provider, model_alias, key_name, "prompt"])
@@ -222,4 +228,71 @@ pub fn record_tokens(
     TOKENS_TOTAL
         .with_label_values(&[provider, model_alias, key_name, "completion"])
         .inc_by(completion as f64);
+    if cache_read > 0 {
+        TOKENS_TOTAL
+            .with_label_values(&[provider, model_alias, key_name, "cache_read"])
+            .inc_by(cache_read as f64);
+    }
+    if cache_write > 0 {
+        TOKENS_TOTAL
+            .with_label_values(&[provider, model_alias, key_name, "cache_write"])
+            .inc_by(cache_write as f64);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Current value of a `ferrox_tokens_total` series, or `None` if the series
+    /// does not exist at all. The distinction is the point: a zero-valued series
+    /// is still cardinality we do not want to create.
+    ///
+    /// Reads the encoded exposition text rather than the protobuf structs, so
+    /// this asserts on exactly what a Prometheus scrape would see.
+    fn token_series(provider: &str, token_type: &str) -> Option<f64> {
+        let scrape = gather();
+        scrape
+            .lines()
+            .filter(|l| l.starts_with("ferrox_tokens_total{"))
+            .find(|l| {
+                l.contains(&format!(r#"provider="{provider}""#))
+                    && l.contains(&format!(r#"type="{token_type}""#))
+            })
+            .and_then(|l| l.rsplit(' ').next())
+            .and_then(|v| v.parse().ok())
+    }
+
+    #[test]
+    fn zero_cache_tokens_create_no_series() {
+        // Distinct provider label so this test owns its series regardless of
+        // what else ran in the same process.
+        record_tokens("test-nocache", "alias", "key", 10, 5, 0, 0);
+
+        assert_eq!(token_series("test-nocache", "prompt"), Some(10.0));
+        assert_eq!(token_series("test-nocache", "completion"), Some(5.0));
+        assert_eq!(
+            token_series("test-nocache", "cache_read"),
+            None,
+            "a non-caching provider must not create a cache_read series"
+        );
+        assert_eq!(token_series("test-nocache", "cache_write"), None);
+    }
+
+    #[test]
+    fn non_zero_cache_tokens_increment_their_series() {
+        record_tokens("test-cache", "alias", "key", 47, 2, 3968, 100);
+
+        assert_eq!(token_series("test-cache", "prompt"), Some(47.0));
+        assert_eq!(token_series("test-cache", "cache_read"), Some(3968.0));
+        assert_eq!(token_series("test-cache", "cache_write"), Some(100.0));
+    }
+
+    #[test]
+    fn cache_read_alone_does_not_create_a_write_series() {
+        record_tokens("test-readonly", "alias", "key", 47, 2, 3968, 0);
+
+        assert_eq!(token_series("test-readonly", "cache_read"), Some(3968.0));
+        assert_eq!(token_series("test-readonly", "cache_write"), None);
+    }
 }

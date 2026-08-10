@@ -204,26 +204,37 @@ pub async fn anthropic_messages(
                 let accumulated_prompt = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
                 let accumulated_completion =
                     std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+                let accumulated_cache_read =
+                    std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+                let accumulated_cache_write =
+                    std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
                 let acc_p = accumulated_prompt.clone();
                 let acc_c = accumulated_completion.clone();
+                let acc_cr = accumulated_cache_read.clone();
+                let acc_cw = accumulated_cache_write.clone();
 
                 // Wrap the OpenAI-format stream to capture token usage before
                 // converting to Anthropic SSE format.
                 let metered_stream = stream.map(move |chunk_result| {
                     chunk_result.inspect(|chunk| {
                         if let Some(usage) = &chunk.usage {
+                            let (cache_read, cache_write) = crate::types::cache_tokens(usage);
                             metrics::record_tokens(
                                 &p1,
                                 &a1,
                                 &k1,
                                 usage.prompt_tokens,
                                 usage.completion_tokens,
+                                cache_read,
+                                cache_write,
                             );
                             acc_p.store(usage.prompt_tokens, std::sync::atomic::Ordering::Relaxed);
                             acc_c.store(
                                 usage.completion_tokens,
                                 std::sync::atomic::Ordering::Relaxed,
                             );
+                            acc_cr.store(cache_read, std::sync::atomic::Ordering::Relaxed);
+                            acc_cw.store(cache_write, std::sync::atomic::Ordering::Relaxed);
                         }
                     })
                 });
@@ -272,6 +283,10 @@ pub async fn anthropic_messages(
                     let prompt = accumulated_prompt.load(std::sync::atomic::Ordering::Relaxed);
                     let completion =
                         accumulated_completion.load(std::sync::atomic::Ordering::Relaxed);
+                    let cache_read =
+                        accumulated_cache_read.load(std::sync::atomic::Ordering::Relaxed);
+                    let cache_write =
+                        accumulated_cache_write.load(std::sync::atomic::Ordering::Relaxed);
                     if prompt > 0 || completion > 0 {
                         // Push webhook event (before usage_writer moves the strings)
                         event_dispatcher.dispatch(TokenUsageEvent {
@@ -295,6 +310,8 @@ pub async fn anthropic_messages(
                             provider: stream_provider,
                             prompt_tokens: prompt,
                             completion_tokens: completion,
+                            cache_read_tokens: cache_read,
+                            cache_write_tokens: cache_write,
                             latency_ms: Some((latency * 1000.0) as u64),
                         });
 
@@ -322,6 +339,10 @@ pub async fn anthropic_messages(
                         latency_ms = (latency * 1000.0) as u64,
                         prompt_tokens = prompt,
                         completion_tokens = completion,
+                        // `Option` fields are omitted entirely when `None`, so
+                        // quiet (non-caching) paths stay quiet.
+                        cache_read_tokens = (cache_read > 0).then_some(cache_read),
+                        cache_write_tokens = (cache_write > 0).then_some(cache_write),
                         "anthropic_request_completed"
                     );
                     // Return a silent SSE comment; Anthropic SDK ignores it.
@@ -355,12 +376,15 @@ pub async fn anthropic_messages(
         match result {
             Ok((resp, provider_name, model_id)) => {
                 if let Some(usage) = &resp.usage {
+                    let (cache_read, cache_write) = crate::types::cache_tokens(usage);
                     metrics::record_tokens(
                         &provider_name,
                         &model_alias,
                         &ctx.key_name,
                         usage.prompt_tokens,
                         usage.completion_tokens,
+                        cache_read,
+                        cache_write,
                     );
 
                     state.usage_writer.record(UsageEvent {
@@ -370,6 +394,8 @@ pub async fn anthropic_messages(
                         provider: provider_name.clone(),
                         prompt_tokens: usage.prompt_tokens,
                         completion_tokens: usage.completion_tokens,
+                        cache_read_tokens: cache_read,
+                        cache_write_tokens: cache_write,
                         latency_ms: Some((latency * 1000.0) as u64),
                     });
 

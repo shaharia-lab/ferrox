@@ -12,6 +12,11 @@ pub struct UsageEvent {
     pub provider: String,
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
+    /// Prompt-cache counters. Zero means "provider reported none"; the column is
+    /// still written, so a `NULL` in `usage_log` means "gateway predates this
+    /// feature" and is distinguishable from a recorded zero.
+    pub cache_read_tokens: u32,
+    pub cache_write_tokens: u32,
     pub latency_ms: Option<u64>,
 }
 
@@ -118,6 +123,8 @@ async fn flush(pool: &sqlx::PgPool, buffer: &mut Vec<UsageEvent>) {
         .iter()
         .map(|e| (e.prompt_tokens + e.completion_tokens) as i32)
         .collect();
+    let cache_read_tokens: Vec<i32> = valid.iter().map(|e| e.cache_read_tokens as i32).collect();
+    let cache_write_tokens: Vec<i32> = valid.iter().map(|e| e.cache_write_tokens as i32).collect();
     let latency_ms: Vec<Option<i32>> = valid
         .iter()
         .map(|e| e.latency_ms.map(|l| l as i32))
@@ -126,10 +133,11 @@ async fn flush(pool: &sqlx::PgPool, buffer: &mut Vec<UsageEvent>) {
     let result = sqlx::query(
         r#"
         INSERT INTO usage_log
-            (client_id, request_id, model, provider, prompt_tokens, completion_tokens, total_tokens, latency_ms)
+            (client_id, request_id, model, provider, prompt_tokens, completion_tokens, total_tokens,
+             cache_read_tokens, cache_write_tokens, latency_ms)
         SELECT * FROM UNNEST(
             $1::uuid[], $2::text[], $3::text[], $4::text[],
-            $5::int[], $6::int[], $7::int[], $8::int[]
+            $5::int[], $6::int[], $7::int[], $8::int[], $9::int[], $10::int[]
         )
         "#,
     )
@@ -140,6 +148,8 @@ async fn flush(pool: &sqlx::PgPool, buffer: &mut Vec<UsageEvent>) {
     .bind(&prompt_tokens)
     .bind(&completion_tokens)
     .bind(&total_tokens)
+    .bind(&cache_read_tokens)
+    .bind(&cache_write_tokens)
     .bind(&latency_ms)
     .execute(pool)
     .await;
@@ -168,6 +178,8 @@ mod tests {
             provider: "openai".to_string(),
             prompt_tokens: 100,
             completion_tokens: 50,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
             latency_ms: Some(200),
         });
         // Give the drainer a moment to consume.
