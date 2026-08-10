@@ -305,6 +305,11 @@ pub async fn chat_completions(
                     .with_label_values(&[provider_name.as_str(), req.model.as_str(), "200"])
                     .observe(latency);
 
+                let (cache_read, cache_write) = resp
+                    .usage
+                    .as_ref()
+                    .map(crate::types::cache_tokens)
+                    .unwrap_or((0, 0));
                 tracing::info!(
                     request_id = %ctx.request_id,
                     key_name = %ctx.key_name,
@@ -316,6 +321,10 @@ pub async fn chat_completions(
                     latency_ms = (latency * 1000.0) as u64,
                     prompt_tokens = resp.usage.as_ref().map(|u| u.prompt_tokens).unwrap_or(0),
                     completion_tokens = resp.usage.as_ref().map(|u| u.completion_tokens).unwrap_or(0),
+                    // `Option` fields are omitted entirely when `None`, so
+                    // non-caching requests log exactly as they did before.
+                    cache_read_tokens = (cache_read > 0).then_some(cache_read),
+                    cache_write_tokens = (cache_write > 0).then_some(cache_write),
                     "request_completed"
                 );
 

@@ -270,24 +270,30 @@ non-streaming `usage` object and the streaming `message_delta`:
 }
 ```
 
-On `/v1/chat/completions` cache reads appear in OpenAI's canonical form, and the
-native Anthropic keys are preserved alongside them:
+On `/v1/chat/completions` both counters appear in OpenAI's canonical form under
+`prompt_tokens_details`, and the native Anthropic keys are preserved alongside
+them:
 
 ```json
 "usage": {
   "prompt_tokens": 47,
   "completion_tokens": 2,
   "total_tokens": 49,
-  "prompt_tokens_details": {"cached_tokens": 3968},
+  "prompt_tokens_details": {"cached_tokens": 3968, "cache_write_tokens": 100},
   "cache_read_input_tokens": 3968,
   "cache_creation_input_tokens": 100
 }
 ```
 
 > `prompt_tokens_details.cached_tokens` and `cache_read_input_tokens` describe
-> **the same tokens** in two vocabularies. Read one or the other — never sum
-> them. Cache *creation* has no OpenAI equivalent and is reported only under its
-> native key.
+> **the same tokens** in two vocabularies, as do
+> `prompt_tokens_details.cache_write_tokens` and `cache_creation_input_tokens`.
+> Read one of each pair — never sum them.
+
+The nested pair is what the official OpenAI SDKs expose
+(`PromptTokensDetails.cached_tokens` / `.cache_write_tokens` in both
+`openai-python` and `openai-go`); the top-level Anthropic-native keys are an
+extension those SDKs ignore, so either vocabulary works with a stock client.
 
 Note that `input_tokens` / `prompt_tokens` counts the **non-cached** input for
 that request; cached tokens are reported separately in the fields above.

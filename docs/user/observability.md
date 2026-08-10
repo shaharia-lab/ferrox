@@ -36,7 +36,10 @@ Every completed request emits a structured log line at `info` level:
 
 `cache_read_tokens` and `cache_write_tokens` are prompt-cache counters. They are
 **omitted entirely** when the provider reported no cache usage, so requests
-against non-caching providers log exactly as before.
+against non-caching providers log exactly as before. Both counters are logged on
+every completed request — streaming and non-streaming, on `request_completed`
+(`/v1/chat/completions`) and `anthropic_request_completed`
+(`/anthropic/v1/messages`) alike.
 
 ---
 
