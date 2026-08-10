@@ -263,15 +263,21 @@ pub const CACHE_READ_INPUT_TOKENS: &str = "cache_read_input_tokens";
 pub const PROMPT_TOKENS_DETAILS: &str = "prompt_tokens_details";
 /// OpenAI-canonical key for cache reads, nested under [`PROMPT_TOKENS_DETAILS`].
 pub const CACHED_TOKENS: &str = "cached_tokens";
+/// OpenAI-canonical key for cache writes, nested under [`PROMPT_TOKENS_DETAILS`].
+///
+/// Declared by the official SDKs as "the unadjusted number of prompt tokens
+/// written to cache" (`openai-python` `PromptTokensDetails.cache_write_tokens`,
+/// `openai-go` `CompletionUsagePromptTokensDetails.CacheWriteTokens`).
+pub const CACHE_WRITE_TOKENS: &str = "cache_write_tokens";
 
 /// Build the [`Usage::extra`] entries for a pair of prompt-cache counters.
 ///
-/// Cache **reads** are represented twice on purpose: once under the
-/// Anthropic-native `cache_read_input_tokens` key and once as OpenAI's
-/// `prompt_tokens_details.cached_tokens`, so both API surfaces report them
-/// without a second translation step. **They are the same tokens — a consumer
-/// must read exactly one of the two and never sum them.** Cache *creation* has
-/// no OpenAI equivalent and is emitted only under its native key.
+/// Each counter is represented twice on purpose: once under its Anthropic-native
+/// key (`cache_read_input_tokens` / `cache_creation_input_tokens`) and once
+/// under OpenAI's `prompt_tokens_details` (`cached_tokens` / `cache_write_tokens`),
+/// so both API surfaces report them without a second translation step. **Each
+/// pair is the same tokens — a consumer must read exactly one of the two and
+/// never sum them.**
 ///
 /// Returns an empty map when neither counter is present, which keeps the
 /// no-cache path allocation-free (`HashMap::new` does not allocate) and makes
@@ -281,14 +287,19 @@ pub fn cache_usage_extra(
     read: Option<u32>,
 ) -> HashMap<String, serde_json::Value> {
     let mut extra = HashMap::new();
+    let mut details = serde_json::Map::new();
     if let Some(creation) = creation {
         extra.insert(CACHE_CREATION_INPUT_TOKENS.to_string(), creation.into());
+        details.insert(CACHE_WRITE_TOKENS.to_string(), creation.into());
     }
     if let Some(read) = read {
         extra.insert(CACHE_READ_INPUT_TOKENS.to_string(), read.into());
+        details.insert(CACHED_TOKENS.to_string(), read.into());
+    }
+    if !details.is_empty() {
         extra.insert(
             PROMPT_TOKENS_DETAILS.to_string(),
-            serde_json::json!({ CACHED_TOKENS: read }),
+            serde_json::Value::Object(details),
         );
     }
     extra
@@ -307,23 +318,28 @@ pub fn cache_tokens(usage: &Usage) -> (u32, u32) {
 
 /// Recover `(cache_creation, cache_read)` from [`Usage::extra`].
 ///
-/// The Anthropic-native keys win; `prompt_tokens_details.cached_tokens` is the
-/// fallback for reads so usage that originated from an OpenAI-format upstream
-/// still round-trips onto the Anthropic surface.
+/// The Anthropic-native keys win; the `prompt_tokens_details` counterparts
+/// (`cached_tokens` for reads, `cache_write_tokens` for writes) are the fallback,
+/// so usage that originated from an OpenAI-format upstream still round-trips
+/// onto the Anthropic surface.
 pub fn cache_tokens_from_extra(
     extra: &HashMap<String, serde_json::Value>,
 ) -> (Option<u32>, Option<u32>) {
     let as_u32 = |v: &serde_json::Value| v.as_u64().map(|t| t as u32);
-    let creation = extra.get(CACHE_CREATION_INPUT_TOKENS).and_then(as_u32);
+    let detail = |key: &str| {
+        extra
+            .get(PROMPT_TOKENS_DETAILS)
+            .and_then(|d| d.get(key))
+            .and_then(as_u32)
+    };
+    let creation = extra
+        .get(CACHE_CREATION_INPUT_TOKENS)
+        .and_then(as_u32)
+        .or_else(|| detail(CACHE_WRITE_TOKENS));
     let read = extra
         .get(CACHE_READ_INPUT_TOKENS)
         .and_then(as_u32)
-        .or_else(|| {
-            extra
-                .get(PROMPT_TOKENS_DETAILS)
-                .and_then(|d| d.get(CACHED_TOKENS))
-                .and_then(as_u32)
-        });
+        .or_else(|| detail(CACHED_TOKENS));
     (creation, read)
 }
 
@@ -574,5 +590,56 @@ mod tests {
             serde_json::json!({"cached_tokens": 512}),
         )]));
         assert_eq!(cache_tokens(&usage), (512, 0));
+    }
+
+    #[test]
+    fn cache_tokens_reads_openai_cache_write_tokens_fallback() {
+        let usage = usage_with(HashMap::from([(
+            "prompt_tokens_details".to_string(),
+            serde_json::json!({"cache_write_tokens": 256}),
+        )]));
+        assert_eq!(cache_tokens(&usage), (0, 256));
+    }
+
+    /// Both counters must land under `prompt_tokens_details` as well as their
+    /// Anthropic-native keys — the official OpenAI SDKs read the nested pair
+    /// (`PromptTokensDetails.cached_tokens` / `.cache_write_tokens`) and ignore
+    /// anything at the top level of `usage`.
+    #[test]
+    fn cache_usage_extra_emits_both_openai_details() {
+        let extra = cache_usage_extra(Some(100), Some(3968));
+        assert_eq!(extra["cache_creation_input_tokens"], 100);
+        assert_eq!(extra["cache_read_input_tokens"], 3968);
+        assert_eq!(extra["prompt_tokens_details"]["cache_write_tokens"], 100);
+        assert_eq!(extra["prompt_tokens_details"]["cached_tokens"], 3968);
+    }
+
+    /// A write with no read still has to produce the OpenAI container, or a
+    /// cache-creating request looks cacheless to an OpenAI SDK consumer.
+    #[test]
+    fn cache_usage_extra_write_only_still_emits_details() {
+        let extra = cache_usage_extra(Some(100), None);
+        assert_eq!(extra["prompt_tokens_details"]["cache_write_tokens"], 100);
+        assert!(extra["prompt_tokens_details"]
+            .get("cached_tokens")
+            .is_none());
+        assert!(!extra.contains_key("cache_read_input_tokens"));
+    }
+
+    #[test]
+    fn cache_usage_extra_read_only_omits_write_key() {
+        let extra = cache_usage_extra(None, Some(3968));
+        assert_eq!(extra["prompt_tokens_details"]["cached_tokens"], 3968);
+        assert!(extra["prompt_tokens_details"]
+            .get("cache_write_tokens")
+            .is_none());
+        assert!(!extra.contains_key("cache_creation_input_tokens"));
+    }
+
+    /// The no-cache path must stay byte-identical to a response from a build
+    /// without cache support — no empty `prompt_tokens_details` container.
+    #[test]
+    fn cache_usage_extra_empty_when_neither_counter_present() {
+        assert!(cache_usage_extra(None, None).is_empty());
     }
 }
