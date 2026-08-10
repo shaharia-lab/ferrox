@@ -28,9 +28,15 @@ Every completed request emits a structured log line at `info` level:
   "status": 200,
   "latency_ms": 843,
   "prompt_tokens": 45,
-  "completion_tokens": 120
+  "completion_tokens": 120,
+  "cache_read_tokens": 3968,
+  "cache_write_tokens": 100
 }
 ```
+
+`cache_read_tokens` and `cache_write_tokens` are prompt-cache counters. They are
+**omitted entirely** when the provider reported no cache usage, so requests
+against non-caching providers log exactly as before.
 
 ---
 
@@ -58,9 +64,37 @@ When `path` is set, metrics are served only at that path.
 | `ferrox_requests_total` | Counter | `provider`, `model_alias`, `model_id`, `status`, `key_name` | Total requests dispatched |
 | `ferrox_request_duration_seconds` | Histogram | `provider`, `model_alias`, `status` | End-to-end latency |
 | `ferrox_ttfb_seconds` | Histogram | `provider`, `model_alias` | Time to first byte |
-| `ferrox_tokens_total` | Counter | `provider`, `model_alias`, `key_name`, `type` | Tokens processed per client (`type`: `prompt` or `completion`) |
+| `ferrox_tokens_total` | Counter | `provider`, `model_alias`, `key_name`, `type` | Tokens processed per client (`type`: `prompt`, `completion`, `cache_read`, `cache_write`) |
 | `ferrox_active_streams` | Gauge | `provider`, `model_alias` | Active SSE connections |
 | `ferrox_errors_total` | Counter | `provider`, `error_type` | Errors by type |
+
+### Prompt-cache metrics
+
+Providers that support prompt caching report two extra `type` values on
+`ferrox_tokens_total`:
+
+| `type` | Meaning |
+|---|---|
+| `cache_read` | Tokens served from the prompt cache (Anthropic `cache_read_input_tokens`, Bedrock `cacheReadInputTokens`) |
+| `cache_write` | Tokens written to the prompt cache (Anthropic `cache_creation_input_tokens`, Bedrock `cacheWriteInputTokens`) |
+
+These series are created **only when a provider actually reports cache usage**,
+so enabling this costs no cardinality on non-caching routes.
+
+`prompt` counts the **non-cached** input tokens for a request — cache reads are
+counted separately, not folded into `prompt`. Cache hit rate is therefore the
+share of total input that was served from cache:
+
+```promql
+sum(rate(ferrox_tokens_total{type="cache_read"}[5m]))
+/
+sum(rate(ferrox_tokens_total{type=~"prompt|cache_read"}[5m]))
+```
+
+Break it down per model, client or provider by adding a `by` clause — e.g.
+`by (model_alias)` on both halves. A sudden drop in this ratio is the signal
+that caching has regressed (a changed system prompt, a lost cache breakpoint, or
+a failover to a provider that does not cache).
 
 ### Routing metrics
 

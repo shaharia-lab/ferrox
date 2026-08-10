@@ -94,8 +94,14 @@ pub async fn chat_completions(
                 let accumulated_prompt = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
                 let accumulated_completion =
                     std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+                let accumulated_cache_read =
+                    std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+                let accumulated_cache_write =
+                    std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
                 let acc_p = accumulated_prompt.clone();
                 let acc_c = accumulated_completion.clone();
+                let acc_cr = accumulated_cache_read.clone();
+                let acc_cw = accumulated_cache_write.clone();
 
                 let p2 = provider_name.clone();
                 let a2 = alias.clone();
@@ -106,12 +112,15 @@ pub async fn chat_completions(
                     .map(move |chunk_result| {
                         chunk_result.map(|chunk| {
                             if let Some(usage) = &chunk.usage {
+                                let (cache_read, cache_write) = crate::types::cache_tokens(usage);
                                 metrics::record_tokens(
                                     &p1,
                                     &a1,
                                     &k1,
                                     usage.prompt_tokens,
                                     usage.completion_tokens,
+                                    cache_read,
+                                    cache_write,
                                 );
                                 acc_p.store(
                                     usage.prompt_tokens,
@@ -121,6 +130,8 @@ pub async fn chat_completions(
                                     usage.completion_tokens,
                                     std::sync::atomic::Ordering::Relaxed,
                                 );
+                                acc_cr.store(cache_read, std::sync::atomic::Ordering::Relaxed);
+                                acc_cw.store(cache_write, std::sync::atomic::Ordering::Relaxed);
                             }
                             let data = serde_json::to_string(&chunk).unwrap_or_default();
                             Event::default().data(data)
@@ -148,6 +159,10 @@ pub async fn chat_completions(
                         let prompt = accumulated_prompt.load(std::sync::atomic::Ordering::Relaxed);
                         let completion =
                             accumulated_completion.load(std::sync::atomic::Ordering::Relaxed);
+                        let cache_read =
+                            accumulated_cache_read.load(std::sync::atomic::Ordering::Relaxed);
+                        let cache_write =
+                            accumulated_cache_write.load(std::sync::atomic::Ordering::Relaxed);
                         if prompt > 0 || completion > 0 {
                             // Push webhook event (clone before usage_writer moves the strings)
                             event_dispatcher.dispatch(TokenUsageEvent {
@@ -171,6 +186,8 @@ pub async fn chat_completions(
                                 provider: stream_provider,
                                 prompt_tokens: prompt,
                                 completion_tokens: completion,
+                                cache_read_tokens: cache_read,
+                                cache_write_tokens: cache_write,
                                 latency_ms: Some((latency * 1000.0) as u64),
                             });
 
@@ -196,6 +213,10 @@ pub async fn chat_completions(
                             streaming = true,
                             status = 200,
                             latency_ms = (latency * 1000.0) as u64,
+                            // `Option` fields are omitted entirely when `None`,
+                            // so quiet (non-caching) paths stay quiet.
+                            cache_read_tokens = (cache_read > 0).then_some(cache_read),
+                            cache_write_tokens = (cache_write > 0).then_some(cache_write),
                             "request_completed"
                         );
                         Ok::<Event, ProxyError>(Event::default().data("[DONE]"))
@@ -218,12 +239,15 @@ pub async fn chat_completions(
             Ok((resp, provider_name, model_id)) => {
                 // Record tokens
                 if let Some(usage) = &resp.usage {
+                    let (cache_read, cache_write) = crate::types::cache_tokens(usage);
                     metrics::record_tokens(
                         &provider_name,
                         &req.model,
                         &ctx.key_name,
                         usage.prompt_tokens,
                         usage.completion_tokens,
+                        cache_read,
+                        cache_write,
                     );
 
                     // Persist usage to database
@@ -234,6 +258,8 @@ pub async fn chat_completions(
                         provider: provider_name.clone(),
                         prompt_tokens: usage.prompt_tokens,
                         completion_tokens: usage.completion_tokens,
+                        cache_read_tokens: cache_read,
+                        cache_write_tokens: cache_write,
                         latency_ms: Some((latency * 1000.0) as u64),
                     });
 

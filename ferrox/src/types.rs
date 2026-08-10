@@ -253,6 +253,17 @@ pub fn cache_usage_extra(
     extra
 }
 
+/// Prompt-cache counters for a completed response as `(cache_read, cache_write)`,
+/// defaulting to zero when the provider reported none.
+///
+/// The observability surfaces (metrics, logs, `usage_log`) all want plain
+/// counts, and they must all read the **same** one of the two equivalent cache
+/// read representations — this is that single reading.
+pub fn cache_tokens(usage: &Usage) -> (u32, u32) {
+    let (creation, read) = cache_tokens_from_extra(&usage.extra);
+    (read.unwrap_or(0), creation.unwrap_or(0))
+}
+
 /// Recover `(cache_creation, cache_read)` from [`Usage::extra`].
 ///
 /// The Anthropic-native keys win; `prompt_tokens_details.cached_tokens` is the
@@ -485,5 +496,37 @@ mod tests {
             reasoning_content: None,
         });
         assert_eq!(r.system_message(), None);
+    }
+
+    fn usage_with(extra: HashMap<String, serde_json::Value>) -> Usage {
+        Usage {
+            prompt_tokens: 47,
+            completion_tokens: 2,
+            total_tokens: 49,
+            extra,
+        }
+    }
+
+    #[test]
+    fn cache_tokens_returns_read_then_write() {
+        // Note the ordering flip: the carrier is (creation, read), the
+        // observability tuple is (read, write).
+        let usage = usage_with(cache_usage_extra(Some(100), Some(3968)));
+        assert_eq!(cache_tokens(&usage), (3968, 100));
+    }
+
+    #[test]
+    fn cache_tokens_defaults_to_zero() {
+        let usage = usage_with(HashMap::new());
+        assert_eq!(cache_tokens(&usage), (0, 0));
+    }
+
+    #[test]
+    fn cache_tokens_reads_openai_cached_tokens_fallback() {
+        let usage = usage_with(HashMap::from([(
+            "prompt_tokens_details".to_string(),
+            serde_json::json!({"cached_tokens": 512}),
+        )]));
+        assert_eq!(cache_tokens(&usage), (512, 0));
     }
 }
