@@ -246,11 +246,51 @@ event: content_block_stop
 data: {"type":"content_block_stop","index":0}
 
 event: message_delta
-data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":10}}
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"input_tokens":15,"output_tokens":10}}
 
 event: message_stop
 data: {"type":"message_stop"}
 ```
+
+### Prompt-cache token counters
+
+When an upstream provider reports prompt-cache usage, Ferrox passes the counters
+through on both API surfaces. They are **omitted entirely** when the upstream
+does not report them, so responses from non-caching providers are unchanged.
+
+On `/anthropic/v1/messages` they appear under their native names, in both the
+non-streaming `usage` object and the streaming `message_delta`:
+
+```json
+"usage": {
+  "input_tokens": 47,
+  "output_tokens": 2,
+  "cache_creation_input_tokens": 100,
+  "cache_read_input_tokens": 3968
+}
+```
+
+On `/v1/chat/completions` cache reads appear in OpenAI's canonical form, and the
+native Anthropic keys are preserved alongside them:
+
+```json
+"usage": {
+  "prompt_tokens": 47,
+  "completion_tokens": 2,
+  "total_tokens": 49,
+  "prompt_tokens_details": {"cached_tokens": 3968},
+  "cache_read_input_tokens": 3968,
+  "cache_creation_input_tokens": 100
+}
+```
+
+> `prompt_tokens_details.cached_tokens` and `cache_read_input_tokens` describe
+> **the same tokens** in two vocabularies. Read one or the other — never sum
+> them. Cache *creation* has no OpenAI equivalent and is reported only under its
+> native key.
+
+Note that `input_tokens` / `prompt_tokens` counts the **non-cached** input for
+that request; cached tokens are reported separately in the fields above.
 
 ### Stop reason mapping
 
