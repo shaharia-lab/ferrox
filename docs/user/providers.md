@@ -150,6 +150,27 @@ models:
   **bytes**, so remote `http(s)` image URLs are skipped (logged as a warning).
 - No `api_key` field is used for Bedrock.
 
+### Prompt caching on Bedrock
+
+Bedrock caching is driven by the same `cache_control` breakpoints as Anthropic —
+Ferrox translates them into Converse `cachePoint` blocks, emitted immediately
+after the content they terminate. The cache token counters Bedrock returns
+(`cacheReadInputTokens` / `cacheWriteInputTokens`) are surfaced on both the
+streaming and non-streaming paths, in the same shape as every other provider, so
+they flow into metrics, logs and `usage_log` automatically.
+
+Bedrock-specific constraints:
+
+| Constraint | Behaviour |
+|---|---|
+| **Max 4 cache points per request** | If more are requested, Ferrox keeps the **last 4** and logs the rest at `debug`. Caching is prefix-based, so a later breakpoint covers everything an earlier one would. System breakpoints come first in request order and are therefore dropped first. |
+| **Supported model families** | `cachePoint` is emitted only for Anthropic Claude and Amazon Nova models. Other families reject the block outright, so an unrecognised model deliberately gets no cache points rather than a failed request. |
+| **TTL is fixed at 5 minutes** | Refreshed on each cache hit; not configurable. |
+| **Minimum cacheable prefix varies by family** | Below the minimum a `cachePoint` is a **silent no-op**, not an error — the request succeeds with no caching. Watch `ferrox_tokens_total{type="cache_write"}` to confirm caching is actually happening. |
+
+A request with no `cache_control` produces a Converse payload identical to
+before caching support existed.
+
 ---
 
 ## Z.AI GLM
