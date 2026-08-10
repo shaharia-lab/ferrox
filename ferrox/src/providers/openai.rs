@@ -367,6 +367,39 @@ mod tests {
     }
 
     #[test]
+    fn system_cache_control_key_does_not_leak_to_openai_upstreams() {
+        // The hoisted system breakpoint is gateway-private; the `_` prefix is
+        // what keeps it out of the outbound body. Pin that explicitly, since a
+        // rename without the prefix would silently start leaking it.
+        let mut req = ChatCompletionRequest {
+            model: "m".to_string(),
+            messages: vec![],
+            stream: None,
+            temperature: None,
+            max_tokens: Some(10),
+            top_p: None,
+            stop: None,
+            tools: None,
+            tool_choice: None,
+            system: None,
+            extra_headers: Default::default(),
+            raw_anthropic_body: None,
+            extra: Default::default(),
+        };
+        req.extra.insert(
+            crate::types::ANTHROPIC_SYSTEM_CACHE_CONTROL.to_string(),
+            serde_json::json!({"type": "ephemeral"}),
+        );
+
+        let body = serde_json::to_value(build_request_body(&req, "kimi-k2", false)).unwrap();
+        assert!(
+            body.get(crate::types::ANTHROPIC_SYSTEM_CACHE_CONTROL)
+                .is_none(),
+            "gateway-private key leaked upstream: {body}"
+        );
+    }
+
+    #[test]
     fn message_without_extras_serializes_without_new_keys() {
         let req = ChatCompletionRequest {
             model: "m".to_string(),
