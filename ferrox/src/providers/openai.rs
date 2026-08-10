@@ -261,6 +261,7 @@ fn build_request_body(req: &ChatCompletionRequest, model_id: &str, stream: bool)
                     tool_calls: None,
                     tool_call_id: None,
                     reasoning_content: None,
+                    extra: Default::default(),
                 },
             );
         }
@@ -315,6 +316,94 @@ fn build_request_body(req: &ChatCompletionRequest, model_id: &str, stream: bool)
 mod tests {
     use super::*;
     use crate::config::{DefaultsConfig, ProviderConfig, ProviderType};
+
+    /// The path from the original report: `/anthropic/v1/messages` routed to a
+    /// `type: openai` provider. The breakpoint must reach the outbound body.
+    #[test]
+    fn cache_control_survives_into_the_openai_body() {
+        let ephemeral = serde_json::json!({"type": "ephemeral"});
+        let req = ChatCompletionRequest {
+            model: "m".to_string(),
+            messages: vec![ChatMessage {
+                role: "user".to_string(),
+                content: Some(MessageContent::Parts(vec![
+                    crate::types::ContentPart::Text {
+                        text: "cached".to_string(),
+                        extra: std::collections::HashMap::from([(
+                            "cache_control".to_string(),
+                            ephemeral.clone(),
+                        )]),
+                    },
+                ])),
+                name: None,
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+                extra: std::collections::HashMap::from([(
+                    "cache_control".to_string(),
+                    ephemeral.clone(),
+                )]),
+            }],
+            stream: None,
+            temperature: None,
+            max_tokens: Some(10),
+            top_p: None,
+            stop: None,
+            tools: None,
+            tool_choice: None,
+            system: None,
+            extra_headers: Default::default(),
+            raw_anthropic_body: None,
+            extra: Default::default(),
+        };
+
+        let body = serde_json::to_value(build_request_body(&req, "kimi-k2", false)).unwrap();
+        let msg = &body["messages"][0];
+        assert_eq!(msg["cache_control"], ephemeral, "message-level breakpoint");
+        assert_eq!(
+            msg["content"][0]["cache_control"], ephemeral,
+            "block-level breakpoint"
+        );
+    }
+
+    #[test]
+    fn message_without_extras_serializes_without_new_keys() {
+        let req = ChatCompletionRequest {
+            model: "m".to_string(),
+            messages: vec![ChatMessage {
+                role: "user".to_string(),
+                content: Some(MessageContent::Text("hi".to_string())),
+                name: None,
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+                extra: Default::default(),
+            }],
+            stream: None,
+            temperature: None,
+            max_tokens: Some(10),
+            top_p: None,
+            stop: None,
+            tools: None,
+            tool_choice: None,
+            system: None,
+            extra_headers: Default::default(),
+            raw_anthropic_body: None,
+            extra: Default::default(),
+        };
+
+        let body = serde_json::to_value(build_request_body(&req, "kimi-k2", false)).unwrap();
+        assert_eq!(
+            body["messages"][0],
+            serde_json::json!({
+                "role": "user",
+                "content": "hi",
+                "name": null,
+                "tool_calls": null,
+                "tool_call_id": null
+            })
+        );
+    }
 
     fn defaults() -> DefaultsConfig {
         DefaultsConfig::default()

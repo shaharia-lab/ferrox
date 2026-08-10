@@ -53,6 +53,10 @@ pub struct AnthropicSystemBlock {
     #[serde(rename = "type")]
     pub block_type: String,
     pub text: Option<String>,
+    /// Prompt-cache breakpoint on the system prompt — typically the largest
+    /// cacheable span, so losing it is the most expensive drop of all.
+    #[serde(default)]
+    pub cache_control: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -73,11 +77,17 @@ pub enum AnthropicMessageContent {
 pub enum AnthropicContentBlock {
     Text {
         text: String,
+        /// Prompt-cache breakpoint. Preserved onto the internal representation
+        /// so it survives routing to a non-Anthropic provider.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cache_control: Option<serde_json::Value>,
     },
     /// Image blocks are accepted but forwarded as-is (provider decides support).
     Image {
         #[allow(dead_code)]
         source: serde_json::Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cache_control: Option<serde_json::Value>,
     },
     /// Assistant-turn tool invocation block.
     ToolUse {
@@ -95,8 +105,12 @@ pub enum AnthropicContentBlock {
         is_error: bool,
     },
     /// Catch-all for document, thinking, search_result, and future block types.
-    #[serde(other)]
-    Unknown,
+    ///
+    /// Captured verbatim rather than discarded so diagnostics can name the block
+    /// type. Must stay last: an untagged variant is tried only after every
+    /// tagged variant fails.
+    #[serde(untagged)]
+    Unknown(serde_json::Value),
 }
 
 // ── Tool definition in request ────────────────────────────────────────────────
@@ -196,12 +210,22 @@ pub struct AnthropicModelObject {
 // ── Translation: Anthropic request → internal ────────────────────────────────
 
 pub fn to_chat_completion_request(req: AnthropicMessagesRequest) -> ChatCompletionRequest {
+    // The internal representation carries the system prompt as a single string,
+    // so a per-block breakpoint has nowhere to live; hoist the last one seen to
+    // the request level. Last wins because Anthropic caches everything up to the
+    // final breakpoint, so the latest block is the widest span.
+    let mut system_cache_control: Option<serde_json::Value> = None;
     let system = req.system.map(|s| match s {
         AnthropicSystemContent::Text(t) => t,
         AnthropicSystemContent::Blocks(blocks) => blocks
             .into_iter()
             .filter(|b| b.block_type == "text")
-            .filter_map(|b| b.text)
+            .filter_map(|b| {
+                if b.cache_control.is_some() {
+                    system_cache_control = b.cache_control;
+                }
+                b.text
+            })
             .collect::<Vec<_>>()
             // Separate system blocks are distinct lines; joining with "" would
             // glue e.g. "You are" + "helpful" into "You arehelpful".
@@ -261,6 +285,9 @@ pub fn to_chat_completion_request(req: AnthropicMessagesRequest) -> ChatCompleti
     if let Some(top_k) = req.top_k {
         extra.insert("top_k".to_string(), serde_json::Value::from(top_k));
     }
+    if let Some(cc) = system_cache_control {
+        extra.insert(crate::types::ANTHROPIC_SYSTEM_CACHE_CONTROL.to_string(), cc);
+    }
 
     ChatCompletionRequest {
         model: req.model,
@@ -296,6 +323,7 @@ fn anthropic_messages_to_internal(messages: Vec<AnthropicMessage>) -> Vec<ChatMe
                     tool_calls: None,
                     tool_call_id: None,
                     reasoning_content: None,
+                    extra: Default::default(),
                 });
             }
             AnthropicMessageContent::Blocks(blocks) => {
@@ -304,6 +332,21 @@ fn anthropic_messages_to_internal(messages: Vec<AnthropicMessage>) -> Vec<ChatMe
         }
     }
     result
+}
+
+/// Wrap a block's `cache_control` as the `extra` map of an internal content part.
+///
+/// Returns an empty map when there is no breakpoint, which keeps the serialized
+/// part byte-identical to one from before cache_control was preserved (and does
+/// not allocate).
+fn cache_control_extra(
+    cache_control: Option<serde_json::Value>,
+) -> HashMap<String, serde_json::Value> {
+    let mut extra = HashMap::new();
+    if let Some(cc) = cache_control {
+        extra.insert(crate::types::CACHE_CONTROL.to_string(), cc);
+    }
+    extra
 }
 
 /// Expand one Anthropic message (block content) into ≥1 internal messages.
@@ -319,14 +362,24 @@ fn convert_blocks(role: String, blocks: Vec<AnthropicContentBlock>, out: &mut Ve
 
     for block in blocks {
         match block {
-            AnthropicContentBlock::Text { text } => {
-                content_parts.push(ContentPart::Text { text });
+            AnthropicContentBlock::Text {
+                text,
+                cache_control,
+            } => {
+                content_parts.push(ContentPart::Text {
+                    text,
+                    extra: cache_control_extra(cache_control),
+                });
             }
-            AnthropicContentBlock::Image { source } => {
+            AnthropicContentBlock::Image {
+                source,
+                cache_control,
+            } => {
                 // Translate to an OpenAI image_url part instead of dropping it.
                 if let Some(url) = anthropic_image_source_to_url(&source) {
                     content_parts.push(ContentPart::ImageUrl {
                         image_url: crate::types::ImageUrl { url, detail: None },
+                        extra: cache_control_extra(cache_control),
                     });
                 }
             }
@@ -360,10 +413,16 @@ fn convert_blocks(role: String, blocks: Vec<AnthropicContentBlock>, out: &mut Ve
                 }
                 tool_results.push((tool_use_id, text));
             }
-            // Document/thinking/unknown blocks have no OpenAI equivalent. Warn so
-            // a silently-dropped block isn't mistaken for successful handling.
-            AnthropicContentBlock::Unknown => {
-                tracing::warn!(
+            // Document/thinking/unknown blocks have no OpenAI equivalent, so
+            // they cannot be forwarded to an OpenAI-format provider without the
+            // upstream rejecting the request. Name the type so the drop is
+            // diagnosable instead of anonymous.
+            AnthropicContentBlock::Unknown(value) => {
+                tracing::debug!(
+                    block_type = value
+                        .get("type")
+                        .and_then(|t| t.as_str())
+                        .unwrap_or("<untyped>"),
                     "dropping unsupported Anthropic content block (no OpenAI equivalent)"
                 );
             }
@@ -383,6 +442,7 @@ fn convert_blocks(role: String, blocks: Vec<AnthropicContentBlock>, out: &mut Ve
             },
             tool_call_id: None,
             reasoning_content: None,
+            extra: Default::default(),
         });
     } else {
         // User turn: emit the `tool` result messages FIRST, then any user
@@ -406,6 +466,7 @@ fn convert_blocks(role: String, blocks: Vec<AnthropicContentBlock>, out: &mut Ve
                 tool_calls: None,
                 tool_call_id: Some(tool_use_id),
                 reasoning_content: None,
+                extra: Default::default(),
             });
         }
         // Re-home any tool_result images onto the trailing user message so they
@@ -420,6 +481,7 @@ fn convert_blocks(role: String, blocks: Vec<AnthropicContentBlock>, out: &mut Ve
                 tool_calls: None,
                 tool_call_id: None,
                 reasoning_content: None,
+                extra: Default::default(),
             });
         }
     }
@@ -432,11 +494,17 @@ fn parts_to_content(parts: Vec<ContentPart>) -> Option<MessageContent> {
     if parts.is_empty() {
         return None;
     }
-    if parts.iter().all(|p| matches!(p, ContentPart::Text { .. })) {
+    // Collapsing several text parts into one string is a convenience for the
+    // common case, but it destroys per-part attributes. Only do it when no part
+    // carries any — otherwise a `cache_control` breakpoint would be joined away.
+    let all_plain_text = parts
+        .iter()
+        .all(|p| matches!(p, ContentPart::Text { extra, .. } if extra.is_empty()));
+    if all_plain_text {
         let text = parts
             .into_iter()
             .filter_map(|p| match p {
-                ContentPart::Text { text } => Some(text),
+                ContentPart::Text { text, .. } => Some(text),
                 _ => None,
             })
             .collect::<Vec<_>>()
@@ -520,6 +588,7 @@ fn tool_result_images(v: Option<&serde_json::Value>) -> Vec<ContentPart> {
                     .and_then(anthropic_image_source_to_url)
                     .map(|url| ContentPart::ImageUrl {
                         image_url: crate::types::ImageUrl { url, detail: None },
+                        extra: Default::default(),
                     }),
                 _ => None,
             })
@@ -552,7 +621,7 @@ pub fn to_anthropic_response(resp: ChatCompletionResponse) -> AnthropicMessagesR
                 MessageContent::Parts(parts) => parts
                     .iter()
                     .filter_map(|p| match p {
-                        ContentPart::Text { text } => Some(text.as_str()),
+                        ContentPart::Text { text, .. } => Some(text.as_str()),
                         _ => None,
                     })
                     .collect::<Vec<_>>()
@@ -1135,6 +1204,7 @@ mod tests {
         req.system = Some(AnthropicSystemContent::Blocks(vec![AnthropicSystemBlock {
             block_type: "text".to_string(),
             text: Some("Act as a robot.".to_string()),
+            cache_control: None,
         }]));
         let out = to_chat_completion_request(req);
         assert_eq!(out.system.as_deref(), Some("Act as a robot."));
@@ -1146,6 +1216,7 @@ mod tests {
         req.system = Some(AnthropicSystemContent::Blocks(vec![AnthropicSystemBlock {
             block_type: "unknown".to_string(),
             text: Some("ignored".to_string()),
+            cache_control: None,
         }]));
         let out = to_chat_completion_request(req);
         assert_eq!(out.system.as_deref(), Some(""));
@@ -1167,6 +1238,7 @@ mod tests {
                 role: "user".to_string(),
                 content: AnthropicMessageContent::Blocks(vec![AnthropicContentBlock::Text {
                     text: "Hi there".to_string(),
+                    cache_control: None,
                 }]),
             }],
             ..minimal_request("claude-sonnet")
@@ -1270,6 +1342,7 @@ mod tests {
                 content: AnthropicMessageContent::Blocks(vec![
                     AnthropicContentBlock::Text {
                         text: "Let me search.".to_string(),
+                        cache_control: None,
                     },
                     AnthropicContentBlock::ToolUse {
                         id: "toolu_abc".to_string(),
@@ -1322,6 +1395,7 @@ mod tests {
                 content: AnthropicMessageContent::Blocks(vec![
                     AnthropicContentBlock::Text {
                         text: "Here is the result:".to_string(),
+                        cache_control: None,
                     },
                     AnthropicContentBlock::ToolResult {
                         tool_use_id: "toolu_x".to_string(),
@@ -1371,6 +1445,7 @@ mod tests {
                         },
                         AnthropicContentBlock::Text {
                             text: "Base directory for this skill: /home/x".to_string(),
+                            cache_control: None,
                         },
                     ]),
                 },
@@ -1434,7 +1509,128 @@ mod tests {
         let block_json =
             r#"{"type": "document", "source": {"type": "url", "url": "https://example.com"}}"#;
         let block: AnthropicContentBlock = serde_json::from_str(block_json).unwrap();
-        assert!(matches!(block, AnthropicContentBlock::Unknown));
+        assert!(matches!(block, AnthropicContentBlock::Unknown(_)));
+    }
+
+    // ── Prompt-cache breakpoint preservation (#127) ──────────────────────────
+
+    #[test]
+    fn cache_control_on_message_block_survives_translation() {
+        let json = r#"{"model":"m","max_tokens":10,"messages":[{"role":"user","content":[
+            {"type":"text","text":"cached prefix","cache_control":{"type":"ephemeral"}},
+            {"type":"text","text":"uncached suffix"}
+        ]}]}"#;
+        let req: AnthropicMessagesRequest = serde_json::from_str(json).unwrap();
+        let internal = to_chat_completion_request(req);
+
+        let parts = match internal.messages[0].content.as_ref().unwrap() {
+            MessageContent::Parts(p) => p,
+            other => panic!("expected parts, got {other:?}"),
+        };
+        match &parts[0] {
+            ContentPart::Text { text, extra } => {
+                assert_eq!(text, "cached prefix");
+                assert_eq!(
+                    extra["cache_control"],
+                    serde_json::json!({"type":"ephemeral"})
+                );
+            }
+            other => panic!("expected text part, got {other:?}"),
+        }
+        match &parts[1] {
+            ContentPart::Text { extra, .. } => {
+                assert!(extra.is_empty(), "unmarked block must carry no extras");
+            }
+            other => panic!("expected text part, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cache_control_on_system_block_is_hoisted_to_request_extra() {
+        // The internal `system` is a flat string, so a per-block breakpoint has
+        // to travel at request level or it is lost.
+        let json = r#"{"model":"m","max_tokens":10,
+            "system":[{"type":"text","text":"You are helpful.","cache_control":{"type":"ephemeral"}}],
+            "messages":[{"role":"user","content":"hi"}]}"#;
+        let req: AnthropicMessagesRequest = serde_json::from_str(json).unwrap();
+        let internal = to_chat_completion_request(req);
+
+        assert_eq!(internal.system.as_deref(), Some("You are helpful."));
+        assert_eq!(
+            internal.extra[crate::types::ANTHROPIC_SYSTEM_CACHE_CONTROL],
+            serde_json::json!({"type":"ephemeral"})
+        );
+    }
+
+    #[test]
+    fn system_without_cache_control_adds_no_request_extra() {
+        let json = r#"{"model":"m","max_tokens":10,
+            "system":[{"type":"text","text":"You are helpful."}],
+            "messages":[{"role":"user","content":"hi"}]}"#;
+        let req: AnthropicMessagesRequest = serde_json::from_str(json).unwrap();
+        let internal = to_chat_completion_request(req);
+        assert!(!internal
+            .extra
+            .contains_key(crate::types::ANTHROPIC_SYSTEM_CACHE_CONTROL));
+    }
+
+    #[test]
+    fn content_part_without_extras_serializes_byte_identically() {
+        // Guards the "no behaviour change for requests without extras" criterion.
+        let part = ContentPart::Text {
+            text: "hi".to_string(),
+            extra: Default::default(),
+        };
+        assert_eq!(
+            serde_json::to_string(&part).unwrap(),
+            r#"{"type":"text","text":"hi"}"#
+        );
+    }
+
+    #[test]
+    fn content_part_round_trips_cache_control_through_json() {
+        let json = r#"{"type":"text","text":"hi","cache_control":{"type":"ephemeral"}}"#;
+        let part: ContentPart = serde_json::from_str(json).unwrap();
+        match &part {
+            ContentPart::Text { extra, .. } => {
+                assert_eq!(
+                    extra["cache_control"],
+                    serde_json::json!({"type":"ephemeral"})
+                );
+                // The internally-tagged discriminant must not leak into `extra`.
+                assert!(
+                    !extra.contains_key("type"),
+                    "tag leaked into extra: {extra:?}"
+                );
+            }
+            other => panic!("expected text part, got {other:?}"),
+        }
+        assert_eq!(
+            serde_json::to_value(&part).unwrap(),
+            serde_json::from_str::<serde_json::Value>(json).unwrap()
+        );
+    }
+
+    #[test]
+    fn unknown_block_is_still_dropped_but_typed() {
+        // Anthropic-only blocks cannot be forwarded to an OpenAI-format
+        // provider, but the type is now captured for diagnostics.
+        let block: AnthropicContentBlock =
+            serde_json::from_str(r#"{"type":"thinking","thinking":"hmm"}"#).unwrap();
+        match block {
+            AnthropicContentBlock::Unknown(v) => {
+                assert_eq!(v.get("type").and_then(|t| t.as_str()), Some("thinking"));
+            }
+            other => panic!("expected Unknown, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn well_formed_text_block_still_wins_over_untagged_fallback() {
+        // The untagged catch-all must not shadow the tagged variants.
+        let block: AnthropicContentBlock =
+            serde_json::from_str(r#"{"type":"text","text":"hello"}"#).unwrap();
+        assert!(matches!(block, AnthropicContentBlock::Text { .. }));
     }
 
     #[test]
@@ -1451,7 +1647,7 @@ mod tests {
                 assert!(
                     parts
                         .iter()
-                        .any(|p| matches!(p, ContentPart::ImageUrl { image_url }
+                        .any(|p| matches!(p, ContentPart::ImageUrl { image_url, .. }
                         if image_url.url == "data:image/png;base64,AAAA")),
                     "image preserved as a data URL"
                 );
@@ -1531,7 +1727,7 @@ mod tests {
                 let imgs: Vec<&crate::types::ImageUrl> = parts
                     .iter()
                     .filter_map(|p| match p {
-                        ContentPart::ImageUrl { image_url } => Some(image_url),
+                        ContentPart::ImageUrl { image_url, .. } => Some(image_url),
                         _ => None,
                     })
                     .collect();
@@ -1566,7 +1762,7 @@ mod tests {
                 assert_eq!(parts.len(), 1);
                 assert!(matches!(
                     &parts[0],
-                    ContentPart::ImageUrl { image_url } if image_url.url == "https://example.com/a.png"
+                    ContentPart::ImageUrl { image_url, .. } if image_url.url == "https://example.com/a.png"
                 ));
             }
             other => panic!("expected image parts, got {other:?}"),
@@ -1625,6 +1821,7 @@ mod tests {
                 content: AnthropicMessageContent::Blocks(vec![
                     AnthropicContentBlock::Text {
                         text: "hi".to_string(),
+                        cache_control: None,
                     },
                     AnthropicContentBlock::ToolResult {
                         tool_use_id: "t1".to_string(),
@@ -1681,6 +1878,7 @@ mod tests {
                     tool_calls: None,
                     tool_call_id: None,
                     reasoning_content: None,
+                    extra: Default::default(),
                 },
                 finish_reason: Some(finish_reason.to_string()),
                 extra: Default::default(),
@@ -1764,6 +1962,7 @@ mod tests {
                     }]),
                     tool_call_id: None,
                     reasoning_content: None,
+                    extra: Default::default(),
                 },
                 finish_reason: Some("tool_calls".to_string()),
                 extra: Default::default(),
@@ -1831,7 +2030,7 @@ mod tests {
         let urls: Vec<&str> = imgs
             .iter()
             .filter_map(|p| match p {
-                ContentPart::ImageUrl { image_url } => Some(image_url.url.as_str()),
+                ContentPart::ImageUrl { image_url, .. } => Some(image_url.url.as_str()),
                 _ => None,
             })
             .collect();

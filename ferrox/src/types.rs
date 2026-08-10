@@ -53,7 +53,7 @@ impl ChatCompletionRequest {
                     MessageContent::Parts(parts) => parts
                         .iter()
                         .filter_map(|p| match p {
-                            ContentPart::Text { text } => Some(text.as_str()),
+                            ContentPart::Text { text, .. } => Some(text.as_str()),
                             _ => None,
                         })
                         .collect::<Vec<_>>()
@@ -75,6 +75,16 @@ pub struct ChatMessage {
     /// `content`; preserved so it round-trips instead of being dropped.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
+    /// Pass-through for message-level attributes with no field of their own —
+    /// `cache_control` above all — so they survive the internal representation
+    /// instead of being erased in translation. Mirrors the catch-all on
+    /// [`ChatCompletionRequest`] and [`Usage`].
+    #[serde(
+        flatten,
+        default,
+        skip_serializing_if = "std::collections::HashMap::is_empty"
+    )]
+    pub extra: std::collections::HashMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -87,9 +97,40 @@ pub enum MessageContent {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentPart {
-    Text { text: String },
-    ImageUrl { image_url: ImageUrl },
+    Text {
+        text: String,
+        /// Per-block pass-through, carrying `cache_control` breakpoints across
+        /// the internal representation. See [`ChatMessage::extra`].
+        #[serde(
+            flatten,
+            default,
+            skip_serializing_if = "std::collections::HashMap::is_empty"
+        )]
+        extra: std::collections::HashMap<String, serde_json::Value>,
+    },
+    ImageUrl {
+        image_url: ImageUrl,
+        #[serde(
+            flatten,
+            default,
+            skip_serializing_if = "std::collections::HashMap::is_empty"
+        )]
+        extra: std::collections::HashMap<String, serde_json::Value>,
+    },
 }
+
+/// Key under which Anthropic prompt-cache breakpoints travel, on both
+/// [`ChatMessage::extra`] and [`ContentPart::Text::extra`].
+pub const CACHE_CONTROL: &str = "cache_control";
+
+/// Request-level [`ChatCompletionRequest::extra`] key holding the `cache_control`
+/// of the **system** prompt.
+///
+/// The internal representation flattens Anthropic system blocks into a single
+/// string, which has nowhere to hold a per-block breakpoint, so it is hoisted
+/// here — the same private-key convention already used by `_anthropic_thinking`
+/// and `_anthropic_betas`.
+pub const ANTHROPIC_SYSTEM_CACHE_CONTROL: &str = "_anthropic_system_cache_control";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImageUrl {
@@ -432,6 +473,7 @@ mod tests {
             tool_calls: None,
             tool_call_id: None,
             reasoning_content: None,
+            extra: Default::default(),
         }
     }
 
@@ -471,15 +513,18 @@ mod tests {
             content: Some(MessageContent::Parts(vec![
                 ContentPart::Text {
                     text: "Part1 ".to_string(),
+                    extra: Default::default(),
                 },
                 ContentPart::Text {
                     text: "Part2".to_string(),
+                    extra: Default::default(),
                 },
             ])),
             name: None,
             tool_calls: None,
             tool_call_id: None,
             reasoning_content: None,
+            extra: Default::default(),
         });
         assert_eq!(r.system_message(), Some("Part1 Part2".to_string()));
     }
@@ -494,6 +539,7 @@ mod tests {
             tool_calls: None,
             tool_call_id: None,
             reasoning_content: None,
+            extra: Default::default(),
         });
         assert_eq!(r.system_message(), None);
     }

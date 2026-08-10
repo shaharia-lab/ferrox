@@ -173,6 +173,38 @@ Available models: `GLM-5.1`, `GLM-5`, `GLM-4.7`, `GLM-4.5-air`.
 
 ---
 
+## Prompt caching (`cache_control`)
+
+Anthropic-style `cache_control` breakpoints are preserved across **every**
+routing path, not just Anthropic-to-Anthropic:
+
+| Path | `cache_control` |
+|---|---|
+| `/anthropic/v1/messages` → `type: anthropic` | Forwarded verbatim (whole body passes through untouched) |
+| `/anthropic/v1/messages` → `type: openai` | Preserved |
+| `/v1/chat/completions` → `type: anthropic` | Preserved |
+| `/v1/chat/completions` → `type: openai` | Preserved |
+
+Breakpoints are carried on individual content blocks and on messages. A
+breakpoint on the **system** prompt is preserved too: the gateway's internal
+representation holds the system prompt as a single string, so the breakpoint
+travels alongside it and is re-attached as a system block when the request goes
+to an Anthropic-format provider.
+
+Requests that set no `cache_control` are forwarded byte-identically to before —
+no empty keys are introduced.
+
+> Anthropic-only content blocks that have no OpenAI equivalent (`thinking`,
+> `document`, `search_result`) are still dropped when routing to an
+> OpenAI-format provider, since the upstream would reject them. The dropped
+> block's type is logged at `debug` level.
+
+Cache effectiveness is measurable — see
+[Observability](observability.md#prompt-cache-metrics) for the
+`ferrox_tokens_total{type="cache_read"}` counter and a cache-hit-rate query.
+
+---
+
 ## Using multiple entries of the same provider
 
 Add multiple entries to multiply your rate limit budget or add geographic redundancy:
