@@ -154,8 +154,11 @@ impl ProviderAdapter for AnthropicAdapter {
 struct AnthropicRequest {
     model: String,
     messages: Vec<AnthropicMessage>,
+    /// Plain string when there is no system breakpoint, or a one-element block
+    /// array carrying `cache_control` when there is — Anthropic accepts both,
+    /// and only the block form can hold a breakpoint.
     #[serde(skip_serializing_if = "Option::is_none")]
-    system: Option<String>,
+    system: Option<Value>,
     max_tokens: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     stream: Option<bool>,
@@ -198,9 +201,15 @@ enum AnthropicContent {
 enum AnthropicPart {
     Text {
         text: String,
+        /// Prompt-cache breakpoint recovered from the internal content part, so
+        /// a breakpoint set by an OpenAI-format client still reaches Anthropic.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<Value>,
     },
     Image {
         source: AnthropicImageSource,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<Value>,
     },
     ToolUse {
         id: String,
@@ -300,7 +309,17 @@ fn build_request_body(
     stream: bool,
     extras: &AnthropicExtras,
 ) -> AnthropicRequest {
-    let system = req.system_message();
+    // A system breakpoint hoisted by the Anthropic→internal translation (the
+    // internal `system` is a plain string and cannot carry one) is restored here
+    // by emitting the system prompt in block form.
+    let system = req.system_message().map(|text| {
+        match req.extra.get(crate::types::ANTHROPIC_SYSTEM_CACHE_CONTROL) {
+            Some(cc) => {
+                serde_json::json!([{"type": "text", "text": text, "cache_control": cc}])
+            }
+            None => Value::String(text),
+        }
+    });
 
     // Filter out system messages; Anthropic does not allow them in the messages array
     let messages: Vec<AnthropicMessage> = req
@@ -374,6 +393,11 @@ fn openai_tool_choice_to_anthropic(tc: &Value) -> Value {
     }
 }
 
+/// Pull a `cache_control` breakpoint out of an internal `extra` map, if present.
+fn cache_control_of(extra: &std::collections::HashMap<String, Value>) -> Option<Value> {
+    extra.get(crate::types::CACHE_CONTROL).cloned()
+}
+
 fn convert_message(msg: &ChatMessage) -> AnthropicMessage {
     let role = match msg.role.as_str() {
         "assistant" => "assistant",
@@ -392,7 +416,7 @@ fn convert_message(msg: &ChatMessage) -> AnthropicMessage {
                 MessageContent::Parts(ps) => ps
                     .iter()
                     .filter_map(|p| {
-                        if let ContentPart::Text { text } = p {
+                        if let ContentPart::Text { text, .. } = p {
                             Some(text.as_str())
                         } else {
                             None
@@ -402,7 +426,10 @@ fn convert_message(msg: &ChatMessage) -> AnthropicMessage {
                     .join(""),
             };
             if !text.is_empty() {
-                parts.push(AnthropicPart::Text { text });
+                parts.push(AnthropicPart::Text {
+                    text,
+                    cache_control: None,
+                });
             }
         }
 
@@ -425,7 +452,7 @@ fn convert_message(msg: &ChatMessage) -> AnthropicMessage {
                 MessageContent::Parts(parts) => parts
                     .iter()
                     .filter_map(|p| {
-                        if let ContentPart::Text { text } = p {
+                        if let ContentPart::Text { text, .. } = p {
                             Some(text.as_str())
                         } else {
                             None
@@ -447,9 +474,13 @@ fn convert_message(msg: &ChatMessage) -> AnthropicMessage {
                 let converted: Vec<AnthropicPart> = parts
                     .iter()
                     .map(|p| match p {
-                        ContentPart::Text { text } => AnthropicPart::Text { text: text.clone() },
-                        ContentPart::ImageUrl { image_url } => AnthropicPart::Image {
+                        ContentPart::Text { text, extra } => AnthropicPart::Text {
+                            text: text.clone(),
+                            cache_control: cache_control_of(extra),
+                        },
+                        ContentPart::ImageUrl { image_url, extra } => AnthropicPart::Image {
                             source: image_url_to_source(&image_url.url),
+                            cache_control: cache_control_of(extra),
                         },
                     })
                     .collect();
@@ -557,6 +588,7 @@ fn anthropic_to_openai_response(resp: AnthropicResponse, model_id: &str) -> Chat
         } else {
             Some(reasoning)
         },
+        extra: Default::default(),
     };
 
     let finish_reason = resp.stop_reason.map(|r| match r.as_str() {
@@ -639,6 +671,140 @@ fn transform_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Prompt-cache breakpoints, OpenAI-internal → Anthropic (#127) ─────────
+
+    fn req_with(messages: Vec<ChatMessage>) -> ChatCompletionRequest {
+        ChatCompletionRequest {
+            model: "m".to_string(),
+            messages,
+            stream: None,
+            temperature: None,
+            max_tokens: Some(10),
+            top_p: None,
+            stop: None,
+            tools: None,
+            tool_choice: None,
+            system: None,
+            extra_headers: Default::default(),
+            raw_anthropic_body: None,
+            extra: Default::default(),
+        }
+    }
+
+    fn user_msg_with_parts(parts: Vec<crate::types::ContentPart>) -> ChatMessage {
+        ChatMessage {
+            role: "user".to_string(),
+            content: Some(crate::types::MessageContent::Parts(parts)),
+            name: None,
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+            extra: Default::default(),
+        }
+    }
+
+    #[test]
+    fn cache_control_reaches_the_anthropic_body() {
+        let ephemeral = serde_json::json!({"type": "ephemeral"});
+        let req = req_with(vec![user_msg_with_parts(vec![
+            crate::types::ContentPart::Text {
+                text: "cached".to_string(),
+                extra: std::collections::HashMap::from([(
+                    "cache_control".to_string(),
+                    ephemeral.clone(),
+                )]),
+            },
+            crate::types::ContentPart::Text {
+                text: "fresh".to_string(),
+                extra: Default::default(),
+            },
+        ])]);
+
+        let body = serde_json::to_value(build_request_body(
+            &req,
+            "claude-sonnet",
+            false,
+            &AnthropicExtras { thinking: None },
+        ))
+        .unwrap();
+
+        let parts = &body["messages"][0]["content"];
+        assert_eq!(parts[0]["cache_control"], ephemeral);
+        assert_eq!(parts[0]["text"], "cached");
+        assert!(
+            parts[1].get("cache_control").is_none(),
+            "unmarked part must stay unmarked: {parts:?}"
+        );
+    }
+
+    #[test]
+    fn system_cache_control_is_restored_as_a_block() {
+        let ephemeral = serde_json::json!({"type": "ephemeral"});
+        let mut req = req_with(vec![]);
+        req.system = Some("You are helpful.".to_string());
+        req.extra.insert(
+            crate::types::ANTHROPIC_SYSTEM_CACHE_CONTROL.to_string(),
+            ephemeral.clone(),
+        );
+
+        let body = serde_json::to_value(build_request_body(
+            &req,
+            "claude-sonnet",
+            false,
+            &AnthropicExtras { thinking: None },
+        ))
+        .unwrap();
+
+        assert_eq!(
+            body["system"],
+            serde_json::json!([{
+                "type": "text",
+                "text": "You are helpful.",
+                "cache_control": {"type": "ephemeral"}
+            }])
+        );
+    }
+
+    #[test]
+    fn system_without_breakpoint_stays_a_plain_string() {
+        // Byte-compatible with the pre-#127 wire format.
+        let mut req = req_with(vec![]);
+        req.system = Some("You are helpful.".to_string());
+
+        let body = serde_json::to_value(build_request_body(
+            &req,
+            "claude-sonnet",
+            false,
+            &AnthropicExtras { thinking: None },
+        ))
+        .unwrap();
+
+        assert_eq!(body["system"], serde_json::json!("You are helpful."));
+    }
+
+    #[test]
+    fn parts_without_extras_serialize_without_cache_control() {
+        let req = req_with(vec![user_msg_with_parts(vec![
+            crate::types::ContentPart::Text {
+                text: "plain".to_string(),
+                extra: Default::default(),
+            },
+        ])]);
+
+        let body = serde_json::to_value(build_request_body(
+            &req,
+            "claude-sonnet",
+            false,
+            &AnthropicExtras { thinking: None },
+        ))
+        .unwrap();
+
+        assert_eq!(
+            body["messages"][0]["content"][0],
+            serde_json::json!({"type": "text", "text": "plain"})
+        );
+    }
 
     #[test]
     fn thinking_block_deserializes_and_maps_to_reasoning() {

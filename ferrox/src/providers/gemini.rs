@@ -63,7 +63,7 @@ impl GeminiAdapter {
         for msg in &mut resolved.messages {
             if let Some(MessageContent::Parts(parts)) = &mut msg.content {
                 for part in parts.iter_mut() {
-                    if let ContentPart::ImageUrl { image_url } = part {
+                    if let ContentPart::ImageUrl { image_url, .. } = part {
                         if !image_url.url.starts_with("data:") {
                             if let Some(data_url) =
                                 self.fetch_image_as_data_url(&image_url.url).await
@@ -581,8 +581,8 @@ fn convert_message(msg: &ChatMessage, tool_names: &HashMap<String, String>) -> G
         Some(MessageContent::Parts(cparts)) => {
             for p in cparts {
                 match p {
-                    ContentPart::Text { text } => parts.push(text_part(text.clone())),
-                    ContentPart::ImageUrl { image_url } => {
+                    ContentPart::Text { text, .. } => parts.push(text_part(text.clone())),
+                    ContentPart::ImageUrl { image_url, .. } => {
                         if let Some((mime_type, data)) = parse_data_url(&image_url.url) {
                             parts.push(GeminiPart {
                                 text: None,
@@ -740,6 +740,7 @@ fn gemini_to_openai_response(resp: GeminiResponse, model_id: &str) -> ChatComple
                 },
                 tool_call_id: None,
                 reasoning_content: None,
+                extra: Default::default(),
             };
 
             Choice {
@@ -826,15 +827,17 @@ mod tests {
                     url: "data:image/png;base64,QUJD".into(),
                     detail: None,
                 },
+                extra: Default::default(),
             }])),
             name: None,
             tool_calls: None,
             tool_call_id: None,
             reasoning_content: None,
+            extra: Default::default(),
         };
         let resolved = a.inline_remote_images(&req(vec![msg], None)).await;
         if let Some(MessageContent::Parts(parts)) = &resolved.messages[0].content {
-            if let ContentPart::ImageUrl { image_url } = &parts[0] {
+            if let ContentPart::ImageUrl { image_url, .. } = &parts[0] {
                 assert_eq!(image_url.url, "data:image/png;base64,QUJD");
             } else {
                 panic!("expected image part");
@@ -884,6 +887,7 @@ mod tests {
             }]),
             tool_call_id: None,
             reasoning_content: None,
+            extra: Default::default(),
         }
     }
 
@@ -895,6 +899,7 @@ mod tests {
             tool_calls: None,
             tool_call_id: Some("t1".into()),
             reasoning_content: None,
+            extra: Default::default(),
         }
     }
 

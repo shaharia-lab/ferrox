@@ -399,11 +399,11 @@ fn user_content_blocks(content: &Option<MessageContent>) -> Vec<ContentBlock> {
         Some(MessageContent::Parts(parts)) => parts
             .iter()
             .filter_map(|p| match p {
-                ContentPart::Text { text } if !text.is_empty() => {
+                ContentPart::Text { text, .. } if !text.is_empty() => {
                     Some(ContentBlock::Text(text.clone()))
                 }
                 ContentPart::Text { .. } => None,
-                ContentPart::ImageUrl { image_url } => image_block(&image_url.url),
+                ContentPart::ImageUrl { image_url, .. } => image_block(&image_url.url),
             })
             .collect(),
         None => Vec::new(),
@@ -598,6 +598,7 @@ fn converse_output_to_openai(
         },
         tool_call_id: None,
         reasoning_content: None,
+        extra: Default::default(),
     };
 
     ChatCompletionResponse {
@@ -712,7 +713,7 @@ fn text_of(content: &Option<MessageContent>) -> String {
         Some(MessageContent::Parts(parts)) => parts
             .iter()
             .filter_map(|p| match p {
-                ContentPart::Text { text } => Some(text.as_str()),
+                ContentPart::Text { text, .. } => Some(text.as_str()),
                 _ => None,
             })
             .collect::<Vec<_>>()
@@ -765,6 +766,7 @@ mod tests {
             tool_calls: None,
             tool_call_id: None,
             reasoning_content: None,
+            extra: Default::default(),
         }
     }
 
@@ -783,6 +785,7 @@ mod tests {
             }]),
             tool_call_id: None,
             reasoning_content: None,
+            extra: Default::default(),
         }
     }
 
@@ -810,6 +813,7 @@ mod tests {
             tool_calls: None,
             tool_call_id: Some("t1".into()),
             reasoning_content: None,
+            extra: Default::default(),
         };
         let out = build_messages(&req(vec![asst_tool_call(), tool_msg], false, None)).unwrap();
         assert_eq!(out.len(), 2);
@@ -917,18 +921,21 @@ mod tests {
             content: Some(MessageContent::Parts(vec![
                 ContentPart::Text {
                     text: "look".into(),
+                    extra: Default::default(),
                 },
                 ContentPart::ImageUrl {
                     image_url: ImageUrl {
                         url: "data:image/png;base64,QUJD".into(),
                         detail: None,
                     },
+                    extra: Default::default(),
                 },
             ])),
             name: None,
             tool_calls: None,
             tool_call_id: None,
             reasoning_content: None,
+            extra: Default::default(),
         };
         let blocks = user_content_blocks(&m.content);
         assert_eq!(blocks.len(), 2);
@@ -949,6 +956,7 @@ mod tests {
                     url: "https://example.com/cat.png".into(),
                     detail: None,
                 },
+                extra: Default::default(),
             }])));
         assert!(
             blocks.is_empty(),
