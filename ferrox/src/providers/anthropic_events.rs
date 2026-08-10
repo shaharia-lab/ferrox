@@ -19,9 +19,11 @@ pub struct AnthropicEventProcessor {
     pending_tool_index: u32,
     pub stop_reason: Option<String>,
     pub usage: Option<Usage>,
-    /// Prompt tokens from the `message_start` event. Anthropic reports
-    /// `input_tokens` there, not in `message_delta`, so we capture it up front
-    /// and fold it into the final usage.
+    /// Prompt tokens from the `message_start` event. api.anthropic.com reports
+    /// `input_tokens` there, so we capture it up front and fold it into the
+    /// final usage. Anthropic-protocol upstreams differ: Z.AI/GLM send
+    /// `input_tokens: 0` in `message_start` and the real count in the trailing
+    /// `message_delta`, which takes precedence when non-zero.
     input_tokens: u32,
 }
 
@@ -199,12 +201,24 @@ pub fn map_stop_reason(r: &str) -> String {
     }
 }
 
+/// Build the final usage from the trailing `message_delta`.
+///
+/// `input_tokens` is the value captured at `message_start`. A non-zero
+/// `usage.input_tokens` on the delta itself wins — some Anthropic-protocol
+/// upstreams (Z.AI/GLM) only report prompt tokens there. The two values are
+/// never summed: whichever is authoritative is used whole.
 fn parse_usage_from_message_delta(v: &Value, input_tokens: u32) -> Option<Usage> {
     let output = v.pointer("/usage/output_tokens").and_then(|t| t.as_u64())? as u32;
+    let input = v
+        .pointer("/usage/input_tokens")
+        .and_then(|t| t.as_u64())
+        .map(|t| t as u32)
+        .filter(|&t| t > 0)
+        .unwrap_or(input_tokens);
     Some(Usage {
-        prompt_tokens: input_tokens,
+        prompt_tokens: input,
         completion_tokens: output,
-        total_tokens: input_tokens + output,
+        total_tokens: input + output,
         extra: Default::default(),
     })
 }
@@ -471,6 +485,41 @@ mod tests {
         assert_eq!(
             usage.prompt_tokens, 123,
             "prompt tokens must come from message_start"
+        );
+        assert_eq!(usage.completion_tokens, 7);
+        assert_eq!(usage.total_tokens, 130);
+    }
+
+    #[test]
+    fn message_delta_input_tokens_override_zero_start() {
+        let mut p = make_processor();
+        // Z.AI/GLM shape: message_start reports 0, the real count lands on the delta.
+        let start =
+            r#"{"type":"message_start","message":{"id":"msg_1","usage":{"input_tokens":0}}}"#;
+        p.process("message_start", start, "glm-4.5-air", "zai");
+        let delta = r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":47,"output_tokens":2}}"#;
+        p.process("message_delta", delta, "glm-4.5-air", "zai");
+        let usage = p.usage.as_ref().unwrap();
+        assert_eq!(
+            usage.prompt_tokens, 47,
+            "a non-zero message_delta input_tokens must win over message_start"
+        );
+        assert_eq!(usage.completion_tokens, 2);
+        assert_eq!(usage.total_tokens, 49);
+    }
+
+    #[test]
+    fn message_delta_zero_input_keeps_message_start() {
+        let mut p = make_processor();
+        let start =
+            r#"{"type":"message_start","message":{"id":"msg_1","usage":{"input_tokens":123}}}"#;
+        p.process("message_start", start, "claude-3", "anthropic");
+        let delta = r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":0,"output_tokens":7}}"#;
+        p.process("message_delta", delta, "claude-3", "anthropic");
+        let usage = p.usage.as_ref().unwrap();
+        assert_eq!(
+            usage.prompt_tokens, 123,
+            "a zero message_delta input_tokens must not clobber message_start"
         );
         assert_eq!(usage.completion_tokens, 7);
         assert_eq!(usage.total_tokens, 130);
