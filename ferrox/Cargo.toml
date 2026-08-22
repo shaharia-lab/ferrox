@@ -45,6 +45,9 @@ async-trait = "0.1"
 futures = "0.3"
 bytes = "1"
 
+# Security
+subtle = "2"  # constant-time secret comparison (see auth.rs, ferrox-cp/middleware/admin_auth.rs)
+
 # Error handling
 thiserror = "1"
 anyhow = "1"
