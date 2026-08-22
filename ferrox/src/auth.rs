@@ -5,6 +5,7 @@ use axum::{
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use serde::Deserialize;
+use subtle::ConstantTimeEq;
 use uuid::Uuid;
 
 use crate::config::RateLimitConfig;
@@ -117,11 +118,17 @@ pub async fn auth_middleware(
 // ── Static key path ───────────────────────────────────────────────────────────
 
 async fn validate_static_key(token: &str, state: &AppState) -> Result<AuthOutcome, ProxyError> {
+    // Constant-time comparison: a plain `==` on strings returns as soon as two
+    // bytes differ, which makes response time depend on how many leading bytes
+    // of a guessed key are correct — a byte-at-a-time credential oracle.
+    // `ct_eq` also handles unequal lengths without branching on content, so no
+    // padding is needed. Same idiom as the control plane's admin-key check in
+    // `ferrox-cp/src/middleware/admin_auth.rs`.
     let key_config = state
         .config
         .virtual_keys
         .iter()
-        .find(|k| k.key == token)
+        .find(|k| bool::from(k.key.as_bytes().ct_eq(token.as_bytes())))
         .ok_or_else(|| ProxyError::Unauthorized("Invalid API key".to_string()))?;
 
     if let Some(rl) = &key_config.rate_limit {
@@ -515,6 +522,62 @@ mod tests {
             let outcome = validate_static_key("sk-real", &state).await.unwrap();
             assert_eq!(outcome.key_name, "test-key");
             assert_eq!(outcome.allowed_models, vec!["claude-sonnet"]);
+        }
+
+        // ── Constant-time comparison (#144) ──────────────────────────────────
+        //
+        // Timing itself is not unit-testable; these pin the *behaviour* the
+        // constant-time comparison must preserve. The equal-length and shared-
+        // prefix cases are the ones a careless "fix" gets wrong.
+
+        #[tokio::test]
+        async fn wrong_key_of_equal_length_is_rejected() {
+            let state = build_state(config_with_key("sk-abcdefgh", None));
+            let err = validate_static_key("sk-abcdefgi", &state)
+                .await
+                .unwrap_err();
+            assert!(matches!(err, ProxyError::Unauthorized(_)));
+        }
+
+        #[tokio::test]
+        async fn wrong_key_of_different_length_is_rejected() {
+            let state = build_state(config_with_key("sk-abcdefgh", None));
+            for candidate in ["sk-abcdefg", "sk-abcdefghi", ""] {
+                let err = validate_static_key(candidate, &state).await.unwrap_err();
+                assert!(
+                    matches!(err, ProxyError::Unauthorized(_)),
+                    "candidate {candidate:?} should not authenticate"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn key_sharing_a_long_prefix_is_rejected() {
+            // The exact shape a byte-at-a-time timing attack walks through:
+            // every byte correct except the last.
+            let state = build_state(config_with_key("sk-super-secret-value", None));
+            let err = validate_static_key("sk-super-secret-valuX", &state)
+                .await
+                .unwrap_err();
+            assert!(matches!(err, ProxyError::Unauthorized(_)));
+        }
+
+        #[tokio::test]
+        async fn correct_key_still_authenticates_among_several() {
+            // Guards the `.find()` rewrite: the predicate must still match the
+            // right entry when more than one key is configured.
+            let mut config = config_with_key("sk-first", None);
+            config.virtual_keys.push(VirtualKeyConfig {
+                key: "sk-second".to_string(),
+                name: "second-key".to_string(),
+                description: None,
+                allowed_models: vec![],
+                rate_limit: None,
+            });
+            let state = build_state(config);
+
+            let outcome = validate_static_key("sk-second", &state).await.unwrap();
+            assert_eq!(outcome.key_name, "second-key");
         }
 
         #[tokio::test]
