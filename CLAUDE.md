@@ -4,10 +4,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-**Ferrox** is a stateless, horizontally-scalable LLM API gateway written in Rust that exposes an OpenAI-compatible API and routes requests to multiple LLM providers (Anthropic, OpenAI, Gemini, AWS Bedrock, GLM). It consists of two binaries in a Cargo workspace:
+**Ferrox** is a stateless, horizontally-scalable LLM API gateway written in Rust that exposes an OpenAI-compatible API and routes requests to multiple LLM providers (Anthropic, OpenAI, Gemini, AWS Bedrock, GLM). It consists of two binaries and one library in a Cargo workspace:
 
 - `ferrox` — the gateway binary (request routing, rate limiting, circuit breaking)
 - `ferrox-cp` — the control plane binary (JWT key management, API client CRUD, embedded React admin UI)
+- `ferrox-providers` — the provider translation layer as a reusable library (wire types, `ProxyError`, Anthropic Messages translation, provider adapters). Consumed by `ferrox` with all features on; consumable standalone by other apps. Default build has no `axum`, no `utoipa` and no AWS SDK — those are the `axum`, `openapi` and `bedrock` features. MSRV 1.88 except with `bedrock`. See `ferrox-providers/README.md`.
 
 ## Essential Commands
 
@@ -28,6 +29,7 @@ make check              # fmt-check + lint + test (CI equivalent)
 # Testing
 make test                     # cargo test --workspace (requires PostgreSQL for ferrox-cp)
 cargo test -p ferrox          # Gateway tests only (no DB required)
+cargo test -p ferrox-providers --all-features  # Translation-layer compat suite (no DB required)
 cargo test -p ferrox-cp -- --test-threads=1  # CP integration tests (requires DATABASE_URL)
 
 # UI (ferrox-cp/ui/)
@@ -67,7 +69,7 @@ Client → [auth middleware] → [rate limiter] → ModelRouter
 3. **ModelRouter** (`ferrox/src/router.rs`): Resolves model alias → `RoutePool`
 4. **RoutePool** (`ferrox/src/lb/`): Selects target using configured strategy
 5. **Circuit Breaker** (`ferrox/src/lb/circuit_breaker.rs`): Per-provider+model, lock-free via `AtomicU8`
-6. **Provider Adapters** (`ferrox/src/providers/`): Translate OpenAI format to/from each provider's API
+6. **Provider Adapters** (`ferrox-providers/src/providers/`): Translate OpenAI format to/from each provider's API
 
 ### Key Design Patterns
 
@@ -126,6 +128,7 @@ Project-scoped agents live in `.claude/agents/`. Invoke with `@<name>` in any Cl
 | API endpoint reference | `docs/user/api-reference.md` |
 | Metrics, tracing, logging | `docs/user/observability.md` |
 | System design & request flow | `docs/developer/architecture.md` |
+| Reusable translation crate (features, MSRV) | `ferrox-providers/README.md` |
 | Build, test, develop guide | `docs/developer/development.md` |
 | Docker, control plane, admin UI deployment | `docs/developer/deployment.md` |
 | Contribution guidelines | `CONTRIBUTING.md` |

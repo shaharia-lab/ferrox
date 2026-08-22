@@ -1,8 +1,10 @@
+#[cfg(feature = "axum")]
 use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
     Json,
 };
+#[cfg(feature = "axum")]
 use serde_json::json;
 use thiserror::Error;
 
@@ -53,6 +55,11 @@ pub enum ProxyError {
     AwsError(String),
 }
 
+/// Maps every variant onto an OpenAI-shaped JSON error body.
+///
+/// Gated on the `axum` feature so the crate does not force a web-framework
+/// version on consumers that only want the translation layer.
+#[cfg(feature = "axum")]
 impl IntoResponse for ProxyError {
     fn into_response(self) -> Response {
         let (status, error_type, message) = match &self {
@@ -122,7 +129,8 @@ impl IntoResponse for ProxyError {
     }
 }
 
-#[cfg(test)]
+// Every test here asserts on the HTTP mapping, so the module follows the impl.
+#[cfg(all(test, feature = "axum"))]
 mod tests {
     use super::*;
     use axum::body::to_bytes;

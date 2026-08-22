@@ -1,10 +1,6 @@
-use axum::response::sse::Event;
-use futures::Stream;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 
-use crate::error::ProxyError;
-use crate::providers::ProviderStream;
 use crate::types::{
     ChatCompletionRequest, ChatCompletionResponse, ChatMessage, ContentPart, FunctionCall,
     MessageContent, StopSequences, Tool, ToolCall, ToolFunction,
@@ -184,7 +180,8 @@ pub struct AnthropicUsage {
 
 // ── Models list response ─────────────────────────────────────────────────────
 
-#[derive(Debug, Serialize, utoipa::ToSchema)]
+#[derive(Debug, Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct AnthropicModelsResponse {
     pub data: Vec<AnthropicModelObject>,
     pub has_more: bool,
@@ -192,14 +189,15 @@ pub struct AnthropicModelsResponse {
     pub last_id: Option<String>,
 }
 
-#[derive(Debug, Serialize, utoipa::ToSchema)]
+#[derive(Debug, Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct AnthropicModelObject {
     /// Always `"model"`.
     #[serde(rename = "type")]
-    #[schema(rename = "type", example = "model")]
+    #[cfg_attr(feature = "openapi", schema(rename = "type", example = "model"))]
     pub object_type: String,
     /// The model alias configured in the gateway.
-    #[schema(example = "claude-sonnet")]
+    #[cfg_attr(feature = "openapi", schema(example = "claude-sonnet"))]
     pub id: String,
     pub display_name: String,
     /// RFC 3339 timestamp; the gateway emits an empty string (aliases are not
@@ -698,440 +696,464 @@ pub fn finish_reason_to_anthropic(reason: &str) -> &str {
 }
 
 // ── Streaming translation: OpenAI chunks → Anthropic SSE events ──────────────
+//
+// These emit `axum::response::sse::Event`, so the whole section is gated on the
+// `axum` feature. `openai_stream_to_anthropic_sse` is re-exported below so its
+// public path is unchanged.
+#[cfg(feature = "axum")]
+mod sse {
+    use axum::response::sse::Event;
+    use futures::Stream;
+    use std::collections::VecDeque;
 
-struct StreamState {
-    inner: ProviderStream,
-    model: String,
-    msg_id: String,
-    is_first: bool,
-    pending: VecDeque<Result<Event, ProxyError>>,
-    output_tokens: u32,
-    /// Prompt tokens. OpenAI-format upstreams deliver this only in the final
-    /// chunk's usage (via `stream_options.include_usage`), so we capture it
-    /// whenever a chunk carries usage and emit it in `message_delta`.
-    input_tokens: u32,
-    /// Prompt-cache counters recovered from the chunk usage's `extra`, emitted
-    /// alongside `input_tokens` in `message_delta` when present.
-    cache_creation_input_tokens: Option<u32>,
-    cache_read_input_tokens: Option<u32>,
-    stop_reason: String,
-    stream_done: bool,
-    /// Whether the text content_block (index 0) has been opened.
-    /// We defer opening it until actual text arrives so tool-only responses
-    /// never produce an empty `{"type":"text","text":""}` block.
-    text_block_started: bool,
-    /// Whether the text content_block (index 0) has been closed.
-    text_block_closed: bool,
-    /// Running count of content blocks emitted so far (used as the next index).
-    next_block_index: u32,
-    /// Open tool_use blocks, as `(openai_tool_index, anthropic_block_index)`.
-    /// OpenAI-format streams fragment each tool call across many deltas keyed by
-    /// `index`; we open one Anthropic block per distinct index, stream its
-    /// argument fragments as `input_json_delta`, and close them all at the end.
-    tool_blocks: Vec<(u32, u32)>,
-    /// Block index assigned to the text content block (0 unless a thinking block
-    /// precedes it). Text is no longer hard-coded to index 0 because a `thinking`
-    /// block, when present, must come first.
-    text_block_index: u32,
-    /// Thinking (reasoning) block state. Reasoning models stream chain-of-thought
-    /// via `reasoning_content`; it is surfaced as an Anthropic `thinking` block
-    /// that precedes text/tool blocks.
-    thinking_started: bool,
-    thinking_closed: bool,
-    thinking_index: u32,
-}
+    use super::*;
+    use crate::error::ProxyError;
+    use crate::providers::ProviderStream;
 
-/// Wraps a `ProviderStream` (OpenAI chunk format) and re-emits events in the
-/// Anthropic SSE event protocol:
-/// `message_start` → `content_block_start` → `ping` →
-/// N× `content_block_delta` → `content_block_stop` →
-/// `message_delta` → `message_stop`
-pub fn openai_stream_to_anthropic_sse(
-    model: String,
-    msg_id: String,
-    stream: ProviderStream,
-) -> impl Stream<Item = Result<Event, ProxyError>> + Send {
-    use futures::StreamExt as _;
+    struct StreamState {
+        inner: ProviderStream,
+        model: String,
+        msg_id: String,
+        is_first: bool,
+        pending: VecDeque<Result<Event, ProxyError>>,
+        output_tokens: u32,
+        /// Prompt tokens. OpenAI-format upstreams deliver this only in the final
+        /// chunk's usage (via `stream_options.include_usage`), so we capture it
+        /// whenever a chunk carries usage and emit it in `message_delta`.
+        input_tokens: u32,
+        /// Prompt-cache counters recovered from the chunk usage's `extra`, emitted
+        /// alongside `input_tokens` in `message_delta` when present.
+        cache_creation_input_tokens: Option<u32>,
+        cache_read_input_tokens: Option<u32>,
+        stop_reason: String,
+        stream_done: bool,
+        /// Whether the text content_block (index 0) has been opened.
+        /// We defer opening it until actual text arrives so tool-only responses
+        /// never produce an empty `{"type":"text","text":""}` block.
+        text_block_started: bool,
+        /// Whether the text content_block (index 0) has been closed.
+        text_block_closed: bool,
+        /// Running count of content blocks emitted so far (used as the next index).
+        next_block_index: u32,
+        /// Open tool_use blocks, as `(openai_tool_index, anthropic_block_index)`.
+        /// OpenAI-format streams fragment each tool call across many deltas keyed by
+        /// `index`; we open one Anthropic block per distinct index, stream its
+        /// argument fragments as `input_json_delta`, and close them all at the end.
+        tool_blocks: Vec<(u32, u32)>,
+        /// Block index assigned to the text content block (0 unless a thinking block
+        /// precedes it). Text is no longer hard-coded to index 0 because a `thinking`
+        /// block, when present, must come first.
+        text_block_index: u32,
+        /// Thinking (reasoning) block state. Reasoning models stream chain-of-thought
+        /// via `reasoning_content`; it is surfaced as an Anthropic `thinking` block
+        /// that precedes text/tool blocks.
+        thinking_started: bool,
+        thinking_closed: bool,
+        thinking_index: u32,
+    }
 
-    let state = StreamState {
-        inner: stream,
-        model,
-        msg_id,
-        is_first: true,
-        pending: VecDeque::new(),
-        output_tokens: 0,
-        input_tokens: 0,
-        cache_creation_input_tokens: None,
-        cache_read_input_tokens: None,
-        stop_reason: "end_turn".to_string(),
-        stream_done: false,
-        text_block_started: false,
-        text_block_closed: false,
-        next_block_index: 0,
-        tool_blocks: Vec::new(),
-        text_block_index: 0,
-        thinking_started: false,
-        thinking_closed: false,
-        thinking_index: 0,
-    };
+    /// Wraps a `ProviderStream` (OpenAI chunk format) and re-emits events in the
+    /// Anthropic SSE event protocol:
+    /// `message_start` → `content_block_start` → `ping` →
+    /// N× `content_block_delta` → `content_block_stop` →
+    /// `message_delta` → `message_stop`
+    pub fn openai_stream_to_anthropic_sse(
+        model: String,
+        msg_id: String,
+        stream: ProviderStream,
+    ) -> impl Stream<Item = Result<Event, ProxyError>> + Send {
+        use futures::StreamExt as _;
 
-    futures::stream::unfold(state, |mut s| async move {
-        loop {
-            // Drain buffered events before polling the inner stream
-            if let Some(ev) = s.pending.pop_front() {
-                return Some((ev, s));
-            }
+        let state = StreamState {
+            inner: stream,
+            model,
+            msg_id,
+            is_first: true,
+            pending: VecDeque::new(),
+            output_tokens: 0,
+            input_tokens: 0,
+            cache_creation_input_tokens: None,
+            cache_read_input_tokens: None,
+            stop_reason: "end_turn".to_string(),
+            stream_done: false,
+            text_block_started: false,
+            text_block_closed: false,
+            next_block_index: 0,
+            tool_blocks: Vec::new(),
+            text_block_index: 0,
+            thinking_started: false,
+            thinking_closed: false,
+            thinking_index: 0,
+        };
 
-            if s.stream_done {
-                return None;
-            }
-
-            match s.inner.next().await {
-                None => {
-                    s.stream_done = true;
-                    if s.is_first {
-                        // Empty upstream — emit a minimal valid Anthropic sequence
-                        s.is_first = false;
-                        s.pending
-                            .push_back(Ok(make_message_start_event(&s.msg_id, &s.model, 0)));
-                        s.pending.push_back(Ok(make_ping_event()));
-                    }
-                    // Close any still-open thinking/text block.
-                    if s.thinking_started && !s.thinking_closed {
-                        s.thinking_closed = true;
-                        s.pending
-                            .push_back(Ok(make_content_block_stop_event(s.thinking_index)));
-                    }
-                    if s.text_block_started && !s.text_block_closed {
-                        s.text_block_closed = true;
-                        s.pending
-                            .push_back(Ok(make_content_block_stop_event(s.text_block_index)));
-                    }
-                    // Close every open tool_use block (in the order opened).
-                    for (_, block_index) in std::mem::take(&mut s.tool_blocks) {
-                        s.pending
-                            .push_back(Ok(make_content_block_stop_event(block_index)));
-                    }
-                    s.pending.push_back(Ok(make_message_delta_event(
-                        &s.stop_reason,
-                        s.input_tokens,
-                        s.output_tokens,
-                        s.cache_creation_input_tokens,
-                        s.cache_read_input_tokens,
-                    )));
-                    s.pending.push_back(Ok(make_message_stop_event()));
-                    // Loop back to drain pending
+        futures::stream::unfold(state, |mut s| async move {
+            loop {
+                // Drain buffered events before polling the inner stream
+                if let Some(ev) = s.pending.pop_front() {
+                    return Some((ev, s));
                 }
-                Some(Err(e)) => {
-                    // Emit a proper Anthropic `error` SSE event instead of yielding
-                    // a raw Err (which axum turns into a bare connection close with
-                    // no terminal event). Then end the stream.
-                    s.stream_done = true;
-                    return Some((Ok(make_error_event(&e)), s));
+
+                if s.stream_done {
+                    return None;
                 }
-                Some(Ok(chunk)) => {
-                    // Update accumulated state
-                    if let Some(usage) = &chunk.usage {
-                        s.output_tokens = usage.completion_tokens;
-                        if usage.prompt_tokens > 0 {
-                            s.input_tokens = usage.prompt_tokens;
-                        }
-                        let (creation, read) = crate::types::cache_tokens_from_extra(&usage.extra);
-                        // Keep the last chunk that actually reported each counter.
-                        s.cache_creation_input_tokens = creation.or(s.cache_creation_input_tokens);
-                        s.cache_read_input_tokens = read.or(s.cache_read_input_tokens);
-                    }
-                    if let Some(choice) = chunk.choices.first() {
-                        if let Some(reason) = &choice.finish_reason {
-                            s.stop_reason = finish_reason_to_anthropic(reason).to_string();
-                        }
-                    }
 
-                    let text = chunk
-                        .choices
-                        .first()
-                        .and_then(|c| c.delta.content.clone())
-                        .unwrap_or_default();
-
-                    let tool_calls = chunk
-                        .choices
-                        .first()
-                        .and_then(|c| c.delta.tool_calls.clone())
-                        .unwrap_or_default();
-
-                    let reasoning = chunk
-                        .choices
-                        .first()
-                        .and_then(|c| c.delta.reasoning_content.clone())
-                        .unwrap_or_default();
-
-                    if s.is_first {
-                        s.is_first = false;
-                        let input_tokens =
-                            chunk.usage.as_ref().map(|u| u.prompt_tokens).unwrap_or(0);
-                        s.pending.push_back(Ok(make_message_start_event(
-                            &s.msg_id,
-                            &s.model,
-                            input_tokens,
-                        )));
-                        s.pending.push_back(Ok(make_ping_event()));
-                        // Do NOT open the text block here; defer until text actually arrives
-                        // so tool-only responses never produce an empty text block.
-                    }
-
-                    // Thinking (reasoning) block — opened first, before text/tools.
-                    // Ignore reasoning that arrives after the block was closed
-                    // (e.g. reasoning interleaved after text) to avoid emitting a
-                    // delta into a stopped block.
-                    if !reasoning.is_empty() && !s.thinking_closed {
-                        if !s.thinking_started {
-                            s.thinking_started = true;
-                            s.thinking_index = s.next_block_index;
-                            s.next_block_index += 1;
+                match s.inner.next().await {
+                    None => {
+                        s.stream_done = true;
+                        if s.is_first {
+                            // Empty upstream — emit a minimal valid Anthropic sequence
+                            s.is_first = false;
                             s.pending
-                                .push_back(Ok(make_thinking_block_start_event(s.thinking_index)));
+                                .push_back(Ok(make_message_start_event(&s.msg_id, &s.model, 0)));
+                            s.pending.push_back(Ok(make_ping_event()));
                         }
-                        s.pending
-                            .push_back(Ok(make_thinking_delta_event(s.thinking_index, &reasoning)));
-                    }
-
-                    if !text.is_empty() {
-                        // Thinking always closes before the text block opens.
+                        // Close any still-open thinking/text block.
                         if s.thinking_started && !s.thinking_closed {
                             s.thinking_closed = true;
                             s.pending
                                 .push_back(Ok(make_content_block_stop_event(s.thinking_index)));
                         }
-                        // Open the text block on first actual text content.
-                        if !s.text_block_started {
-                            s.text_block_started = true;
-                            s.text_block_index = s.next_block_index;
-                            s.next_block_index += 1;
+                        if s.text_block_started && !s.text_block_closed {
+                            s.text_block_closed = true;
                             s.pending
-                                .push_back(Ok(make_content_block_start_event(s.text_block_index)));
+                                .push_back(Ok(make_content_block_stop_event(s.text_block_index)));
                         }
-                        s.pending.push_back(Ok(make_content_block_delta_event(
-                            s.text_block_index,
-                            &text,
+                        // Close every open tool_use block (in the order opened).
+                        for (_, block_index) in std::mem::take(&mut s.tool_blocks) {
+                            s.pending
+                                .push_back(Ok(make_content_block_stop_event(block_index)));
+                        }
+                        s.pending.push_back(Ok(make_message_delta_event(
+                            &s.stop_reason,
+                            s.input_tokens,
+                            s.output_tokens,
+                            s.cache_creation_input_tokens,
+                            s.cache_read_input_tokens,
                         )));
+                        s.pending.push_back(Ok(make_message_stop_event()));
+                        // Loop back to drain pending
                     }
+                    Some(Err(e)) => {
+                        // Emit a proper Anthropic `error` SSE event instead of yielding
+                        // a raw Err (which axum turns into a bare connection close with
+                        // no terminal event). Then end the stream.
+                        s.stream_done = true;
+                        return Some((Ok(make_error_event(&e)), s));
+                    }
+                    Some(Ok(chunk)) => {
+                        // Update accumulated state
+                        if let Some(usage) = &chunk.usage {
+                            s.output_tokens = usage.completion_tokens;
+                            if usage.prompt_tokens > 0 {
+                                s.input_tokens = usage.prompt_tokens;
+                            }
+                            let (creation, read) =
+                                crate::types::cache_tokens_from_extra(&usage.extra);
+                            // Keep the last chunk that actually reported each counter.
+                            s.cache_creation_input_tokens =
+                                creation.or(s.cache_creation_input_tokens);
+                            s.cache_read_input_tokens = read.or(s.cache_read_input_tokens);
+                        }
+                        if let Some(choice) = chunk.choices.first() {
+                            if let Some(reason) = &choice.finish_reason {
+                                s.stop_reason = finish_reason_to_anthropic(reason).to_string();
+                            }
+                        }
 
-                    // Accumulate fragmented tool-call deltas by `index`: open one
-                    // Anthropic tool_use block the first time an index is seen
-                    // (id/name arrive in that first fragment) and stream later
-                    // fragments' arguments into it. Blocks are closed at stream end.
-                    for tc in &tool_calls {
-                        // Some providers send -1 for a single tool call; clamp
-                        // negatives to 0 (matching the official SDKs).
-                        let idx = tc.index.max(0) as u32;
-                        let name = tc.function.as_ref().and_then(|f| f.name.as_deref());
-                        let args = tc.function.as_ref().and_then(|f| f.arguments.as_deref());
+                        let text = chunk
+                            .choices
+                            .first()
+                            .and_then(|c| c.delta.content.clone())
+                            .unwrap_or_default();
 
-                        // Open the block on first sighting of this tool index.
-                        if !s.tool_blocks.iter().any(|(oi, _)| *oi == idx) {
-                            // Close any open thinking/text block before the first
-                            // tool_use block.
+                        let tool_calls = chunk
+                            .choices
+                            .first()
+                            .and_then(|c| c.delta.tool_calls.clone())
+                            .unwrap_or_default();
+
+                        let reasoning = chunk
+                            .choices
+                            .first()
+                            .and_then(|c| c.delta.reasoning_content.clone())
+                            .unwrap_or_default();
+
+                        if s.is_first {
+                            s.is_first = false;
+                            let input_tokens =
+                                chunk.usage.as_ref().map(|u| u.prompt_tokens).unwrap_or(0);
+                            s.pending.push_back(Ok(make_message_start_event(
+                                &s.msg_id,
+                                &s.model,
+                                input_tokens,
+                            )));
+                            s.pending.push_back(Ok(make_ping_event()));
+                            // Do NOT open the text block here; defer until text actually arrives
+                            // so tool-only responses never produce an empty text block.
+                        }
+
+                        // Thinking (reasoning) block — opened first, before text/tools.
+                        // Ignore reasoning that arrives after the block was closed
+                        // (e.g. reasoning interleaved after text) to avoid emitting a
+                        // delta into a stopped block.
+                        if !reasoning.is_empty() && !s.thinking_closed {
+                            if !s.thinking_started {
+                                s.thinking_started = true;
+                                s.thinking_index = s.next_block_index;
+                                s.next_block_index += 1;
+                                s.pending.push_back(Ok(make_thinking_block_start_event(
+                                    s.thinking_index,
+                                )));
+                            }
+                            s.pending.push_back(Ok(make_thinking_delta_event(
+                                s.thinking_index,
+                                &reasoning,
+                            )));
+                        }
+
+                        if !text.is_empty() {
+                            // Thinking always closes before the text block opens.
                             if s.thinking_started && !s.thinking_closed {
                                 s.thinking_closed = true;
                                 s.pending
                                     .push_back(Ok(make_content_block_stop_event(s.thinking_index)));
                             }
-                            if s.text_block_started && !s.text_block_closed {
-                                s.text_block_closed = true;
-                                s.pending.push_back(Ok(make_content_block_stop_event(
+                            // Open the text block on first actual text content.
+                            if !s.text_block_started {
+                                s.text_block_started = true;
+                                s.text_block_index = s.next_block_index;
+                                s.next_block_index += 1;
+                                s.pending.push_back(Ok(make_content_block_start_event(
                                     s.text_block_index,
                                 )));
                             }
-                            let block_index = s.next_block_index;
-                            s.next_block_index += 1;
-                            s.tool_blocks.push((idx, block_index));
-                            s.pending.push_back(Ok(make_tool_use_block_start_event(
-                                block_index,
-                                tc.id.as_deref().unwrap_or(""),
-                                name.unwrap_or(""),
+                            s.pending.push_back(Ok(make_content_block_delta_event(
+                                s.text_block_index,
+                                &text,
                             )));
                         }
 
-                        // Stream this fragment's argument piece into the block.
-                        if let Some(args) = args.filter(|a| !a.is_empty()) {
-                            let block_index = s
-                                .tool_blocks
-                                .iter()
-                                .find(|(oi, _)| *oi == idx)
-                                .map(|(_, bi)| *bi)
-                                .unwrap_or(0);
-                            s.pending
-                                .push_back(Ok(make_input_json_delta_event(block_index, args)));
+                        // Accumulate fragmented tool-call deltas by `index`: open one
+                        // Anthropic tool_use block the first time an index is seen
+                        // (id/name arrive in that first fragment) and stream later
+                        // fragments' arguments into it. Blocks are closed at stream end.
+                        for tc in &tool_calls {
+                            // Some providers send -1 for a single tool call; clamp
+                            // negatives to 0 (matching the official SDKs).
+                            let idx = tc.index.max(0) as u32;
+                            let name = tc.function.as_ref().and_then(|f| f.name.as_deref());
+                            let args = tc.function.as_ref().and_then(|f| f.arguments.as_deref());
+
+                            // Open the block on first sighting of this tool index.
+                            if !s.tool_blocks.iter().any(|(oi, _)| *oi == idx) {
+                                // Close any open thinking/text block before the first
+                                // tool_use block.
+                                if s.thinking_started && !s.thinking_closed {
+                                    s.thinking_closed = true;
+                                    s.pending.push_back(Ok(make_content_block_stop_event(
+                                        s.thinking_index,
+                                    )));
+                                }
+                                if s.text_block_started && !s.text_block_closed {
+                                    s.text_block_closed = true;
+                                    s.pending.push_back(Ok(make_content_block_stop_event(
+                                        s.text_block_index,
+                                    )));
+                                }
+                                let block_index = s.next_block_index;
+                                s.next_block_index += 1;
+                                s.tool_blocks.push((idx, block_index));
+                                s.pending.push_back(Ok(make_tool_use_block_start_event(
+                                    block_index,
+                                    tc.id.as_deref().unwrap_or(""),
+                                    name.unwrap_or(""),
+                                )));
+                            }
+
+                            // Stream this fragment's argument piece into the block.
+                            if let Some(args) = args.filter(|a| !a.is_empty()) {
+                                let block_index = s
+                                    .tool_blocks
+                                    .iter()
+                                    .find(|(oi, _)| *oi == idx)
+                                    .map(|(_, bi)| *bi)
+                                    .unwrap_or(0);
+                                s.pending
+                                    .push_back(Ok(make_input_json_delta_event(block_index, args)));
+                            }
                         }
+                        // Loop back to drain pending or fetch the next chunk
                     }
-                    // Loop back to drain pending or fetch the next chunk
                 }
             }
-        }
-    })
-}
+        })
+    }
 
-// ── SSE event constructors ────────────────────────────────────────────────────
+    // ── SSE event constructors ────────────────────────────────────────────────────
 
-fn make_message_start_event(msg_id: &str, model: &str, input_tokens: u32) -> Event {
-    let data = serde_json::json!({
-        "type": "message_start",
-        "message": {
-            "id": msg_id,
-            "type": "message",
-            "role": "assistant",
-            "content": [],
-            "model": model,
-            "stop_reason": null,
-            "stop_sequence": null,
-            "usage": {
-                "input_tokens": input_tokens,
-                "output_tokens": 1
+    fn make_message_start_event(msg_id: &str, model: &str, input_tokens: u32) -> Event {
+        let data = serde_json::json!({
+            "type": "message_start",
+            "message": {
+                "id": msg_id,
+                "type": "message",
+                "role": "assistant",
+                "content": [],
+                "model": model,
+                "stop_reason": null,
+                "stop_sequence": null,
+                "usage": {
+                    "input_tokens": input_tokens,
+                    "output_tokens": 1
+                }
+            }
+        });
+        Event::default()
+            .event("message_start")
+            .data(data.to_string())
+    }
+
+    fn make_content_block_start_event(index: u32) -> Event {
+        let data = serde_json::json!({
+            "type": "content_block_start",
+            "index": index,
+            "content_block": {"type": "text", "text": ""}
+        });
+        Event::default()
+            .event("content_block_start")
+            .data(data.to_string())
+    }
+
+    fn make_tool_use_block_start_event(index: u32, id: &str, name: &str) -> Event {
+        let data = serde_json::json!({
+            "type": "content_block_start",
+            "index": index,
+            "content_block": {"type": "tool_use", "id": id, "name": name, "input": {}}
+        });
+        Event::default()
+            .event("content_block_start")
+            .data(data.to_string())
+    }
+
+    fn make_error_event(e: &ProxyError) -> Event {
+        let (error_type, message) = match e {
+            ProxyError::Unauthorized(m) => ("authentication_error", m.clone()),
+            ProxyError::Forbidden(m) => ("permission_error", m.clone()),
+            ProxyError::ModelNotFound(m) => ("not_found_error", m.clone()),
+            ProxyError::RateLimited(m) | ProxyError::BudgetExceeded(m) => {
+                ("rate_limit_error", m.clone())
+            }
+            ProxyError::CircuitOpen(m) => ("overloaded_error", m.clone()),
+            other => ("api_error", other.to_string()),
+        };
+        let data = serde_json::json!({
+            "type": "error",
+            "error": {"type": error_type, "message": message}
+        });
+        Event::default().event("error").data(data.to_string())
+    }
+
+    fn make_thinking_block_start_event(index: u32) -> Event {
+        let data = serde_json::json!({
+            "type": "content_block_start",
+            "index": index,
+            "content_block": {"type": "thinking", "thinking": ""}
+        });
+        Event::default()
+            .event("content_block_start")
+            .data(data.to_string())
+    }
+
+    fn make_thinking_delta_event(index: u32, thinking: &str) -> Event {
+        let data = serde_json::json!({
+            "type": "content_block_delta",
+            "index": index,
+            "delta": {"type": "thinking_delta", "thinking": thinking}
+        });
+        Event::default()
+            .event("content_block_delta")
+            .data(data.to_string())
+    }
+
+    fn make_input_json_delta_event(index: u32, partial_json: &str) -> Event {
+        let data = serde_json::json!({
+            "type": "content_block_delta",
+            "index": index,
+            "delta": {"type": "input_json_delta", "partial_json": partial_json}
+        });
+        Event::default()
+            .event("content_block_delta")
+            .data(data.to_string())
+    }
+
+    fn make_ping_event() -> Event {
+        Event::default()
+            .event("ping")
+            .data(serde_json::json!({"type": "ping"}).to_string())
+    }
+
+    fn make_content_block_delta_event(index: u32, text: &str) -> Event {
+        let data = serde_json::json!({
+            "type": "content_block_delta",
+            "index": index,
+            "delta": {"type": "text_delta", "text": text}
+        });
+        Event::default()
+            .event("content_block_delta")
+            .data(data.to_string())
+    }
+
+    fn make_content_block_stop_event(index: u32) -> Event {
+        Event::default()
+            .event("content_block_stop")
+            .data(serde_json::json!({"type": "content_block_stop", "index": index}).to_string())
+    }
+
+    fn make_message_delta_event(
+        stop_reason: &str,
+        input_tokens: u32,
+        output_tokens: u32,
+        cache_creation_input_tokens: Option<u32>,
+        cache_read_input_tokens: Option<u32>,
+    ) -> Event {
+        // Anthropic clients read the authoritative `input_tokens` from `message_delta`
+        // (message_start only carries a placeholder), so surface it here.
+        let mut usage = serde_json::json!({
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+        });
+        // Only present when the upstream reported them, so a non-caching stream is
+        // byte-identical to one from before cache support existed.
+        if let Some(map) = usage.as_object_mut() {
+            if let Some(creation) = cache_creation_input_tokens {
+                map.insert("cache_creation_input_tokens".to_string(), creation.into());
+            }
+            if let Some(read) = cache_read_input_tokens {
+                map.insert("cache_read_input_tokens".to_string(), read.into());
             }
         }
-    });
-    Event::default()
-        .event("message_start")
-        .data(data.to_string())
-}
-
-fn make_content_block_start_event(index: u32) -> Event {
-    let data = serde_json::json!({
-        "type": "content_block_start",
-        "index": index,
-        "content_block": {"type": "text", "text": ""}
-    });
-    Event::default()
-        .event("content_block_start")
-        .data(data.to_string())
-}
-
-fn make_tool_use_block_start_event(index: u32, id: &str, name: &str) -> Event {
-    let data = serde_json::json!({
-        "type": "content_block_start",
-        "index": index,
-        "content_block": {"type": "tool_use", "id": id, "name": name, "input": {}}
-    });
-    Event::default()
-        .event("content_block_start")
-        .data(data.to_string())
-}
-
-fn make_error_event(e: &ProxyError) -> Event {
-    let (error_type, message) = match e {
-        ProxyError::Unauthorized(m) => ("authentication_error", m.clone()),
-        ProxyError::Forbidden(m) => ("permission_error", m.clone()),
-        ProxyError::ModelNotFound(m) => ("not_found_error", m.clone()),
-        ProxyError::RateLimited(m) | ProxyError::BudgetExceeded(m) => {
-            ("rate_limit_error", m.clone())
-        }
-        ProxyError::CircuitOpen(m) => ("overloaded_error", m.clone()),
-        other => ("api_error", other.to_string()),
-    };
-    let data = serde_json::json!({
-        "type": "error",
-        "error": {"type": error_type, "message": message}
-    });
-    Event::default().event("error").data(data.to_string())
-}
-
-fn make_thinking_block_start_event(index: u32) -> Event {
-    let data = serde_json::json!({
-        "type": "content_block_start",
-        "index": index,
-        "content_block": {"type": "thinking", "thinking": ""}
-    });
-    Event::default()
-        .event("content_block_start")
-        .data(data.to_string())
-}
-
-fn make_thinking_delta_event(index: u32, thinking: &str) -> Event {
-    let data = serde_json::json!({
-        "type": "content_block_delta",
-        "index": index,
-        "delta": {"type": "thinking_delta", "thinking": thinking}
-    });
-    Event::default()
-        .event("content_block_delta")
-        .data(data.to_string())
-}
-
-fn make_input_json_delta_event(index: u32, partial_json: &str) -> Event {
-    let data = serde_json::json!({
-        "type": "content_block_delta",
-        "index": index,
-        "delta": {"type": "input_json_delta", "partial_json": partial_json}
-    });
-    Event::default()
-        .event("content_block_delta")
-        .data(data.to_string())
-}
-
-fn make_ping_event() -> Event {
-    Event::default()
-        .event("ping")
-        .data(serde_json::json!({"type": "ping"}).to_string())
-}
-
-fn make_content_block_delta_event(index: u32, text: &str) -> Event {
-    let data = serde_json::json!({
-        "type": "content_block_delta",
-        "index": index,
-        "delta": {"type": "text_delta", "text": text}
-    });
-    Event::default()
-        .event("content_block_delta")
-        .data(data.to_string())
-}
-
-fn make_content_block_stop_event(index: u32) -> Event {
-    Event::default()
-        .event("content_block_stop")
-        .data(serde_json::json!({"type": "content_block_stop", "index": index}).to_string())
-}
-
-fn make_message_delta_event(
-    stop_reason: &str,
-    input_tokens: u32,
-    output_tokens: u32,
-    cache_creation_input_tokens: Option<u32>,
-    cache_read_input_tokens: Option<u32>,
-) -> Event {
-    // Anthropic clients read the authoritative `input_tokens` from `message_delta`
-    // (message_start only carries a placeholder), so surface it here.
-    let mut usage = serde_json::json!({
-        "input_tokens": input_tokens,
-        "output_tokens": output_tokens,
-    });
-    // Only present when the upstream reported them, so a non-caching stream is
-    // byte-identical to one from before cache support existed.
-    if let Some(map) = usage.as_object_mut() {
-        if let Some(creation) = cache_creation_input_tokens {
-            map.insert("cache_creation_input_tokens".to_string(), creation.into());
-        }
-        if let Some(read) = cache_read_input_tokens {
-            map.insert("cache_read_input_tokens".to_string(), read.into());
-        }
+        let data = serde_json::json!({
+            "type": "message_delta",
+            "delta": {
+                "stop_reason": stop_reason,
+                "stop_sequence": null
+            },
+            "usage": usage
+        });
+        Event::default()
+            .event("message_delta")
+            .data(data.to_string())
     }
-    let data = serde_json::json!({
-        "type": "message_delta",
-        "delta": {
-            "stop_reason": stop_reason,
-            "stop_sequence": null
-        },
-        "usage": usage
-    });
-    Event::default()
-        .event("message_delta")
-        .data(data.to_string())
+
+    fn make_message_stop_event() -> Event {
+        Event::default()
+            .event("message_stop")
+            .data(serde_json::json!({"type": "message_stop"}).to_string())
+    }
 }
 
-fn make_message_stop_event() -> Event {
-    Event::default()
-        .event("message_stop")
-        .data(serde_json::json!({"type": "message_stop"}).to_string())
-}
+#[cfg(feature = "axum")]
+pub use sse::openai_stream_to_anthropic_sse;
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
@@ -2046,547 +2068,553 @@ mod tests {
         assert!(tool_result_images(Some(&serde_json::json!("plain text"))).is_empty());
     }
 
-    // ── openai_stream_to_anthropic_sse ────────────────────────────────────────
+    // The SSE emitters these exercise are `axum`-gated, so the tests are too.
+    #[cfg(feature = "axum")]
+    mod sse {
+        use super::*;
 
-    use crate::types::{ChatCompletionChunk, ChunkChoice, ChunkDelta};
-    use futures::StreamExt;
+        // ── openai_stream_to_anthropic_sse ────────────────────────────────────────
 
-    fn make_chunk(content: Option<&str>, finish_reason: Option<&str>) -> ChatCompletionChunk {
-        ChatCompletionChunk {
-            id: "chatcmpl-1".to_string(),
-            object: "chat.completion.chunk".to_string(),
-            created: 0,
-            model: "gpt-4o".to_string(),
-            choices: vec![ChunkChoice {
-                index: 0,
-                delta: ChunkDelta {
-                    role: None,
-                    content: content.map(str::to_string),
-                    tool_calls: None,
-                    reasoning_content: None,
-                },
-                finish_reason: finish_reason.map(str::to_string),
+        use crate::error::ProxyError;
+        use crate::providers::ProviderStream;
+        use crate::types::{ChatCompletionChunk, ChunkChoice, ChunkDelta};
+        use futures::StreamExt;
+
+        fn make_chunk(content: Option<&str>, finish_reason: Option<&str>) -> ChatCompletionChunk {
+            ChatCompletionChunk {
+                id: "chatcmpl-1".to_string(),
+                object: "chat.completion.chunk".to_string(),
+                created: 0,
+                model: "gpt-4o".to_string(),
+                choices: vec![ChunkChoice {
+                    index: 0,
+                    delta: ChunkDelta {
+                        role: None,
+                        content: content.map(str::to_string),
+                        tool_calls: None,
+                        reasoning_content: None,
+                    },
+                    finish_reason: finish_reason.map(str::to_string),
+                    extra: Default::default(),
+                }],
+                usage: None,
                 extra: Default::default(),
-            }],
-            usage: None,
-            extra: Default::default(),
-        }
-    }
-
-    fn make_tool_call_chunk(
-        id: &str,
-        name: &str,
-        args: &str,
-        finish_reason: Option<&str>,
-    ) -> ChatCompletionChunk {
-        ChatCompletionChunk {
-            id: "chatcmpl-1".to_string(),
-            object: "chat.completion.chunk".to_string(),
-            created: 0,
-            model: "gpt-4o".to_string(),
-            choices: vec![ChunkChoice {
-                index: 0,
-                delta: ChunkDelta {
-                    role: None,
-                    content: None,
-                    tool_calls: Some(vec![crate::types::StreamToolCall {
-                        index: 0,
-                        id: Some(id.to_string()),
-                        r#type: Some("function".to_string()),
-                        function: Some(crate::types::StreamFunctionCall {
-                            name: Some(name.to_string()),
-                            arguments: Some(args.to_string()),
-                        }),
-                    }]),
-                    reasoning_content: None,
-                },
-                finish_reason: finish_reason.map(str::to_string),
-                extra: Default::default(),
-            }],
-            usage: None,
-            extra: Default::default(),
-        }
-    }
-
-    /// One fragmented streaming tool-call delta (id/name only in the first).
-    fn tool_frag(
-        index: i32,
-        id: Option<&str>,
-        name: Option<&str>,
-        args: Option<&str>,
-        finish: Option<&str>,
-    ) -> ChatCompletionChunk {
-        ChatCompletionChunk {
-            id: "c".to_string(),
-            object: "chat.completion.chunk".to_string(),
-            created: 0,
-            model: "k".to_string(),
-            choices: vec![ChunkChoice {
-                index: 0,
-                delta: ChunkDelta {
-                    role: None,
-                    content: None,
-                    tool_calls: Some(vec![crate::types::StreamToolCall {
-                        index,
-                        id: id.map(str::to_string),
-                        r#type: id.map(|_| "function".to_string()),
-                        function: Some(crate::types::StreamFunctionCall {
-                            name: name.map(str::to_string),
-                            arguments: args.map(str::to_string),
-                        }),
-                    }]),
-                    reasoning_content: None,
-                },
-                finish_reason: finish.map(str::to_string),
-                extra: Default::default(),
-            }],
-            usage: None,
-            extra: Default::default(),
-        }
-    }
-
-    #[test]
-    fn streaming_tool_call_continuation_fragment_deserializes() {
-        // Regression: continuation fragments carry only `index` + partial
-        // `arguments` (no id/type/name). Modelling those as required aborted the
-        // whole stream. They must now deserialize.
-        let json = r#"{"id":"c","object":"chat.completion.chunk","created":0,"model":"k","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"date"}}]},"finish_reason":null}],"usage":null}"#;
-        let chunk: ChatCompletionChunk =
-            serde_json::from_str(json).expect("continuation fragment must deserialize");
-        let tc = &chunk.choices[0].delta.tool_calls.as_ref().unwrap()[0];
-        assert_eq!(tc.index, 0);
-        assert!(tc.id.is_none());
-        assert_eq!(
-            tc.function.as_ref().unwrap().arguments.as_deref(),
-            Some("date")
-        );
-    }
-
-    #[tokio::test]
-    async fn fragmented_tool_call_accumulates_into_one_block() {
-        // id+name in the first fragment, arguments streamed across the rest.
-        let chunks: Vec<Result<ChatCompletionChunk, ProxyError>> = vec![
-            Ok(tool_frag(0, Some("t1"), Some("Bash"), Some(""), None)),
-            Ok(tool_frag(0, None, None, Some(r#"{"cmd":""#), None)),
-            Ok(tool_frag(0, None, None, Some("ls"), None)),
-            Ok(tool_frag(0, None, None, Some(r#""}"#), None)),
-            Ok(make_chunk(None, Some("tool_calls"))),
-        ];
-        let inner: ProviderStream = Box::pin(futures::stream::iter(chunks));
-        let events: Vec<_> =
-            openai_stream_to_anthropic_sse("m".to_string(), "msg".to_string(), inner)
-                .collect()
-                .await;
-
-        assert!(events.iter().all(|e| e.is_ok()), "stream must not abort");
-        let dump = events
-            .iter()
-            .map(|e| format!("{:?}", e.as_ref().unwrap()))
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        // Exactly ONE tool block: one start, one stop (not one per fragment).
-        // Count the SSE event-name line ("content_block_start" also appears in
-        // the JSON `type` field, so match the `event:` prefix).
-        assert_eq!(
-            dump.matches("event: content_block_start").count(),
-            1,
-            "exactly one content_block_start: {dump}"
-        );
-        assert_eq!(
-            dump.matches("event: content_block_stop").count(),
-            1,
-            "exactly one content_block_stop"
-        );
-        // id + name captured from the first fragment.
-        assert!(dump.contains("t1") && dump.contains("Bash"));
-        // Three non-empty argument fragments streamed as input_json_delta.
-        assert_eq!(
-            dump.matches("input_json_delta").count(),
-            3,
-            "one input_json_delta per non-empty arg fragment: {dump}"
-        );
-    }
-
-    #[tokio::test]
-    async fn parallel_tool_calls_produce_distinct_blocks() {
-        // Two tool calls interleaved by index 0 and 1.
-        let chunks: Vec<Result<ChatCompletionChunk, ProxyError>> = vec![
-            Ok(tool_frag(
-                0,
-                Some("a"),
-                Some("Bash"),
-                Some(r#"{"c":"#),
-                None,
-            )),
-            Ok(tool_frag(
-                1,
-                Some("b"),
-                Some("Read"),
-                Some(r#"{"p":"#),
-                None,
-            )),
-            Ok(tool_frag(0, None, None, Some("1}"), None)),
-            Ok(tool_frag(1, None, None, Some("2}"), None)),
-            Ok(make_chunk(None, Some("tool_calls"))),
-        ];
-        let inner: ProviderStream = Box::pin(futures::stream::iter(chunks));
-        let events: Vec<_> =
-            openai_stream_to_anthropic_sse("m".to_string(), "msg".to_string(), inner)
-                .collect()
-                .await;
-        assert!(events.iter().all(|e| e.is_ok()));
-        let dump = events
-            .iter()
-            .map(|e| format!("{:?}", e.as_ref().unwrap()))
-            .collect::<Vec<_>>()
-            .join("\n");
-        // Two distinct tool blocks: two starts, two stops.
-        assert_eq!(dump.matches("event: content_block_start").count(), 2);
-        assert_eq!(dump.matches("event: content_block_stop").count(), 2);
-        assert!(dump.contains("Bash") && dump.contains("Read"));
-    }
-
-    #[tokio::test]
-    async fn negative_tool_call_index_is_clamped() {
-        // A provider that sends -1 for a single tool call must not abort.
-        let chunks: Vec<Result<ChatCompletionChunk, ProxyError>> = vec![
-            Ok(tool_frag(
-                -1,
-                Some("x"),
-                Some("Bash"),
-                Some(r#"{"c":"ls"}"#),
-                None,
-            )),
-            Ok(make_chunk(None, Some("tool_calls"))),
-        ];
-        let inner: ProviderStream = Box::pin(futures::stream::iter(chunks));
-        let events: Vec<_> =
-            openai_stream_to_anthropic_sse("m".to_string(), "msg".to_string(), inner)
-                .collect()
-                .await;
-        assert!(
-            events.iter().all(|e| e.is_ok()),
-            "stream must not abort on index -1"
-        );
-        let dump = events
-            .iter()
-            .map(|e| format!("{:?}", e.as_ref().unwrap()))
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert_eq!(dump.matches("event: content_block_start").count(), 1);
-        assert!(dump.contains("Bash"));
-    }
-
-    #[tokio::test]
-    async fn reasoning_content_emits_thinking_block_before_text() {
-        let mut r_chunk = make_chunk(None, None);
-        r_chunk.choices[0].delta.reasoning_content = Some("pondering".to_string());
-        let chunks: Vec<Result<ChatCompletionChunk, ProxyError>> = vec![
-            Ok(r_chunk),
-            Ok(make_chunk(Some("answer"), None)),
-            Ok(make_chunk(None, Some("stop"))),
-        ];
-        let inner: ProviderStream = Box::pin(futures::stream::iter(chunks));
-        let events: Vec<_> =
-            openai_stream_to_anthropic_sse("m".to_string(), "msg".to_string(), inner)
-                .collect()
-                .await;
-        assert!(events.iter().all(|e| e.is_ok()));
-        let dump = events
-            .iter()
-            .map(|e| format!("{:?}", e.as_ref().unwrap()))
-            .collect::<Vec<_>>()
-            .join("\n");
-        // A thinking block with a thinking_delta is emitted.
-        assert!(
-            dump.contains("thinking_delta"),
-            "thinking_delta emitted: {dump}"
-        );
-        assert!(dump.contains("pondering"));
-        // Thinking precedes text; two content blocks open (thinking + text).
-        assert!(
-            dump.find("pondering").unwrap() < dump.find("answer").unwrap(),
-            "thinking must precede text"
-        );
-        assert_eq!(dump.matches("event: content_block_start").count(), 2);
-    }
-
-    /// Tool-only stream must NOT produce an empty text block.
-    /// If it did, Anthropic would reject the next request with
-    /// "messages: text content blocks must be non-empty".
-    #[tokio::test]
-    async fn tool_only_stream_emits_no_empty_text_block() {
-        let chunks: Vec<Result<ChatCompletionChunk, ProxyError>> = vec![Ok(make_tool_call_chunk(
-            "call_abc",
-            "bash",
-            r#"{"cmd":"ls"}"#,
-            Some("tool_calls"),
-        ))];
-        let inner: ProviderStream = Box::pin(futures::stream::iter(chunks));
-        let events: Vec<_> =
-            openai_stream_to_anthropic_sse("m".to_string(), "msg_tool".to_string(), inner)
-                .collect()
-                .await;
-
-        assert!(events.iter().all(|e| e.is_ok()));
-
-        // Verify no content_block_start with type "text" appears
-        for sse in events.iter().flatten() {
-            let data = format!("{:?}", sse);
-            if data.contains("content_block_start") {
-                assert!(
-                    !data.contains(r#""type":"text""#),
-                    "tool-only response must not emit a text content block: {data}"
-                );
             }
         }
-    }
 
-    #[tokio::test]
-    async fn stream_emits_correct_event_sequence() {
-        let chunks: Vec<Result<ChatCompletionChunk, ProxyError>> = vec![
-            Ok(make_chunk(Some("Hello"), None)),
-            Ok(make_chunk(Some(" world"), None)),
-            Ok(make_chunk(None, Some("stop"))),
-        ];
-        let inner = futures::stream::iter(chunks);
-        let inner: ProviderStream = Box::pin(inner);
+        fn make_tool_call_chunk(
+            id: &str,
+            name: &str,
+            args: &str,
+            finish_reason: Option<&str>,
+        ) -> ChatCompletionChunk {
+            ChatCompletionChunk {
+                id: "chatcmpl-1".to_string(),
+                object: "chat.completion.chunk".to_string(),
+                created: 0,
+                model: "gpt-4o".to_string(),
+                choices: vec![ChunkChoice {
+                    index: 0,
+                    delta: ChunkDelta {
+                        role: None,
+                        content: None,
+                        tool_calls: Some(vec![crate::types::StreamToolCall {
+                            index: 0,
+                            id: Some(id.to_string()),
+                            r#type: Some("function".to_string()),
+                            function: Some(crate::types::StreamFunctionCall {
+                                name: Some(name.to_string()),
+                                arguments: Some(args.to_string()),
+                            }),
+                        }]),
+                        reasoning_content: None,
+                    },
+                    finish_reason: finish_reason.map(str::to_string),
+                    extra: Default::default(),
+                }],
+                usage: None,
+                extra: Default::default(),
+            }
+        }
 
-        let events: Vec<_> = openai_stream_to_anthropic_sse(
-            "claude-sonnet".to_string(),
-            "msg_test123".to_string(),
-            inner,
-        )
-        .collect()
-        .await;
+        /// One fragmented streaming tool-call delta (id/name only in the first).
+        fn tool_frag(
+            index: i32,
+            id: Option<&str>,
+            name: Option<&str>,
+            args: Option<&str>,
+            finish: Option<&str>,
+        ) -> ChatCompletionChunk {
+            ChatCompletionChunk {
+                id: "c".to_string(),
+                object: "chat.completion.chunk".to_string(),
+                created: 0,
+                model: "k".to_string(),
+                choices: vec![ChunkChoice {
+                    index: 0,
+                    delta: ChunkDelta {
+                        role: None,
+                        content: None,
+                        tool_calls: Some(vec![crate::types::StreamToolCall {
+                            index,
+                            id: id.map(str::to_string),
+                            r#type: id.map(|_| "function".to_string()),
+                            function: Some(crate::types::StreamFunctionCall {
+                                name: name.map(str::to_string),
+                                arguments: args.map(str::to_string),
+                            }),
+                        }]),
+                        reasoning_content: None,
+                    },
+                    finish_reason: finish.map(str::to_string),
+                    extra: Default::default(),
+                }],
+                usage: None,
+                extra: Default::default(),
+            }
+        }
 
-        // All events should be Ok
-        assert!(events.iter().all(|e| e.is_ok()));
+        #[test]
+        fn streaming_tool_call_continuation_fragment_deserializes() {
+            // Regression: continuation fragments carry only `index` + partial
+            // `arguments` (no id/type/name). Modelling those as required aborted the
+            // whole stream. They must now deserialize.
+            let json = r#"{"id":"c","object":"chat.completion.chunk","created":0,"model":"k","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"date"}}]},"finish_reason":null}],"usage":null}"#;
+            let chunk: ChatCompletionChunk =
+                serde_json::from_str(json).expect("continuation fragment must deserialize");
+            let tc = &chunk.choices[0].delta.tool_calls.as_ref().unwrap()[0];
+            assert_eq!(tc.index, 0);
+            assert!(tc.id.is_none());
+            assert_eq!(
+                tc.function.as_ref().unwrap().arguments.as_deref(),
+                Some("date")
+            );
+        }
 
-        // We expect: message_start, content_block_start, ping,
-        //            delta("Hello"), delta(" world"),
-        //            content_block_stop, message_delta, message_stop
-        assert_eq!(events.len(), 8);
-    }
+        #[tokio::test]
+        async fn fragmented_tool_call_accumulates_into_one_block() {
+            // id+name in the first fragment, arguments streamed across the rest.
+            let chunks: Vec<Result<ChatCompletionChunk, ProxyError>> = vec![
+                Ok(tool_frag(0, Some("t1"), Some("Bash"), Some(""), None)),
+                Ok(tool_frag(0, None, None, Some(r#"{"cmd":""#), None)),
+                Ok(tool_frag(0, None, None, Some("ls"), None)),
+                Ok(tool_frag(0, None, None, Some(r#""}"#), None)),
+                Ok(make_chunk(None, Some("tool_calls"))),
+            ];
+            let inner: ProviderStream = Box::pin(futures::stream::iter(chunks));
+            let events: Vec<_> =
+                openai_stream_to_anthropic_sse("m".to_string(), "msg".to_string(), inner)
+                    .collect()
+                    .await;
 
-    #[tokio::test]
-    async fn message_delta_includes_input_tokens_from_final_usage() {
-        // OpenAI-format upstreams report prompt_tokens only in the final chunk's
-        // usage; it must surface as Anthropic `input_tokens` in message_delta.
-        let mut usage_chunk = make_chunk(None, Some("stop"));
-        usage_chunk.usage = Some(crate::types::Usage {
-            prompt_tokens: 123,
-            completion_tokens: 45,
-            total_tokens: 168,
-            extra: Default::default(),
-        });
-        let chunks: Vec<Result<ChatCompletionChunk, ProxyError>> =
-            vec![Ok(make_chunk(Some("hi"), None)), Ok(usage_chunk)];
-        let inner: ProviderStream = Box::pin(futures::stream::iter(chunks));
+            assert!(events.iter().all(|e| e.is_ok()), "stream must not abort");
+            let dump = events
+                .iter()
+                .map(|e| format!("{:?}", e.as_ref().unwrap()))
+                .collect::<Vec<_>>()
+                .join("\n");
 
-        let events: Vec<_> =
-            openai_stream_to_anthropic_sse("m".to_string(), "msg_u".to_string(), inner)
-                .collect()
-                .await;
-        let dump = events
-            .iter()
-            .map(|e| format!("{:?}", e.as_ref().unwrap()))
-            .collect::<Vec<_>>()
-            .join("\n");
-        // Event Debug-formats its buffer as an escaped byte string, so quotes
-        // appear as \"; match the token/value pair rather than exact JSON.
-        assert!(
-            dump.contains(r#"input_tokens\":123"#),
-            "message_delta must carry input_tokens: {dump}"
-        );
-        assert!(dump.contains(r#"output_tokens\":45"#));
-    }
+            // Exactly ONE tool block: one start, one stop (not one per fragment).
+            // Count the SSE event-name line ("content_block_start" also appears in
+            // the JSON `type` field, so match the `event:` prefix).
+            assert_eq!(
+                dump.matches("event: content_block_start").count(),
+                1,
+                "exactly one content_block_start: {dump}"
+            );
+            assert_eq!(
+                dump.matches("event: content_block_stop").count(),
+                1,
+                "exactly one content_block_stop"
+            );
+            // id + name captured from the first fragment.
+            assert!(dump.contains("t1") && dump.contains("Bash"));
+            // Three non-empty argument fragments streamed as input_json_delta.
+            assert_eq!(
+                dump.matches("input_json_delta").count(),
+                3,
+                "one input_json_delta per non-empty arg fragment: {dump}"
+            );
+        }
 
-    #[tokio::test]
-    async fn message_delta_includes_cache_counters_from_usage_extra() {
-        let mut usage_chunk = make_chunk(None, Some("stop"));
-        usage_chunk.usage = Some(crate::types::Usage {
-            prompt_tokens: 47,
-            completion_tokens: 2,
-            total_tokens: 49,
-            extra: crate::types::cache_usage_extra(Some(100), Some(3968)),
-        });
-        let chunks: Vec<Result<ChatCompletionChunk, ProxyError>> = vec![Ok(usage_chunk)];
-        let inner: ProviderStream = Box::pin(futures::stream::iter(chunks));
+        #[tokio::test]
+        async fn parallel_tool_calls_produce_distinct_blocks() {
+            // Two tool calls interleaved by index 0 and 1.
+            let chunks: Vec<Result<ChatCompletionChunk, ProxyError>> = vec![
+                Ok(tool_frag(
+                    0,
+                    Some("a"),
+                    Some("Bash"),
+                    Some(r#"{"c":"#),
+                    None,
+                )),
+                Ok(tool_frag(
+                    1,
+                    Some("b"),
+                    Some("Read"),
+                    Some(r#"{"p":"#),
+                    None,
+                )),
+                Ok(tool_frag(0, None, None, Some("1}"), None)),
+                Ok(tool_frag(1, None, None, Some("2}"), None)),
+                Ok(make_chunk(None, Some("tool_calls"))),
+            ];
+            let inner: ProviderStream = Box::pin(futures::stream::iter(chunks));
+            let events: Vec<_> =
+                openai_stream_to_anthropic_sse("m".to_string(), "msg".to_string(), inner)
+                    .collect()
+                    .await;
+            assert!(events.iter().all(|e| e.is_ok()));
+            let dump = events
+                .iter()
+                .map(|e| format!("{:?}", e.as_ref().unwrap()))
+                .collect::<Vec<_>>()
+                .join("\n");
+            // Two distinct tool blocks: two starts, two stops.
+            assert_eq!(dump.matches("event: content_block_start").count(), 2);
+            assert_eq!(dump.matches("event: content_block_stop").count(), 2);
+            assert!(dump.contains("Bash") && dump.contains("Read"));
+        }
 
-        let events: Vec<_> =
-            openai_stream_to_anthropic_sse("m".to_string(), "msg_c".to_string(), inner)
-                .collect()
-                .await;
-        let dump = events
-            .iter()
-            .map(|e| format!("{:?}", e.as_ref().unwrap()))
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(
-            dump.contains(r#"cache_read_input_tokens\":3968"#),
-            "message_delta must carry cache_read_input_tokens: {dump}"
-        );
-        assert!(
-            dump.contains(r#"cache_creation_input_tokens\":100"#),
-            "message_delta must carry cache_creation_input_tokens: {dump}"
-        );
-    }
+        #[tokio::test]
+        async fn negative_tool_call_index_is_clamped() {
+            // A provider that sends -1 for a single tool call must not abort.
+            let chunks: Vec<Result<ChatCompletionChunk, ProxyError>> = vec![
+                Ok(tool_frag(
+                    -1,
+                    Some("x"),
+                    Some("Bash"),
+                    Some(r#"{"c":"ls"}"#),
+                    None,
+                )),
+                Ok(make_chunk(None, Some("tool_calls"))),
+            ];
+            let inner: ProviderStream = Box::pin(futures::stream::iter(chunks));
+            let events: Vec<_> =
+                openai_stream_to_anthropic_sse("m".to_string(), "msg".to_string(), inner)
+                    .collect()
+                    .await;
+            assert!(
+                events.iter().all(|e| e.is_ok()),
+                "stream must not abort on index -1"
+            );
+            let dump = events
+                .iter()
+                .map(|e| format!("{:?}", e.as_ref().unwrap()))
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert_eq!(dump.matches("event: content_block_start").count(), 1);
+            assert!(dump.contains("Bash"));
+        }
 
-    #[tokio::test]
-    async fn message_delta_omits_cache_counters_when_absent() {
-        let mut usage_chunk = make_chunk(None, Some("stop"));
-        usage_chunk.usage = Some(crate::types::Usage {
-            prompt_tokens: 123,
-            completion_tokens: 45,
-            total_tokens: 168,
-            extra: Default::default(),
-        });
-        let chunks: Vec<Result<ChatCompletionChunk, ProxyError>> = vec![Ok(usage_chunk)];
-        let inner: ProviderStream = Box::pin(futures::stream::iter(chunks));
+        #[tokio::test]
+        async fn reasoning_content_emits_thinking_block_before_text() {
+            let mut r_chunk = make_chunk(None, None);
+            r_chunk.choices[0].delta.reasoning_content = Some("pondering".to_string());
+            let chunks: Vec<Result<ChatCompletionChunk, ProxyError>> = vec![
+                Ok(r_chunk),
+                Ok(make_chunk(Some("answer"), None)),
+                Ok(make_chunk(None, Some("stop"))),
+            ];
+            let inner: ProviderStream = Box::pin(futures::stream::iter(chunks));
+            let events: Vec<_> =
+                openai_stream_to_anthropic_sse("m".to_string(), "msg".to_string(), inner)
+                    .collect()
+                    .await;
+            assert!(events.iter().all(|e| e.is_ok()));
+            let dump = events
+                .iter()
+                .map(|e| format!("{:?}", e.as_ref().unwrap()))
+                .collect::<Vec<_>>()
+                .join("\n");
+            // A thinking block with a thinking_delta is emitted.
+            assert!(
+                dump.contains("thinking_delta"),
+                "thinking_delta emitted: {dump}"
+            );
+            assert!(dump.contains("pondering"));
+            // Thinking precedes text; two content blocks open (thinking + text).
+            assert!(
+                dump.find("pondering").unwrap() < dump.find("answer").unwrap(),
+                "thinking must precede text"
+            );
+            assert_eq!(dump.matches("event: content_block_start").count(), 2);
+        }
 
-        let events: Vec<_> =
-            openai_stream_to_anthropic_sse("m".to_string(), "msg_n".to_string(), inner)
-                .collect()
-                .await;
-        let dump = events
-            .iter()
-            .map(|e| format!("{:?}", e.as_ref().unwrap()))
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(
-            !dump.contains("cache_read_input_tokens") && !dump.contains("cache_creation"),
-            "a non-caching stream must emit no cache keys: {dump}"
-        );
-    }
+        /// Tool-only stream must NOT produce an empty text block.
+        /// If it did, Anthropic would reject the next request with
+        /// "messages: text content blocks must be non-empty".
+        #[tokio::test]
+        async fn tool_only_stream_emits_no_empty_text_block() {
+            let chunks: Vec<Result<ChatCompletionChunk, ProxyError>> = vec![Ok(
+                make_tool_call_chunk("call_abc", "bash", r#"{"cmd":"ls"}"#, Some("tool_calls")),
+            )];
+            let inner: ProviderStream = Box::pin(futures::stream::iter(chunks));
+            let events: Vec<_> =
+                openai_stream_to_anthropic_sse("m".to_string(), "msg_tool".to_string(), inner)
+                    .collect()
+                    .await;
 
-    #[test]
-    fn response_usage_round_trips_cache_counters() {
-        let mut resp = make_openai_response("x", "stop");
-        resp.usage.as_mut().unwrap().extra = crate::types::cache_usage_extra(Some(100), Some(3968));
-        let r = to_anthropic_response(resp);
-        assert_eq!(r.usage.cache_read_input_tokens, Some(3968));
-        assert_eq!(r.usage.cache_creation_input_tokens, Some(100));
-        let json = serde_json::to_string(&r.usage).unwrap();
-        assert!(json.contains(r#""cache_read_input_tokens":3968"#), "{json}");
-        assert!(
-            json.contains(r#""cache_creation_input_tokens":100"#),
-            "{json}"
-        );
-    }
+            assert!(events.iter().all(|e| e.is_ok()));
 
-    #[test]
-    fn response_usage_round_trips_openai_cached_tokens() {
-        // Usage that only speaks OpenAI (prompt_tokens_details.cached_tokens)
-        // must still surface on the Anthropic-native surface.
-        let mut resp = make_openai_response("x", "stop");
-        resp.usage.as_mut().unwrap().extra = std::collections::HashMap::from([(
-            "prompt_tokens_details".to_string(),
-            serde_json::json!({"cached_tokens": 512}),
-        )]);
-        let r = to_anthropic_response(resp);
-        assert_eq!(r.usage.cache_read_input_tokens, Some(512));
-        assert_eq!(r.usage.cache_creation_input_tokens, None);
-    }
+            // Verify no content_block_start with type "text" appears
+            for sse in events.iter().flatten() {
+                let data = format!("{:?}", sse);
+                if data.contains("content_block_start") {
+                    assert!(
+                        !data.contains(r#""type":"text""#),
+                        "tool-only response must not emit a text content block: {data}"
+                    );
+                }
+            }
+        }
 
-    #[test]
-    fn response_usage_without_cache_serializes_unchanged() {
-        // Byte-identical to the pre-cache-support wire format.
-        let r = to_anthropic_response(make_openai_response("x", "stop"));
-        assert_eq!(
-            serde_json::to_string(&r.usage).unwrap(),
-            r#"{"input_tokens":10,"output_tokens":5}"#
-        );
-    }
+        #[tokio::test]
+        async fn stream_emits_correct_event_sequence() {
+            let chunks: Vec<Result<ChatCompletionChunk, ProxyError>> = vec![
+                Ok(make_chunk(Some("Hello"), None)),
+                Ok(make_chunk(Some(" world"), None)),
+                Ok(make_chunk(None, Some("stop"))),
+            ];
+            let inner = futures::stream::iter(chunks);
+            let inner: ProviderStream = Box::pin(inner);
 
-    #[tokio::test]
-    async fn empty_stream_emits_valid_sequence() {
-        let inner: ProviderStream = Box::pin(futures::stream::empty());
-        let events: Vec<_> =
-            openai_stream_to_anthropic_sse("m".to_string(), "msg_x".to_string(), inner)
-                .collect()
-                .await;
+            let events: Vec<_> = openai_stream_to_anthropic_sse(
+                "claude-sonnet".to_string(),
+                "msg_test123".to_string(),
+                inner,
+            )
+            .collect()
+            .await;
 
-        // message_start, ping, message_delta, message_stop = 4 events
-        // No text block emitted — empty response has no content blocks.
-        assert_eq!(events.len(), 4);
-        assert!(events.iter().all(|e| e.is_ok()));
-    }
+            // All events should be Ok
+            assert!(events.iter().all(|e| e.is_ok()));
 
-    #[test]
-    fn finish_reason_maps_content_filter_and_unknowns() {
-        assert_eq!(finish_reason_to_anthropic("content_filter"), "refusal");
-        assert_eq!(finish_reason_to_anthropic("something_new"), "end_turn");
-        assert_eq!(finish_reason_to_anthropic("tool_calls"), "tool_use");
-    }
+            // We expect: message_start, content_block_start, ping,
+            //            delta("Hello"), delta(" world"),
+            //            content_block_stop, message_delta, message_stop
+            assert_eq!(events.len(), 8);
+        }
 
-    #[tokio::test]
-    async fn mid_stream_error_emits_anthropic_error_event() {
-        let chunks: Vec<Result<ChatCompletionChunk, ProxyError>> = vec![
-            Ok(make_chunk(Some("hi"), None)),
-            Err(ProxyError::RateLimited("slow down".to_string())),
-        ];
-        let inner: ProviderStream = Box::pin(futures::stream::iter(chunks));
-        let events: Vec<_> =
-            openai_stream_to_anthropic_sse("m".to_string(), "msg".to_string(), inner)
-                .collect()
-                .await;
-        // Every event is Ok — the error surfaces as an SSE `error` event, not a
-        // raw stream error (which would close the connection with no terminal event).
-        assert!(events.iter().all(|e| e.is_ok()), "no raw stream errors");
-        let dump = events
-            .iter()
-            .map(|e| format!("{:?}", e.as_ref().unwrap()))
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(
-            dump.contains("event: error"),
-            "an error event is emitted: {dump}"
-        );
-        assert!(dump.contains("rate_limit_error"));
-    }
+        #[tokio::test]
+        async fn message_delta_includes_input_tokens_from_final_usage() {
+            // OpenAI-format upstreams report prompt_tokens only in the final chunk's
+            // usage; it must surface as Anthropic `input_tokens` in message_delta.
+            let mut usage_chunk = make_chunk(None, Some("stop"));
+            usage_chunk.usage = Some(crate::types::Usage {
+                prompt_tokens: 123,
+                completion_tokens: 45,
+                total_tokens: 168,
+                extra: Default::default(),
+            });
+            let chunks: Vec<Result<ChatCompletionChunk, ProxyError>> =
+                vec![Ok(make_chunk(Some("hi"), None)), Ok(usage_chunk)];
+            let inner: ProviderStream = Box::pin(futures::stream::iter(chunks));
 
-    #[tokio::test]
-    async fn stream_surfaces_error_as_error_event() {
-        let chunks: Vec<Result<ChatCompletionChunk, ProxyError>> = vec![
-            Ok(make_chunk(Some("Hi"), None)),
-            Err(ProxyError::StreamError("broken".to_string())),
-        ];
-        let inner: ProviderStream = Box::pin(futures::stream::iter(chunks));
+            let events: Vec<_> =
+                openai_stream_to_anthropic_sse("m".to_string(), "msg_u".to_string(), inner)
+                    .collect()
+                    .await;
+            let dump = events
+                .iter()
+                .map(|e| format!("{:?}", e.as_ref().unwrap()))
+                .collect::<Vec<_>>()
+                .join("\n");
+            // Event Debug-formats its buffer as an escaped byte string, so quotes
+            // appear as \"; match the token/value pair rather than exact JSON.
+            assert!(
+                dump.contains(r#"input_tokens\":123"#),
+                "message_delta must carry input_tokens: {dump}"
+            );
+            assert!(dump.contains(r#"output_tokens\":45"#));
+        }
 
-        let events: Vec<_> =
-            openai_stream_to_anthropic_sse("m".to_string(), "msg_x".to_string(), inner)
-                .collect()
-                .await;
+        #[tokio::test]
+        async fn message_delta_includes_cache_counters_from_usage_extra() {
+            let mut usage_chunk = make_chunk(None, Some("stop"));
+            usage_chunk.usage = Some(crate::types::Usage {
+                prompt_tokens: 47,
+                completion_tokens: 2,
+                total_tokens: 49,
+                extra: crate::types::cache_usage_extra(Some(100), Some(3968)),
+            });
+            let chunks: Vec<Result<ChatCompletionChunk, ProxyError>> = vec![Ok(usage_chunk)];
+            let inner: ProviderStream = Box::pin(futures::stream::iter(chunks));
 
-        // The upstream error is surfaced as an Anthropic `error` SSE event, not a
-        // raw stream Err (which would drop the connection with no terminal event).
-        assert!(events.iter().all(|e| e.is_ok()));
-        let dump = events
-            .iter()
-            .map(|e| format!("{:?}", e.as_ref().unwrap()))
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(dump.contains("event: error"));
-    }
+            let events: Vec<_> =
+                openai_stream_to_anthropic_sse("m".to_string(), "msg_c".to_string(), inner)
+                    .collect()
+                    .await;
+            let dump = events
+                .iter()
+                .map(|e| format!("{:?}", e.as_ref().unwrap()))
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(
+                dump.contains(r#"cache_read_input_tokens\":3968"#),
+                "message_delta must carry cache_read_input_tokens: {dump}"
+            );
+            assert!(
+                dump.contains(r#"cache_creation_input_tokens\":100"#),
+                "message_delta must carry cache_creation_input_tokens: {dump}"
+            );
+        }
 
-    #[tokio::test]
-    async fn stream_skips_empty_content_deltas() {
-        let chunks: Vec<Result<ChatCompletionChunk, ProxyError>> = vec![
-            Ok(make_chunk(Some("Hi"), None)),
-            Ok(make_chunk(Some(""), None)), // empty delta — should not emit event
-            Ok(make_chunk(None, Some("stop"))),
-        ];
-        let inner: ProviderStream = Box::pin(futures::stream::iter(chunks));
+        #[tokio::test]
+        async fn message_delta_omits_cache_counters_when_absent() {
+            let mut usage_chunk = make_chunk(None, Some("stop"));
+            usage_chunk.usage = Some(crate::types::Usage {
+                prompt_tokens: 123,
+                completion_tokens: 45,
+                total_tokens: 168,
+                extra: Default::default(),
+            });
+            let chunks: Vec<Result<ChatCompletionChunk, ProxyError>> = vec![Ok(usage_chunk)];
+            let inner: ProviderStream = Box::pin(futures::stream::iter(chunks));
 
-        let events: Vec<_> =
-            openai_stream_to_anthropic_sse("m".to_string(), "msg_x".to_string(), inner)
-                .collect()
-                .await;
+            let events: Vec<_> =
+                openai_stream_to_anthropic_sse("m".to_string(), "msg_n".to_string(), inner)
+                    .collect()
+                    .await;
+            let dump = events
+                .iter()
+                .map(|e| format!("{:?}", e.as_ref().unwrap()))
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(
+                !dump.contains("cache_read_input_tokens") && !dump.contains("cache_creation"),
+                "a non-caching stream must emit no cache keys: {dump}"
+            );
+        }
 
-        // message_start, content_block_start, ping, delta("Hi"),
-        // content_block_stop, message_delta, message_stop = 7 (no delta for "")
-        assert_eq!(events.len(), 7);
+        #[test]
+        fn response_usage_round_trips_cache_counters() {
+            let mut resp = make_openai_response("x", "stop");
+            resp.usage.as_mut().unwrap().extra =
+                crate::types::cache_usage_extra(Some(100), Some(3968));
+            let r = to_anthropic_response(resp);
+            assert_eq!(r.usage.cache_read_input_tokens, Some(3968));
+            assert_eq!(r.usage.cache_creation_input_tokens, Some(100));
+            let json = serde_json::to_string(&r.usage).unwrap();
+            assert!(json.contains(r#""cache_read_input_tokens":3968"#), "{json}");
+            assert!(
+                json.contains(r#""cache_creation_input_tokens":100"#),
+                "{json}"
+            );
+        }
+
+        #[test]
+        fn response_usage_round_trips_openai_cached_tokens() {
+            // Usage that only speaks OpenAI (prompt_tokens_details.cached_tokens)
+            // must still surface on the Anthropic-native surface.
+            let mut resp = make_openai_response("x", "stop");
+            resp.usage.as_mut().unwrap().extra = std::collections::HashMap::from([(
+                "prompt_tokens_details".to_string(),
+                serde_json::json!({"cached_tokens": 512}),
+            )]);
+            let r = to_anthropic_response(resp);
+            assert_eq!(r.usage.cache_read_input_tokens, Some(512));
+            assert_eq!(r.usage.cache_creation_input_tokens, None);
+        }
+
+        #[test]
+        fn response_usage_without_cache_serializes_unchanged() {
+            // Byte-identical to the pre-cache-support wire format.
+            let r = to_anthropic_response(make_openai_response("x", "stop"));
+            assert_eq!(
+                serde_json::to_string(&r.usage).unwrap(),
+                r#"{"input_tokens":10,"output_tokens":5}"#
+            );
+        }
+
+        #[tokio::test]
+        async fn empty_stream_emits_valid_sequence() {
+            let inner: ProviderStream = Box::pin(futures::stream::empty());
+            let events: Vec<_> =
+                openai_stream_to_anthropic_sse("m".to_string(), "msg_x".to_string(), inner)
+                    .collect()
+                    .await;
+
+            // message_start, ping, message_delta, message_stop = 4 events
+            // No text block emitted — empty response has no content blocks.
+            assert_eq!(events.len(), 4);
+            assert!(events.iter().all(|e| e.is_ok()));
+        }
+
+        #[test]
+        fn finish_reason_maps_content_filter_and_unknowns() {
+            assert_eq!(finish_reason_to_anthropic("content_filter"), "refusal");
+            assert_eq!(finish_reason_to_anthropic("something_new"), "end_turn");
+            assert_eq!(finish_reason_to_anthropic("tool_calls"), "tool_use");
+        }
+
+        #[tokio::test]
+        async fn mid_stream_error_emits_anthropic_error_event() {
+            let chunks: Vec<Result<ChatCompletionChunk, ProxyError>> = vec![
+                Ok(make_chunk(Some("hi"), None)),
+                Err(ProxyError::RateLimited("slow down".to_string())),
+            ];
+            let inner: ProviderStream = Box::pin(futures::stream::iter(chunks));
+            let events: Vec<_> =
+                openai_stream_to_anthropic_sse("m".to_string(), "msg".to_string(), inner)
+                    .collect()
+                    .await;
+            // Every event is Ok — the error surfaces as an SSE `error` event, not a
+            // raw stream error (which would close the connection with no terminal event).
+            assert!(events.iter().all(|e| e.is_ok()), "no raw stream errors");
+            let dump = events
+                .iter()
+                .map(|e| format!("{:?}", e.as_ref().unwrap()))
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(
+                dump.contains("event: error"),
+                "an error event is emitted: {dump}"
+            );
+            assert!(dump.contains("rate_limit_error"));
+        }
+
+        #[tokio::test]
+        async fn stream_surfaces_error_as_error_event() {
+            let chunks: Vec<Result<ChatCompletionChunk, ProxyError>> = vec![
+                Ok(make_chunk(Some("Hi"), None)),
+                Err(ProxyError::StreamError("broken".to_string())),
+            ];
+            let inner: ProviderStream = Box::pin(futures::stream::iter(chunks));
+
+            let events: Vec<_> =
+                openai_stream_to_anthropic_sse("m".to_string(), "msg_x".to_string(), inner)
+                    .collect()
+                    .await;
+
+            // The upstream error is surfaced as an Anthropic `error` SSE event, not a
+            // raw stream Err (which would drop the connection with no terminal event).
+            assert!(events.iter().all(|e| e.is_ok()));
+            let dump = events
+                .iter()
+                .map(|e| format!("{:?}", e.as_ref().unwrap()))
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(dump.contains("event: error"));
+        }
+
+        #[tokio::test]
+        async fn stream_skips_empty_content_deltas() {
+            let chunks: Vec<Result<ChatCompletionChunk, ProxyError>> = vec![
+                Ok(make_chunk(Some("Hi"), None)),
+                Ok(make_chunk(Some(""), None)), // empty delta — should not emit event
+                Ok(make_chunk(None, Some("stop"))),
+            ];
+            let inner: ProviderStream = Box::pin(futures::stream::iter(chunks));
+
+            let events: Vec<_> =
+                openai_stream_to_anthropic_sse("m".to_string(), "msg_x".to_string(), inner)
+                    .collect()
+                    .await;
+
+            // message_start, content_block_start, ping, delta("Hi"),
+            // content_block_stop, message_delta, message_stop = 7 (no delta for "")
+            assert_eq!(events.len(), 7);
+        }
     }
 }
