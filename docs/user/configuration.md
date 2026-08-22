@@ -107,8 +107,6 @@ providers:
     # Optional per-provider overrides:
     timeouts:
       ttfb_secs: 90
-    retry:
-      max_attempts: 2
     circuit_breaker:
       failure_threshold: 3
 ```
@@ -133,7 +131,6 @@ static-keys / profile / AssumeRole auth modes.
 | `base_url` | no | Override the default endpoint. Must include the API version prefix (e.g. `https://api.openai.com/v1`). The adapter appends only `/chat/completions`. |
 | `aws` | no | AWS config (Bedrock only): `region`, optional `endpoint_url`, and `auth` (static keys / `profile` / `assume_role`). |
 | `timeouts` | no | Per-provider timeout overrides |
-| `retry` | no | Per-provider retry overrides |
 | `circuit_breaker` | no | Per-provider circuit breaker overrides |
 
 ---

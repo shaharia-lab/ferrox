@@ -6,9 +6,9 @@
 //! depending on `ferrox` itself.
 //!
 //! [`RetryConfig`] and [`CircuitBreakerConfig`] are never read by this crate.
-//! They are carried because [`ProviderConfig`] and [`DefaultsConfig`] are
-//! deserialized from a single YAML object that also holds those per-provider
-//! overrides, and splitting the struct would silently drop them on round-trip.
+//! They are carried because [`DefaultsConfig`] is deserialized from a single
+//! YAML object that also holds that gateway policy, and splitting the struct
+//! would silently drop it on round-trip.
 
 use serde::{Deserialize, Serialize};
 
@@ -153,7 +153,6 @@ pub struct ProviderConfig {
     /// provider; ignored by every other provider type.
     pub aws: Option<AwsConfig>,
     pub timeouts: Option<TimeoutsConfig>,
-    pub retry: Option<RetryConfig>,
     pub circuit_breaker: Option<CircuitBreakerConfig>,
 }
 
@@ -208,4 +207,48 @@ pub struct AwsAssumeRoleConfig {
     pub external_id: Option<String>,
     /// Session duration in seconds (STS default is 3600 when omitted).
     pub duration_secs: Option<u64>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `providers[].retry` was a dead field, removed in #145. Configs written
+    /// against older versions still carry it, so deserialization must keep
+    /// ignoring the key rather than failing — i.e. `ProviderConfig` must never
+    /// gain `#[serde(deny_unknown_fields)]`.
+    #[test]
+    fn provider_config_still_loads_when_a_legacy_retry_key_is_present() {
+        let yaml = r#"
+name: anthropic-primary
+type: anthropic
+api_key: sk-test
+retry:
+  max_attempts: 2
+circuit_breaker:
+  failure_threshold: 3
+"#;
+        let cfg: ProviderConfig =
+            serde_yaml::from_str(yaml).expect("legacy retry key must not break parsing");
+
+        assert_eq!(cfg.name, "anthropic-primary");
+        assert_eq!(cfg.provider_type, ProviderType::Anthropic);
+        assert_eq!(cfg.api_key.as_deref(), Some("sk-test"));
+        // The still-supported sibling override must survive alongside it.
+        assert_eq!(
+            cfg.circuit_breaker
+                .expect("circuit_breaker")
+                .failure_threshold,
+            3
+        );
+    }
+
+    /// `defaults.retry` is real and read by the gateway — guard against it
+    /// being removed along with the per-provider one.
+    #[test]
+    fn defaults_config_still_parses_retry() {
+        let yaml = "retry:\n  max_attempts: 7\n";
+        let cfg: DefaultsConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(cfg.retry.max_attempts, 7);
+    }
 }

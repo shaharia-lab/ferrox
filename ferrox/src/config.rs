@@ -613,7 +613,6 @@ mod tests {
                 base_url: None,
                 aws: None,
                 timeouts: None,
-                retry: None,
                 circuit_breaker: None,
             }],
             models: vec![ModelConfig {
@@ -653,7 +652,6 @@ mod tests {
             base_url: None,
             aws: None,
             timeouts: None,
-            retry: None,
             circuit_breaker: None,
         });
         let err = validate(&config).unwrap_err().to_string();

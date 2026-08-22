@@ -35,7 +35,6 @@ let providers = vec![ProviderConfig {
     base_url: None,
     aws: None,
     timeouts: None,
-    retry: None,
     circuit_breaker: None,
 }];
 
@@ -77,9 +76,10 @@ Carried over from the extraction and worth knowing before depending on the API:
 - **`ProxyError` still carries gateway-flavoured variants** (`RateLimited`,
   `BudgetExceeded`, `CircuitOpen`) that this crate never constructs. Splitting
   the enum would ripple through every Ferrox handler, so it was left alone.
-- **`ProviderConfig` and `DefaultsConfig` carry `retry` / `circuit_breaker`**,
-  which the adapters never read. They are part of the same deserialized YAML
-  object; dropping them would silently discard those keys on round-trip.
+- **`DefaultsConfig` carries `retry` / `circuit_breaker`**, which the adapters
+  never read. They are part of the same deserialized YAML object; dropping them
+  would silently discard that gateway policy on round-trip. (`ProviderConfig`
+  no longer carries a dead `retry` — removed in #145.)
 - **`parse_sse_stream` takes a `reqwest::Response`**, so `reqwest`'s major
   version is part of the public API surface.
 
