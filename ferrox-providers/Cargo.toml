@@ -1,0 +1,91 @@
+[package]
+name = "ferrox-providers"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+description = "OpenAI-compatible translation layer for Anthropic, OpenAI, Google Gemini and AWS Bedrock"
+repository = "https://github.com/shaharia-lab/ferrox"
+license = "MIT"
+
+[features]
+default = ["anthropic", "openai", "gemini"]
+
+# Provider adapters. `anthropic`, `openai` and `gemini` are dependency-free
+# switches; `bedrock` pulls the AWS SDK and is opt-in for that reason.
+anthropic = []
+openai = []
+gemini = []
+bedrock = [
+    "dep:aws-config",
+    "dep:aws-sdk-bedrockruntime",
+    "dep:aws-credential-types",
+    "dep:aws-smithy-types",
+]
+
+# Transport / schema integration. Off by default so a consumer embedding this
+# crate is not forced into Ferrox's web-framework versions.
+axum = ["dep:axum"]
+openapi = ["dep:utoipa"]
+
+[dependencies]
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Async utilities
+tokio = { version = "1", features = ["net", "time"] }
+async-trait = "0.1"
+async-stream = "0.3"
+futures = "0.3"
+eventsource-stream = "0.2"
+tokio-stream = "0.1"
+bytes = "1"
+pin-project-lite = "0.2"
+
+# HTTP client
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+
+# Error handling
+thiserror = "1"
+anyhow = "1"
+
+# Logging
+tracing = "0.1"
+
+# Utilities
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+base64 = "0.21"
+
+# Optional — enabled by the `axum` / `openapi` features
+axum = { version = "0.7", features = ["macros"], optional = true }
+utoipa = { version = "4", features = ["axum_extras"], optional = true }
+
+# Optional — enabled by the `bedrock` feature
+aws-config = { version = "1", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio", "credentials-process", "sso"], optional = true }
+aws-sdk-bedrockruntime = { version = "1", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio"], optional = true }
+aws-credential-types = { version = "1", features = ["hardcoded-credentials"], optional = true }
+aws-smithy-types = { version = "1", optional = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+unused_must_use = "deny"
+
+[lints.clippy]
+await_holding_lock = "warn"
+dbg_macro = "warn"
+exit = "warn"
+filter_map_next = "warn"
+inefficient_to_string = "warn"
+linkedlist = "warn"
+macro_use_imports = "warn"
+needless_continue = "warn"
+option_option = "warn"
+semicolon_if_nothing_returned = "warn"
+string_add_assign = "warn"
+undocumented_unsafe_blocks = "warn"
+unused_self = "warn"
+verbose_file_reads = "warn"

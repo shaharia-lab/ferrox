@@ -1,23 +1,24 @@
-mod anthropic_types;
 mod auth;
 mod budget_enforcer;
 mod config;
-mod error;
 mod event_dispatcher;
 mod handlers;
 mod jwks;
 mod lb;
 mod metrics;
 mod openapi;
-mod providers;
 mod ratelimit;
 mod retry;
 mod router;
 mod server;
 mod state;
 mod telemetry;
-mod types;
 mod usage_writer;
+
+// The translation layer lives in its own crate so other applications can reuse
+// it without the gateway. Aliasing it into the crate root keeps every existing
+// `crate::types::…` / `crate::providers::…` path resolving unchanged.
+use ferrox_providers::{anthropic_types, error, providers, types};
 
 use std::sync::{
     atomic::{AtomicBool, Ordering},

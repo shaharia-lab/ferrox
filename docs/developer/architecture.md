@@ -37,10 +37,24 @@ flowchart TD
 
 ## Repository layout
 
-This is a Cargo workspace with two crates:
+This is a Cargo workspace with three crates:
 
 - **`ferrox/`** — the gateway binary (this document describes its internals)
 - **`ferrox-cp/`** — the control plane binary (Phase 3, in progress)
+- **`ferrox-providers/`** — the provider translation layer, as a reusable library
+
+`ferrox-providers` holds everything needed to translate between the OpenAI wire
+format and each provider's API — the wire types, `ProxyError`, the Anthropic
+Messages translation, and the adapters themselves — and nothing about the
+gateway. It is a separate crate so other applications can embed the translation
+without the routing, load balancing, circuit breaking, rate limiting and auth
+that surround it here. `ferrox` depends on it with every feature enabled and
+aliases its modules into the crate root, so gateway code still writes
+`crate::types::…` and `crate::providers::…` as before.
+
+Its default build pulls in no web framework and no AWS SDK; `axum`, `openapi`
+and `bedrock` are opt-in features. See `ferrox-providers/README.md` for the
+feature matrix and MSRV.
 
 ## Control plane (`ferrox-cp`)
 
@@ -199,18 +213,9 @@ ferrox/src/
   usage_writer.rs     async batched writer: mpsc channel → background flush to usage_log table
   jwks.rs             JWKS cache: fetch, TTL refresh, stale fallback, background task
   router.rs           ModelRouter: alias -> Arc<RoutePool>
-  error.rs            ProxyError enum, OpenAI-format HTTP responses
-  types.rs            OpenAI wire types (request, response, chunk)
   openapi.rs          utoipa ApiDoc: OpenAPI 3.x spec served at /api-schema + /openapi.json
   retry.rs            execute_with_retry, is_retryable, backoff_duration
   metrics.rs          thin shim: initialises telemetry::metrics at startup
-
-  providers/
-    mod.rs            ProviderAdapter trait, ProviderRegistry, parse_sse_stream
-    anthropic.rs      Anthropic Messages API adapter
-    openai.rs         OpenAI Chat Completions adapter
-    gemini.rs         Gemini generateContent adapter
-    bedrock.rs        AWS Bedrock Converse adapter (all model families)
 
   lb/
     mod.rs            RoutePool, RouteTarget, select_target
@@ -234,6 +239,21 @@ ferrox/src/
     chat.rs           chat_completions handler, dispatch_non_stream, dispatch_stream
     health.rs         /healthz, /readyz
     models.rs         /v1/models
+
+ferrox-providers/src/
+  lib.rs              crate root; feature matrix documented here
+  config.rs           the adapter-facing config subtree (ProviderConfig, DefaultsConfig, …)
+  error.rs            ProxyError enum; OpenAI-format HTTP responses behind `axum`
+  types.rs            OpenAI wire types (request, response, chunk)
+  anthropic_types.rs  Anthropic Messages translation; SSE emitters behind `axum`
+
+  providers/
+    mod.rs            ProviderAdapter trait, ProviderRegistry, parse_sse_stream
+    anthropic.rs      Anthropic Messages API adapter          [feature: anthropic]
+    anthropic_events.rs  Anthropic streaming event processor
+    openai.rs         OpenAI Chat Completions adapter         [feature: openai]
+    gemini.rs         Gemini generateContent adapter          [feature: gemini]
+    bedrock.rs        AWS Bedrock Converse adapter            [feature: bedrock]
 ```
 
 The gateway serves its own OpenAPI 3.x document (built at compile time by

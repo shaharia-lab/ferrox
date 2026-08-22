@@ -1,7 +1,12 @@
+#[cfg(feature = "anthropic")]
 pub mod anthropic;
+#[cfg(any(feature = "anthropic", feature = "bedrock"))]
 pub mod anthropic_events;
+#[cfg(feature = "bedrock")]
 pub mod bedrock;
+#[cfg(feature = "gemini")]
 pub mod gemini;
+#[cfg(feature = "openai")]
 pub mod openai;
 
 use std::collections::HashMap;
@@ -50,23 +55,37 @@ pub async fn build_registry(
 
     for cfg in providers {
         let adapter: Arc<dyn ProviderAdapter> = match cfg.provider_type {
+            #[cfg(feature = "anthropic")]
             ProviderType::Anthropic => Arc::new(
                 anthropic::AnthropicAdapter::new(cfg, defaults).with_context(|| {
                     format!("Failed to build Anthropic provider '{}'", cfg.name)
                 })?,
             ),
+            #[cfg(feature = "openai")]
             ProviderType::OpenAI | ProviderType::Glm => Arc::new(
                 openai::OpenAIAdapter::new(cfg, defaults)
                     .with_context(|| format!("Failed to build OpenAI provider '{}'", cfg.name))?,
             ),
+            #[cfg(feature = "gemini")]
             ProviderType::Gemini => Arc::new(
                 gemini::GeminiAdapter::new(cfg, defaults)
                     .with_context(|| format!("Failed to build Gemini provider '{}'", cfg.name))?,
             ),
+            #[cfg(feature = "bedrock")]
             ProviderType::Bedrock => Arc::new(
                 bedrock::BedrockAdapter::new(cfg, defaults)
                     .await
                     .with_context(|| format!("Failed to build Bedrock provider '{}'", cfg.name))?,
+            ),
+
+            // A provider type whose adapter was compiled out. Fails at registry
+            // build time with an actionable message rather than at the call site.
+            #[allow(unreachable_patterns)]
+            ref other => anyhow::bail!(
+                "provider '{}' has type {:?}, but ferrox-providers was built without the \
+                 corresponding feature — enable it to use this provider",
+                cfg.name,
+                other
             ),
         };
         registry.insert(cfg.name.clone(), adapter);

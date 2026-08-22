@@ -16,15 +16,18 @@ COPY Cargo.toml Cargo.lock ./
 COPY ferrox/Cargo.toml ferrox/Cargo.toml
 COPY ferrox/build.rs ferrox/build.rs
 COPY ferrox-cp/Cargo.toml ferrox-cp/Cargo.toml
-RUN mkdir -p ferrox/src ferrox-cp/src \
+COPY ferrox-providers/Cargo.toml ferrox-providers/Cargo.toml
+RUN mkdir -p ferrox/src ferrox-cp/src ferrox-providers/src \
     && echo 'fn main() {}' > ferrox/src/main.rs \
     && echo 'fn main() {}' > ferrox-cp/src/main.rs \
+    && : > ferrox-providers/src/lib.rs \
     && cargo build --release -p ferrox \
-    && rm -rf ferrox/src ferrox-cp/src
+    && rm -rf ferrox/src ferrox-cp/src ferrox-providers/src
 
 # Copy real source and rebuild only ferrox (deps already cached above)
+COPY ferrox-providers/src ./ferrox-providers/src
 COPY ferrox/src ./ferrox/src
-RUN touch ferrox/src/main.rs \
+RUN touch ferrox/src/main.rs ferrox-providers/src/lib.rs \
     && cargo build --release -p ferrox
 
 # ── Stage 2: Runtime ──────────────────────────────────────────────────────────

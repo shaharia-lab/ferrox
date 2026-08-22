@@ -11,6 +11,16 @@ name = "ferrox"
 path = "src/main.rs"
 
 [dependencies]
+# Provider translation layer (workspace member; also consumable standalone)
+ferrox-providers = { path = "../ferrox-providers", version = "0.1", features = [
+    "anthropic",
+    "openai",
+    "gemini",
+    "bedrock",
+    "axum",
+    "openapi",
+] }
+
 # Runtime
 tokio = { version = "1", features = ["full"] }
 
@@ -32,12 +42,8 @@ serde_yaml = "0.9"
 
 # Async utilities
 async-trait = "0.1"
-async-stream = "0.3"
 futures = "0.3"
-eventsource-stream = "0.2"
-tokio-stream = "0.1"
 bytes = "1"
-pin-project-lite = "0.2"
 
 # Error handling
 thiserror = "1"
@@ -76,12 +82,6 @@ sqlx = { version = "0.8", default-features = false, features = [
     "uuid",
     "chrono",
 ] }
-
-# AWS Bedrock
-aws-config = { version = "1", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio", "credentials-process", "sso"] }
-aws-sdk-bedrockruntime = { version = "1", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
-aws-credential-types = { version = "1", features = ["hardcoded-credentials"] }
-aws-smithy-types = "1"
 
 [lints.rust]
 unsafe_code = "forbid"

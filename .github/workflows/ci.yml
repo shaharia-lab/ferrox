@@ -55,6 +55,48 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - run: cargo clippy --workspace -- -D warnings
 
+  # ── Provider crate boundary ───────────────────────────────────────────────────
+  # ferrox-providers is consumed standalone by desktop apps (see #142). Its
+  # default build must stay free of the web framework and the AWS SDK, and must
+  # keep compiling on the MSRV those consumers pin. Both are easy to regress by
+  # adding an import, so they are asserted rather than trusted.
+  providers-boundary:
+    name: Provider crate boundary
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4  # stable
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16  # v2
+
+      - name: Build without framework or AWS deps
+        run: cargo build -p ferrox-providers --no-default-features --features anthropic,openai,gemini
+
+      - name: Assert axum / utoipa / aws-* are absent
+        run: |
+          leaked=$(cargo tree -p ferrox-providers \
+                     --no-default-features --features anthropic,openai,gemini \
+                     -e normal --prefix none \
+                   | awk '{print $1}' | sort -u \
+                   | grep -E '^(axum|utoipa|aws-)' || true)
+          if [ -n "$leaked" ]; then
+            echo "::error::ferrox-providers leaked framework/AWS dependencies into its default build:"
+            echo "$leaked"
+            exit 1
+          fi
+          echo "Boundary clean — no axum, utoipa or aws-* in the lean build."
+
+      # `cargo test -p ferrox-providers` alone runs only 116 of the 169 tests —
+      # the SSE suite is behind `axum`. The workspace run picks them up through
+      # feature unification, but assert it here so the crate's own suite is
+      # verified in full regardless of what the gateway happens to enable.
+      - name: Test all features
+        run: cargo test -p ferrox-providers --all-features
+
+      - name: Check MSRV (1.88, bedrock excluded — the AWS SDK requires 1.94)
+        run: |
+          rustup toolchain install 1.88.0 --profile minimal
+          cargo +1.88.0 check -p ferrox-providers --features axum,openapi
+
   # ── Test ──────────────────────────────────────────────────────────────────────
   # Runs the full test suite including ferrox-cp integration tests which require
   # a live Postgres instance. sqlx::test spins up isolated temp databases per test.

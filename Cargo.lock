@@ -1405,12 +1405,7 @@ name = "ferrox"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "async-stream",
  "async-trait",
- "aws-config",
- "aws-credential-types",
- "aws-sdk-bedrockruntime",
- "aws-smithy-types",
  "axum",
  "base64 0.21.7",
  "bytes",
@@ -1418,14 +1413,13 @@ dependencies = [
  "clap",
  "deadpool-redis",
  "dotenvy",
- "eventsource-stream",
+ "ferrox-providers",
  "futures",
  "jsonwebtoken",
  "once_cell",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
- "pin-project-lite",
  "prometheus",
  "rand 0.8.7",
  "redis",
@@ -1437,7 +1431,6 @@ dependencies = [
  "sqlx",
  "thiserror 1.0.69",
  "tokio",
- "tokio-stream",
  "tower 0.4.13",
  "tower-http 0.5.2",
  "tracing",
@@ -1473,6 +1466,35 @@ dependencies = [
  "tower 0.5.3",
  "tracing",
  "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
+name = "ferrox-providers"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-stream",
+ "async-trait",
+ "aws-config",
+ "aws-credential-types",
+ "aws-sdk-bedrockruntime",
+ "aws-smithy-types",
+ "axum",
+ "base64 0.21.7",
+ "bytes",
+ "chrono",
+ "eventsource-stream",
+ "futures",
+ "pin-project-lite",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-stream",
+ "tracing",
+ "utoipa",
  "uuid",
 ]
 
