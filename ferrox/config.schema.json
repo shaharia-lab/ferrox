@@ -162,7 +162,6 @@
         },
         "aws": { "$ref": "#/definitions/AwsConfig" },
         "timeouts": { "$ref": "#/definitions/TimeoutsConfig" },
-        "retry": { "$ref": "#/definitions/RetryConfig" },
         "circuit_breaker": { "$ref": "#/definitions/CircuitBreakerConfig" }
       }
     },

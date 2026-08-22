@@ -257,7 +257,7 @@ This distributes requests evenly across two API keys, effectively doubling the r
 
 ## Per-provider overrides
 
-Any provider can override the global `defaults` for timeouts, retries, and circuit breaker settings:
+Any provider can override the global `defaults` for timeouts and circuit breaker settings:
 
 ```yaml
 providers:
@@ -266,8 +266,6 @@ providers:
     api_key: "${ANTHROPIC_API_KEY}"
     timeouts:
       ttfb_secs: 120    # extended for reasoning models
-    retry:
-      max_attempts: 2   # fail faster for primary; let fallback handle it
     circuit_breaker:
-      failure_threshold: 3
+      failure_threshold: 3   # trip sooner for primary; let fallback take over
 ```

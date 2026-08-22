@@ -450,7 +450,6 @@ mod tests {
             base_url: base_url.map(str::to_string),
             aws: None,
             timeouts: None,
-            retry: None,
             circuit_breaker: None,
         }
     }

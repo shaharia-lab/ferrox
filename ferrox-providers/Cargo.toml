@@ -69,6 +69,7 @@ aws-smithy-types = { version = "1", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+serde_yaml = "0.9"  # config deserialization tests only
 
 [lints.rust]
 unsafe_code = "forbid"

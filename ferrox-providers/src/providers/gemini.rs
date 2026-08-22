@@ -779,7 +779,6 @@ mod tests {
                 base_url: None,
                 aws: None,
                 timeouts: None,
-                retry: None,
                 circuit_breaker: None,
             },
             &DefaultsConfig::default(),

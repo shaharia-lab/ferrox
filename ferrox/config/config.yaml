@@ -69,8 +69,6 @@ providers:
       connect_secs: 10
       ttfb_secs: 60
       idle_secs: 30
-    retry:
-      max_attempts: 2
     circuit_breaker:
       failure_threshold: 3
 
