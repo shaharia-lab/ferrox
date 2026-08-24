@@ -185,6 +185,46 @@ mod body_tests {
         ProxyError::SerializationError(serde_json::from_str::<i32>("nope").unwrap_err())
     }
 
+    /// A non-timeout `reqwest::Error`. `reqwest::Error` has no public
+    /// constructor, so provoke a real one — connection refused on a closed
+    /// loopback port is deterministic and needs no external network.
+    async fn http_client_error() -> ProxyError {
+        let err = reqwest::Client::new()
+            .get("http://127.0.0.1:1/")
+            .send()
+            .await
+            .expect_err("port 1 on loopback refuses connections");
+        assert!(!err.is_timeout(), "expected a connect error, not a timeout");
+        ProxyError::HttpClientError(err)
+    }
+
+    /// A timeout `reqwest::Error`, provoked by a listener that accepts the
+    /// connection and then never answers.
+    async fn http_timeout_error() -> ProxyError {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // Hold the accepted socket open without writing a response.
+        tokio::spawn(async move {
+            let _held = listener.accept().await;
+            std::future::pending::<()>().await;
+        });
+
+        let err = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_millis(100))
+            .build()
+            .unwrap()
+            .get(format!("http://{addr}/"))
+            .send()
+            .await
+            .expect_err("the server never responds");
+        assert!(err.is_timeout(), "expected a timeout, got {err}");
+        ProxyError::HttpClientError(err)
+    }
+
+    /// Every `ProxyError` variant, so the tables below cannot silently fall
+    /// behind the enum: add a variant and the length assertions fail.
+    const VARIANT_COUNT: usize = 13;
+
     // ── OpenAI shape ─────────────────────────────────────────────────────────
 
     #[test]
@@ -216,6 +256,12 @@ mod body_tests {
             (serde_error(), 400, "serialization_error"),
             (ProxyError::AwsError("a".into()), 502, "aws_error"),
         ];
+
+        assert_eq!(
+            cases.len(),
+            VARIANT_COUNT - 1,
+            "every variant except HttpClientError (covered separately, it branches)"
+        );
 
         for (err, want_status, want_type) in cases {
             let (status, body) = openai_error_body(&err);
@@ -268,6 +314,12 @@ mod body_tests {
             (ProxyError::AwsError("a".into()), 500, "api_error"),
         ];
 
+        assert_eq!(
+            cases.len(),
+            VARIANT_COUNT - 1,
+            "every variant except HttpClientError (covered separately, it branches)"
+        );
+
         for (err, want_status, want_type) in cases {
             let (status, body) = anthropic_error_body(&err);
             assert_eq!(status, want_status, "status for {err}");
@@ -292,6 +344,34 @@ mod body_tests {
             body["error"].get("code").is_none(),
             "Anthropic's shape has no `code`: {body}"
         );
+    }
+
+    // ── HttpClientError: the only variant whose mapping branches ─────────────
+
+    #[tokio::test]
+    async fn http_client_error_maps_by_timeout_on_the_openai_shape() {
+        let (status, body) = openai_error_body(&http_client_error().await);
+        assert_eq!(status, 502);
+        assert_eq!(body["error"]["type"], "http_client_error");
+
+        let (status, body) = openai_error_body(&http_timeout_error().await);
+        assert_eq!(
+            status, 504,
+            "a timeout is a gateway timeout, not a bad gateway"
+        );
+        assert_eq!(body["error"]["type"], "upstream_timeout");
+    }
+
+    #[tokio::test]
+    async fn http_client_error_is_a_500_api_error_on_the_anthropic_shape() {
+        // Both branches fall through the catch-all here. This asymmetry with the
+        // OpenAI shape above is pre-existing behavior, preserved deliberately:
+        // #149 keeps every status and `error.type` string exactly as it was.
+        for err in [http_client_error().await, http_timeout_error().await] {
+            let (status, body) = anthropic_error_body(&err);
+            assert_eq!(status, 500);
+            assert_eq!(body["error"]["type"], "api_error");
+        }
     }
 
     // ── Status handling, shared by both shapes ───────────────────────────────
