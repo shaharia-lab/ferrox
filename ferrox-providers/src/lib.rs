@@ -22,6 +22,10 @@
 //! ferrox-providers = { git = "https://github.com/shaharia-lab/ferrox", tag = "providers-v0.1.0",
 //!                      default-features = false, features = ["anthropic", "openai"] }
 //! ```
+//!
+//! The crate is not on crates.io, so a git dependency is the only way to consume
+//! it. `providers-v*` tags are versioned independently of Ferrox's `v*` gateway
+//! releases; pin a `rev = "<sha>"` to track untagged work on `main`.
 
 pub mod anthropic_types;
 pub mod config;

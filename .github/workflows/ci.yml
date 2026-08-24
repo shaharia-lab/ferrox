@@ -65,8 +65,36 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          # Full history + tags: the pin check below resolves the git refs the
+          # crate's docs tell consumers to depend on.
+          fetch-depth: 0
+          fetch-tags: true
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4  # stable
       - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16  # v2
+
+      # The README and crate docs told consumers to pin `providers-v0.1.0` for
+      # months before that tag existed (#150), so this is now enforced: every git
+      # ref the docs name must actually resolve in this repo.
+      - name: Assert documented git pins resolve
+        run: |
+          missing=0
+          refs=$(grep -rhoE '(tag|rev) = "[^"<]+"' \
+                   ferrox-providers/README.md ferrox-providers/src/lib.rs \
+                 | sed 's/.*"\(.*\)"/\1/' | sort -u)
+          if [ -z "$refs" ]; then
+            echo "::error::no documented git pin found — did the install snippet move?"
+            exit 1
+          fi
+          for ref in $refs; do
+            if git rev-parse --verify --quiet "$ref^{commit}" >/dev/null; then
+              echo "ok: $ref -> $(git rev-parse --short "$ref^{commit}")"
+            else
+              echo "::error::the docs pin a git ref that does not exist in this repo: $ref"
+              missing=1
+            fi
+          done
+          [ "$missing" -eq 0 ] || exit 1
 
       - name: Build without framework or AWS deps
         run: cargo build -p ferrox-providers --no-default-features --features anthropic,openai,gemini
