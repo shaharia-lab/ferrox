@@ -65,7 +65,8 @@ the dependency tree roughly in half (144 crates with `anthropic` alone, versus
 `message_start` → `content_block_start` → `ping` → N× `content_block_delta` →
 `content_block_stop` → `message_delta` → `message_stop`, including `thinking`
 blocks, `tool_use` with `input_json_delta`, and prompt-cache counters — and emits
-a framework-free [`SseFrame`]. It needs **no** feature beyond a provider's.
+a framework-free `ferrox_providers::sse::SseFrame` (just an `event` name and a
+`data` payload). It needs **no** feature beyond a provider's.
 
 Adapting frames to your own framework is the whole integration:
 
@@ -73,16 +74,14 @@ Adapting frames to your own framework is the whole integration:
 use ferrox_providers::anthropic_types::openai_stream_to_anthropic_frames;
 use futures::StreamExt as _;
 
-let frames = openai_stream_to_anthropic_frames(model, msg_id, upstream)
-    .map(|frame| frame.map(|f| my_framework::SseEvent::new(f.event, f.data)));
+let events = openai_stream_to_anthropic_frames(model, msg_id, upstream)
+    .map(|res| res.map(|f| my_framework::SseEvent::new(f.event, f.data)));
 ```
 
 With the `axum` feature enabled you get that adapter for axum 0.7 for free, as
 `openai_stream_to_anthropic_sse` (this is what the Ferrox binary serves). On any
 other axum version, take the frames and write the two-line mapping above — do
 not enable the feature, or you will compile a second axum into your tree.
-
-[`SseFrame`]: https://docs.rs/ferrox-providers/latest/ferrox_providers/sse/struct.SseFrame.html
 
 Requesting a provider whose feature is disabled fails at `build_registry` time
 with an actionable message, not at compile time — so a config file can name a

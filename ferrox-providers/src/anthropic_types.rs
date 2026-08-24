@@ -1152,7 +1152,7 @@ pub fn openai_stream_to_anthropic_sse(
 ) -> impl futures::Stream<Item = Result<axum::response::sse::Event, crate::error::ProxyError>> + Send
 {
     use futures::StreamExt as _;
-    openai_stream_to_anthropic_frames(model, msg_id, stream).map(|frame| frame.map(Into::into))
+    openai_stream_to_anthropic_frames(model, msg_id, stream).map(|res| res.map(Into::into))
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
