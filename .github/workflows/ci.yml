@@ -66,10 +66,9 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
-          # Full history + tags: the pin check below resolves the git refs the
-          # crate's docs tell consumers to depend on.
+          # Full history and tags, so the pin check below can resolve the git
+          # refs the crate's docs tell consumers to depend on.
           fetch-depth: 0
-          fetch-tags: true
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4  # stable
       - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16  # v2
 

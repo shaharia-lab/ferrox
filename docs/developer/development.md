@@ -425,8 +425,12 @@ The CI pipeline runs:
 ## Releasing `ferrox-providers`
 
 The library is versioned **independently of the gateway** and is not published to
-crates.io, so consumers depend on it by git ref. Cut a new reference point with a
-plain annotated tag:
+crates.io, so consumers depend on it by git ref. To cut a new reference point:
+
+1. Bump `version` in `ferrox-providers/Cargo.toml` and merge that — the tag name
+   must match the version the crate declares, or a consumer pinning
+   `providers-v0.2.0` gets a crate calling itself `0.1.0`.
+2. Tag the merged commit, with a plain annotated tag:
 
 ```bash
 git tag -a providers-v0.2.0 <sha> -m "ferrox-providers 0.2.0 — <what changed>"
