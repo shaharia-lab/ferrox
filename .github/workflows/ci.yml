@@ -85,10 +85,10 @@ jobs:
           fi
           echo "Boundary clean — no axum, utoipa or aws-* in the lean build."
 
-      # `cargo test -p ferrox-providers` alone runs only 116 of the 169 tests —
-      # the SSE suite is behind `axum`. The workspace run picks them up through
-      # feature unification, but assert it here so the crate's own suite is
-      # verified in full regardless of what the gateway happens to enable.
+      # `cargo test -p ferrox-providers` alone runs 138 of the 174 tests — the
+      # remainder is behind `bedrock` and `openapi`. The workspace run picks some
+      # up through feature unification, but assert it here so the crate's own
+      # suite is verified in full regardless of what the gateway happens to enable.
       - name: Test all features
         run: cargo test -p ferrox-providers --all-features
 

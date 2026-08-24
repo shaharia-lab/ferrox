@@ -697,25 +697,25 @@ pub fn finish_reason_to_anthropic(reason: &str) -> &str {
 
 // ── Streaming translation: OpenAI chunks → Anthropic SSE events ──────────────
 //
-// These emit `axum::response::sse::Event`, so the whole section is gated on the
-// `axum` feature. `openai_stream_to_anthropic_sse` is re-exported below so its
-// public path is unchanged.
-#[cfg(feature = "axum")]
-mod sse {
-    use axum::response::sse::Event;
+// The state machine is framework-free: it emits `crate::sse::SseFrame`, so any
+// consumer can drive it. The `axum`-gated adapter that turns those frames into
+// `axum::response::sse::Event` — the shape the Ferrox binary serves — lives just
+// below the module.
+mod emitter {
     use futures::Stream;
     use std::collections::VecDeque;
 
     use super::*;
     use crate::error::ProxyError;
     use crate::providers::ProviderStream;
+    use crate::sse::SseFrame;
 
     struct StreamState {
         inner: ProviderStream,
         model: String,
         msg_id: String,
         is_first: bool,
-        pending: VecDeque<Result<Event, ProxyError>>,
+        pending: VecDeque<Result<SseFrame, ProxyError>>,
         output_tokens: u32,
         /// Prompt tokens. OpenAI-format upstreams deliver this only in the final
         /// chunk's usage (via `stream_options.include_usage`), so we capture it
@@ -757,11 +757,11 @@ mod sse {
     /// `message_start` → `content_block_start` → `ping` →
     /// N× `content_block_delta` → `content_block_stop` →
     /// `message_delta` → `message_stop`
-    pub fn openai_stream_to_anthropic_sse(
+    pub fn openai_stream_to_anthropic_frames(
         model: String,
         msg_id: String,
         stream: ProviderStream,
-    ) -> impl Stream<Item = Result<Event, ProxyError>> + Send {
+    ) -> impl Stream<Item = Result<SseFrame, ProxyError>> + Send {
         use futures::StreamExt as _;
 
         let state = StreamState {
@@ -991,7 +991,7 @@ mod sse {
 
     // ── SSE event constructors ────────────────────────────────────────────────────
 
-    fn make_message_start_event(msg_id: &str, model: &str, input_tokens: u32) -> Event {
+    fn make_message_start_event(msg_id: &str, model: &str, input_tokens: u32) -> SseFrame {
         let data = serde_json::json!({
             "type": "message_start",
             "message": {
@@ -1008,34 +1008,28 @@ mod sse {
                 }
             }
         });
-        Event::default()
-            .event("message_start")
-            .data(data.to_string())
+        SseFrame::new("message_start", data.to_string())
     }
 
-    fn make_content_block_start_event(index: u32) -> Event {
+    fn make_content_block_start_event(index: u32) -> SseFrame {
         let data = serde_json::json!({
             "type": "content_block_start",
             "index": index,
             "content_block": {"type": "text", "text": ""}
         });
-        Event::default()
-            .event("content_block_start")
-            .data(data.to_string())
+        SseFrame::new("content_block_start", data.to_string())
     }
 
-    fn make_tool_use_block_start_event(index: u32, id: &str, name: &str) -> Event {
+    fn make_tool_use_block_start_event(index: u32, id: &str, name: &str) -> SseFrame {
         let data = serde_json::json!({
             "type": "content_block_start",
             "index": index,
             "content_block": {"type": "tool_use", "id": id, "name": name, "input": {}}
         });
-        Event::default()
-            .event("content_block_start")
-            .data(data.to_string())
+        SseFrame::new("content_block_start", data.to_string())
     }
 
-    fn make_error_event(e: &ProxyError) -> Event {
+    fn make_error_event(e: &ProxyError) -> SseFrame {
         let (error_type, message) = match e {
             ProxyError::Unauthorized(m) => ("authentication_error", m.clone()),
             ProxyError::Forbidden(m) => ("permission_error", m.clone()),
@@ -1050,63 +1044,54 @@ mod sse {
             "type": "error",
             "error": {"type": error_type, "message": message}
         });
-        Event::default().event("error").data(data.to_string())
+        SseFrame::new("error", data.to_string())
     }
 
-    fn make_thinking_block_start_event(index: u32) -> Event {
+    fn make_thinking_block_start_event(index: u32) -> SseFrame {
         let data = serde_json::json!({
             "type": "content_block_start",
             "index": index,
             "content_block": {"type": "thinking", "thinking": ""}
         });
-        Event::default()
-            .event("content_block_start")
-            .data(data.to_string())
+        SseFrame::new("content_block_start", data.to_string())
     }
 
-    fn make_thinking_delta_event(index: u32, thinking: &str) -> Event {
+    fn make_thinking_delta_event(index: u32, thinking: &str) -> SseFrame {
         let data = serde_json::json!({
             "type": "content_block_delta",
             "index": index,
             "delta": {"type": "thinking_delta", "thinking": thinking}
         });
-        Event::default()
-            .event("content_block_delta")
-            .data(data.to_string())
+        SseFrame::new("content_block_delta", data.to_string())
     }
 
-    fn make_input_json_delta_event(index: u32, partial_json: &str) -> Event {
+    fn make_input_json_delta_event(index: u32, partial_json: &str) -> SseFrame {
         let data = serde_json::json!({
             "type": "content_block_delta",
             "index": index,
             "delta": {"type": "input_json_delta", "partial_json": partial_json}
         });
-        Event::default()
-            .event("content_block_delta")
-            .data(data.to_string())
+        SseFrame::new("content_block_delta", data.to_string())
     }
 
-    fn make_ping_event() -> Event {
-        Event::default()
-            .event("ping")
-            .data(serde_json::json!({"type": "ping"}).to_string())
+    fn make_ping_event() -> SseFrame {
+        SseFrame::new("ping", serde_json::json!({"type": "ping"}).to_string())
     }
 
-    fn make_content_block_delta_event(index: u32, text: &str) -> Event {
+    fn make_content_block_delta_event(index: u32, text: &str) -> SseFrame {
         let data = serde_json::json!({
             "type": "content_block_delta",
             "index": index,
             "delta": {"type": "text_delta", "text": text}
         });
-        Event::default()
-            .event("content_block_delta")
-            .data(data.to_string())
+        SseFrame::new("content_block_delta", data.to_string())
     }
 
-    fn make_content_block_stop_event(index: u32) -> Event {
-        Event::default()
-            .event("content_block_stop")
-            .data(serde_json::json!({"type": "content_block_stop", "index": index}).to_string())
+    fn make_content_block_stop_event(index: u32) -> SseFrame {
+        SseFrame::new(
+            "content_block_stop",
+            serde_json::json!({"type": "content_block_stop", "index": index}).to_string(),
+        )
     }
 
     fn make_message_delta_event(
@@ -1115,7 +1100,7 @@ mod sse {
         output_tokens: u32,
         cache_creation_input_tokens: Option<u32>,
         cache_read_input_tokens: Option<u32>,
-    ) -> Event {
+    ) -> SseFrame {
         // Anthropic clients read the authoritative `input_tokens` from `message_delta`
         // (message_start only carries a placeholder), so surface it here.
         let mut usage = serde_json::json!({
@@ -1140,20 +1125,35 @@ mod sse {
             },
             "usage": usage
         });
-        Event::default()
-            .event("message_delta")
-            .data(data.to_string())
+        SseFrame::new("message_delta", data.to_string())
     }
 
-    fn make_message_stop_event() -> Event {
-        Event::default()
-            .event("message_stop")
-            .data(serde_json::json!({"type": "message_stop"}).to_string())
+    fn make_message_stop_event() -> SseFrame {
+        SseFrame::new(
+            "message_stop",
+            serde_json::json!({"type": "message_stop"}).to_string(),
+        )
     }
 }
 
+pub use emitter::openai_stream_to_anthropic_frames;
+
+/// The frame stream above, adapted to axum's SSE `Event` — the shape the Ferrox
+/// binary serves on `/anthropic/v1/messages`.
+///
+/// Gated on the `axum` feature so the crate does not pin a web-framework version
+/// on consumers that only want the translation; a consumer on another framework
+/// maps [`crate::sse::SseFrame`] itself.
 #[cfg(feature = "axum")]
-pub use sse::openai_stream_to_anthropic_sse;
+pub fn openai_stream_to_anthropic_sse(
+    model: String,
+    msg_id: String,
+    stream: crate::providers::ProviderStream,
+) -> impl futures::Stream<Item = Result<axum::response::sse::Event, crate::error::ProxyError>> + Send
+{
+    use futures::StreamExt as _;
+    openai_stream_to_anthropic_frames(model, msg_id, stream).map(|res| res.map(Into::into))
+}
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
@@ -2068,17 +2068,31 @@ mod tests {
         assert!(tool_result_images(Some(&serde_json::json!("plain text"))).is_empty());
     }
 
-    // The SSE emitters these exercise are `axum`-gated, so the tests are too.
-    #[cfg(feature = "axum")]
-    mod sse {
+    // The emitter is framework-free, so these run in the lean build too — no
+    // `axum` cfg. They assert on `SseFrame` fields directly.
+    mod emitter {
         use super::*;
 
-        // ── openai_stream_to_anthropic_sse ────────────────────────────────────────
+        // ── openai_stream_to_anthropic_frames ─────────────────────────────────────
 
         use crate::error::ProxyError;
         use crate::providers::ProviderStream;
+        use crate::sse::SseFrame;
         use crate::types::{ChatCompletionChunk, ChunkChoice, ChunkDelta};
         use futures::StreamExt;
+
+        /// Render frames the way they go on the wire, so assertions read like SSE
+        /// and match the exact bytes a client would parse.
+        fn wire_dump(frames: &[Result<SseFrame, ProxyError>]) -> String {
+            frames
+                .iter()
+                .map(|f| {
+                    let f = f.as_ref().expect("frame must be Ok");
+                    format!("event: {}\ndata: {}", f.event, f.data)
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
 
         fn make_chunk(content: Option<&str>, finish_reason: Option<&str>) -> ChatCompletionChunk {
             ChatCompletionChunk {
@@ -2203,16 +2217,12 @@ mod tests {
             ];
             let inner: ProviderStream = Box::pin(futures::stream::iter(chunks));
             let events: Vec<_> =
-                openai_stream_to_anthropic_sse("m".to_string(), "msg".to_string(), inner)
+                openai_stream_to_anthropic_frames("m".to_string(), "msg".to_string(), inner)
                     .collect()
                     .await;
 
             assert!(events.iter().all(|e| e.is_ok()), "stream must not abort");
-            let dump = events
-                .iter()
-                .map(|e| format!("{:?}", e.as_ref().unwrap()))
-                .collect::<Vec<_>>()
-                .join("\n");
+            let dump = wire_dump(&events);
 
             // Exactly ONE tool block: one start, one stop (not one per fragment).
             // Count the SSE event-name line ("content_block_start" also appears in
@@ -2261,15 +2271,11 @@ mod tests {
             ];
             let inner: ProviderStream = Box::pin(futures::stream::iter(chunks));
             let events: Vec<_> =
-                openai_stream_to_anthropic_sse("m".to_string(), "msg".to_string(), inner)
+                openai_stream_to_anthropic_frames("m".to_string(), "msg".to_string(), inner)
                     .collect()
                     .await;
             assert!(events.iter().all(|e| e.is_ok()));
-            let dump = events
-                .iter()
-                .map(|e| format!("{:?}", e.as_ref().unwrap()))
-                .collect::<Vec<_>>()
-                .join("\n");
+            let dump = wire_dump(&events);
             // Two distinct tool blocks: two starts, two stops.
             assert_eq!(dump.matches("event: content_block_start").count(), 2);
             assert_eq!(dump.matches("event: content_block_stop").count(), 2);
@@ -2291,18 +2297,14 @@ mod tests {
             ];
             let inner: ProviderStream = Box::pin(futures::stream::iter(chunks));
             let events: Vec<_> =
-                openai_stream_to_anthropic_sse("m".to_string(), "msg".to_string(), inner)
+                openai_stream_to_anthropic_frames("m".to_string(), "msg".to_string(), inner)
                     .collect()
                     .await;
             assert!(
                 events.iter().all(|e| e.is_ok()),
                 "stream must not abort on index -1"
             );
-            let dump = events
-                .iter()
-                .map(|e| format!("{:?}", e.as_ref().unwrap()))
-                .collect::<Vec<_>>()
-                .join("\n");
+            let dump = wire_dump(&events);
             assert_eq!(dump.matches("event: content_block_start").count(), 1);
             assert!(dump.contains("Bash"));
         }
@@ -2318,15 +2320,11 @@ mod tests {
             ];
             let inner: ProviderStream = Box::pin(futures::stream::iter(chunks));
             let events: Vec<_> =
-                openai_stream_to_anthropic_sse("m".to_string(), "msg".to_string(), inner)
+                openai_stream_to_anthropic_frames("m".to_string(), "msg".to_string(), inner)
                     .collect()
                     .await;
             assert!(events.iter().all(|e| e.is_ok()));
-            let dump = events
-                .iter()
-                .map(|e| format!("{:?}", e.as_ref().unwrap()))
-                .collect::<Vec<_>>()
-                .join("\n");
+            let dump = wire_dump(&events);
             // A thinking block with a thinking_delta is emitted.
             assert!(
                 dump.contains("thinking_delta"),
@@ -2351,19 +2349,19 @@ mod tests {
             )];
             let inner: ProviderStream = Box::pin(futures::stream::iter(chunks));
             let events: Vec<_> =
-                openai_stream_to_anthropic_sse("m".to_string(), "msg_tool".to_string(), inner)
+                openai_stream_to_anthropic_frames("m".to_string(), "msg_tool".to_string(), inner)
                     .collect()
                     .await;
 
             assert!(events.iter().all(|e| e.is_ok()));
 
             // Verify no content_block_start with type "text" appears
-            for sse in events.iter().flatten() {
-                let data = format!("{:?}", sse);
-                if data.contains("content_block_start") {
+            for frame in events.iter().flatten() {
+                if frame.event == "content_block_start" {
                     assert!(
-                        !data.contains(r#""type":"text""#),
-                        "tool-only response must not emit a text content block: {data}"
+                        !frame.data.contains(r#""type":"text""#),
+                        "tool-only response must not emit a text content block: {}",
+                        frame.data
                     );
                 }
             }
@@ -2379,7 +2377,7 @@ mod tests {
             let inner = futures::stream::iter(chunks);
             let inner: ProviderStream = Box::pin(inner);
 
-            let events: Vec<_> = openai_stream_to_anthropic_sse(
+            let events: Vec<_> = openai_stream_to_anthropic_frames(
                 "claude-sonnet".to_string(),
                 "msg_test123".to_string(),
                 inner,
@@ -2412,21 +2410,15 @@ mod tests {
             let inner: ProviderStream = Box::pin(futures::stream::iter(chunks));
 
             let events: Vec<_> =
-                openai_stream_to_anthropic_sse("m".to_string(), "msg_u".to_string(), inner)
+                openai_stream_to_anthropic_frames("m".to_string(), "msg_u".to_string(), inner)
                     .collect()
                     .await;
-            let dump = events
-                .iter()
-                .map(|e| format!("{:?}", e.as_ref().unwrap()))
-                .collect::<Vec<_>>()
-                .join("\n");
-            // Event Debug-formats its buffer as an escaped byte string, so quotes
-            // appear as \"; match the token/value pair rather than exact JSON.
+            let dump = wire_dump(&events);
             assert!(
-                dump.contains(r#"input_tokens\":123"#),
+                dump.contains(r#""input_tokens":123"#),
                 "message_delta must carry input_tokens: {dump}"
             );
-            assert!(dump.contains(r#"output_tokens\":45"#));
+            assert!(dump.contains(r#""output_tokens":45"#));
         }
 
         #[tokio::test]
@@ -2442,20 +2434,16 @@ mod tests {
             let inner: ProviderStream = Box::pin(futures::stream::iter(chunks));
 
             let events: Vec<_> =
-                openai_stream_to_anthropic_sse("m".to_string(), "msg_c".to_string(), inner)
+                openai_stream_to_anthropic_frames("m".to_string(), "msg_c".to_string(), inner)
                     .collect()
                     .await;
-            let dump = events
-                .iter()
-                .map(|e| format!("{:?}", e.as_ref().unwrap()))
-                .collect::<Vec<_>>()
-                .join("\n");
+            let dump = wire_dump(&events);
             assert!(
-                dump.contains(r#"cache_read_input_tokens\":3968"#),
+                dump.contains(r#""cache_read_input_tokens":3968"#),
                 "message_delta must carry cache_read_input_tokens: {dump}"
             );
             assert!(
-                dump.contains(r#"cache_creation_input_tokens\":100"#),
+                dump.contains(r#""cache_creation_input_tokens":100"#),
                 "message_delta must carry cache_creation_input_tokens: {dump}"
             );
         }
@@ -2473,14 +2461,10 @@ mod tests {
             let inner: ProviderStream = Box::pin(futures::stream::iter(chunks));
 
             let events: Vec<_> =
-                openai_stream_to_anthropic_sse("m".to_string(), "msg_n".to_string(), inner)
+                openai_stream_to_anthropic_frames("m".to_string(), "msg_n".to_string(), inner)
                     .collect()
                     .await;
-            let dump = events
-                .iter()
-                .map(|e| format!("{:?}", e.as_ref().unwrap()))
-                .collect::<Vec<_>>()
-                .join("\n");
+            let dump = wire_dump(&events);
             assert!(
                 !dump.contains("cache_read_input_tokens") && !dump.contains("cache_creation"),
                 "a non-caching stream must emit no cache keys: {dump}"
@@ -2531,7 +2515,7 @@ mod tests {
         async fn empty_stream_emits_valid_sequence() {
             let inner: ProviderStream = Box::pin(futures::stream::empty());
             let events: Vec<_> =
-                openai_stream_to_anthropic_sse("m".to_string(), "msg_x".to_string(), inner)
+                openai_stream_to_anthropic_frames("m".to_string(), "msg_x".to_string(), inner)
                     .collect()
                     .await;
 
@@ -2556,17 +2540,13 @@ mod tests {
             ];
             let inner: ProviderStream = Box::pin(futures::stream::iter(chunks));
             let events: Vec<_> =
-                openai_stream_to_anthropic_sse("m".to_string(), "msg".to_string(), inner)
+                openai_stream_to_anthropic_frames("m".to_string(), "msg".to_string(), inner)
                     .collect()
                     .await;
             // Every event is Ok — the error surfaces as an SSE `error` event, not a
             // raw stream error (which would close the connection with no terminal event).
             assert!(events.iter().all(|e| e.is_ok()), "no raw stream errors");
-            let dump = events
-                .iter()
-                .map(|e| format!("{:?}", e.as_ref().unwrap()))
-                .collect::<Vec<_>>()
-                .join("\n");
+            let dump = wire_dump(&events);
             assert!(
                 dump.contains("event: error"),
                 "an error event is emitted: {dump}"
@@ -2583,18 +2563,14 @@ mod tests {
             let inner: ProviderStream = Box::pin(futures::stream::iter(chunks));
 
             let events: Vec<_> =
-                openai_stream_to_anthropic_sse("m".to_string(), "msg_x".to_string(), inner)
+                openai_stream_to_anthropic_frames("m".to_string(), "msg_x".to_string(), inner)
                     .collect()
                     .await;
 
             // The upstream error is surfaced as an Anthropic `error` SSE event, not a
             // raw stream Err (which would drop the connection with no terminal event).
             assert!(events.iter().all(|e| e.is_ok()));
-            let dump = events
-                .iter()
-                .map(|e| format!("{:?}", e.as_ref().unwrap()))
-                .collect::<Vec<_>>()
-                .join("\n");
+            let dump = wire_dump(&events);
             assert!(dump.contains("event: error"));
         }
 
@@ -2608,7 +2584,7 @@ mod tests {
             let inner: ProviderStream = Box::pin(futures::stream::iter(chunks));
 
             let events: Vec<_> =
-                openai_stream_to_anthropic_sse("m".to_string(), "msg_x".to_string(), inner)
+                openai_stream_to_anthropic_frames("m".to_string(), "msg_x".to_string(), inner)
                     .collect()
                     .await;
 

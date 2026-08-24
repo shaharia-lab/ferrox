@@ -12,7 +12,7 @@
 //! |---|---|---|
 //! | `anthropic`, `openai`, `gemini` | ✅ | adapter for that provider |
 //! | `bedrock` | — | AWS Bedrock adapter; pulls the AWS SDK |
-//! | `axum` | — | `IntoResponse for ProxyError` + the Anthropic SSE emitters |
+//! | `axum` | — | `IntoResponse for ProxyError` + `SseFrame` → `axum` SSE `Event` |
 //! | `openapi` | — | `utoipa::ToSchema` on the public response types |
 //!
 //! The default build depends on no web framework, so embedding this crate does
@@ -27,4 +27,5 @@ pub mod anthropic_types;
 pub mod config;
 pub mod error;
 pub mod providers;
+pub mod sse;
 pub mod types;

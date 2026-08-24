@@ -51,13 +51,37 @@ let response = adapter.chat(&request, "claude-sonnet-4-20250514").await?;
 | `openai` | ✅ | OpenAI adapter (also serves `ProviderType::Glm`) |
 | `gemini` | ✅ | Google Gemini adapter |
 | `bedrock` | — | AWS Bedrock adapter; pulls the AWS SDK |
-| `axum` | — | `IntoResponse for ProxyError` and the Anthropic SSE event emitters |
+| `axum` | — | `IntoResponse for ProxyError` and `SseFrame` → axum SSE `Event` |
 | `openapi` | — | `utoipa::ToSchema` on the public response types |
 
 The default build depends on **no web framework**: no `axum`, no `utoipa`, no
 AWS SDK. That keeps a consumer off Ferrox's framework version treadmill and cuts
 the dependency tree roughly in half (144 crates with `anthropic` alone, versus
 266 with everything enabled).
+
+### Streaming on an Anthropic-native surface
+
+`openai_stream_to_anthropic_frames` drives the full Anthropic SSE protocol —
+`message_start` → `content_block_start` → `ping` → N× `content_block_delta` →
+`content_block_stop` → `message_delta` → `message_stop`, including `thinking`
+blocks, `tool_use` with `input_json_delta`, and prompt-cache counters — and emits
+a framework-free `ferrox_providers::sse::SseFrame` (just an `event` name and a
+`data` payload). It needs **no** feature beyond a provider's.
+
+Adapting frames to your own framework is the whole integration:
+
+```rust
+use ferrox_providers::anthropic_types::openai_stream_to_anthropic_frames;
+use futures::StreamExt as _;
+
+let events = openai_stream_to_anthropic_frames(model, msg_id, upstream)
+    .map(|res| res.map(|f| my_framework::SseEvent::new(f.event, f.data)));
+```
+
+With the `axum` feature enabled you get that adapter for axum 0.7 for free, as
+`openai_stream_to_anthropic_sse` (this is what the Ferrox binary serves). On any
+other axum version, take the frames and write the two-line mapping above — do
+not enable the feature, or you will compile a second axum into your tree.
 
 Requesting a provider whose feature is disabled fails at `build_registry` time
 with an actionable message, not at compile time — so a config file can name a
