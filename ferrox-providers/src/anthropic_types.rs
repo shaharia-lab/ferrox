@@ -1029,22 +1029,12 @@ mod emitter {
         SseFrame::new("content_block_start", data.to_string())
     }
 
+    /// The mid-stream `error` event carries the same body the non-streaming path
+    /// serves, so both come from `anthropic_error_body`. The status is dropped —
+    /// headers are long gone by the time a stream fails.
     fn make_error_event(e: &ProxyError) -> SseFrame {
-        let (error_type, message) = match e {
-            ProxyError::Unauthorized(m) => ("authentication_error", m.clone()),
-            ProxyError::Forbidden(m) => ("permission_error", m.clone()),
-            ProxyError::ModelNotFound(m) => ("not_found_error", m.clone()),
-            ProxyError::RateLimited(m) | ProxyError::BudgetExceeded(m) => {
-                ("rate_limit_error", m.clone())
-            }
-            ProxyError::CircuitOpen(m) => ("overloaded_error", m.clone()),
-            other => ("api_error", other.to_string()),
-        };
-        let data = serde_json::json!({
-            "type": "error",
-            "error": {"type": error_type, "message": message}
-        });
-        SseFrame::new("error", data.to_string())
+        let (_status, body) = crate::error::anthropic_error_body(e);
+        SseFrame::new("error", body.to_string())
     }
 
     fn make_thinking_block_start_event(index: u32) -> SseFrame {
@@ -2572,6 +2562,47 @@ mod tests {
             assert!(events.iter().all(|e| e.is_ok()));
             let dump = wire_dump(&events);
             assert!(dump.contains("event: error"));
+        }
+
+        // The point of sharing one mapping (#149): the `error` event a client gets
+        // mid-stream must be the same body it would have got as a JSON response,
+        // for every variant. Before, the two paths had separate tables and the
+        // streaming one fell through to `Display` (a "Provider error from … " or
+        // "Upstream timeout: " prefix) where the response path used the bare
+        // message.
+        #[tokio::test]
+        async fn mid_stream_error_body_matches_the_non_streaming_body() {
+            let cases = vec![
+                ProxyError::Unauthorized("bad key".to_string()),
+                ProxyError::RateLimited("slow down".to_string()),
+                ProxyError::CircuitOpen("open".to_string()),
+                ProxyError::UpstreamTimeout("timed out".to_string()),
+                ProxyError::StreamError("broken".to_string()),
+                ProxyError::ProviderError {
+                    provider: "anthropic".to_string(),
+                    status: 503,
+                    message: "overloaded".to_string(),
+                },
+                ProxyError::ConfigError("bad config".to_string()),
+            ];
+
+            for err in cases {
+                let expected = crate::error::anthropic_error_body(&err).1.to_string();
+
+                let chunks: Vec<Result<ChatCompletionChunk, ProxyError>> = vec![Err(err)];
+                let inner: ProviderStream = Box::pin(futures::stream::iter(chunks));
+                let events: Vec<_> =
+                    openai_stream_to_anthropic_frames("m".to_string(), "msg".to_string(), inner)
+                        .collect()
+                        .await;
+
+                let error_frame = events
+                    .iter()
+                    .flatten()
+                    .find(|f| f.event == "error")
+                    .expect("an error event is emitted");
+                assert_eq!(error_frame.data, expected);
+            }
         }
 
         #[tokio::test]

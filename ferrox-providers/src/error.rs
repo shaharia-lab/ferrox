@@ -4,7 +4,6 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-#[cfg(feature = "axum")]
 use serde_json::json;
 use thiserror::Error;
 
@@ -55,77 +54,352 @@ pub enum ProxyError {
     AwsError(String),
 }
 
-/// Maps every variant onto an OpenAI-shaped JSON error body.
+/// `StatusCode::from_u16` accepts 100..=999; anything else is not a valid HTTP
+/// status and falls back to 502, matching what the axum layer did when it owned
+/// this decision.
+fn http_status_or_bad_gateway(status: u16) -> u16 {
+    if (100..=999).contains(&status) {
+        status
+    } else {
+        502
+    }
+}
+
+/// Maps every variant onto an OpenAI-shaped JSON error body —
+/// `{"error":{"message":…,"type":…,"code":…}}` — plus the HTTP status to serve
+/// it with.
+///
+/// Framework-free on purpose: a consumer builds its own response from the pair,
+/// and the `axum` feature's `IntoResponse` is just one such consumer.
+pub fn openai_error_body(e: &ProxyError) -> (u16, serde_json::Value) {
+    let (status, error_type, message) = match e {
+        ProxyError::Unauthorized(msg) => (401, "unauthorized", msg.clone()),
+        ProxyError::Forbidden(msg) => (403, "forbidden", msg.clone()),
+        ProxyError::ModelNotFound(msg) => (404, "model_not_found", msg.clone()),
+        ProxyError::RateLimited(msg) => (429, "rate_limited", msg.clone()),
+        ProxyError::BudgetExceeded(msg) => (429, "budget_exceeded", msg.clone()),
+        ProxyError::CircuitOpen(msg) => (502, "circuit_open", msg.clone()),
+        ProxyError::ProviderError {
+            status, message, ..
+        } => (
+            http_status_or_bad_gateway(*status),
+            "provider_error",
+            message.clone(),
+        ),
+        ProxyError::UpstreamTimeout(msg) => (504, "upstream_timeout", msg.clone()),
+        ProxyError::StreamError(msg) => (500, "stream_error", msg.clone()),
+        ProxyError::ConfigError(msg) => (500, "config_error", msg.clone()),
+        ProxyError::SerializationError(e) => (400, "serialization_error", e.to_string()),
+        ProxyError::HttpClientError(e) => {
+            if e.is_timeout() {
+                (504, "upstream_timeout", e.to_string())
+            } else {
+                (502, "http_client_error", e.to_string())
+            }
+        }
+        ProxyError::AwsError(msg) => (502, "aws_error", msg.clone()),
+    };
+
+    (
+        status,
+        json!({
+            "error": {
+                "message": message,
+                "type": error_type,
+                "code": status
+            }
+        }),
+    )
+}
+
+/// Maps every variant onto an Anthropic-shaped JSON error body —
+/// `{"type":"error","error":{"type":…,"message":…}}` — plus the HTTP status.
+///
+/// Anthropic SDK clients branch on `error.type` (`authentication_error` vs
+/// `permission_error` vs `overloaded_error` drive real retry behavior), so any
+/// gateway exposing an Anthropic-native surface must emit exactly these strings.
+/// Returning the status alongside the body lets the non-streaming response path
+/// and the mid-stream SSE `error` event share one mapping.
+pub fn anthropic_error_body(e: &ProxyError) -> (u16, serde_json::Value) {
+    let (status, error_type, message) = match e {
+        ProxyError::Unauthorized(msg) => (401, "authentication_error", msg.clone()),
+        ProxyError::Forbidden(msg) => (403, "permission_error", msg.clone()),
+        ProxyError::ModelNotFound(msg) => (404, "not_found_error", msg.clone()),
+        ProxyError::RateLimited(msg) | ProxyError::BudgetExceeded(msg) => {
+            (429, "rate_limit_error", msg.clone())
+        }
+        // 529 is Anthropic's "overloaded" status; 502 is the closest standard code.
+        ProxyError::CircuitOpen(msg) => (502, "overloaded_error", msg.clone()),
+        ProxyError::ProviderError {
+            status, message, ..
+        } => (
+            http_status_or_bad_gateway(*status),
+            "api_error",
+            message.clone(),
+        ),
+        ProxyError::UpstreamTimeout(msg) => (504, "api_error", msg.clone()),
+        ProxyError::StreamError(msg) => (500, "api_error", msg.clone()),
+        other => (500, "api_error", other.to_string()),
+    };
+
+    (
+        status,
+        json!({
+            "type": "error",
+            "error": {
+                "type": error_type,
+                "message": message
+            }
+        }),
+    )
+}
+
+/// Serves [`openai_error_body`] as an axum response.
 ///
 /// Gated on the `axum` feature so the crate does not force a web-framework
 /// version on consumers that only want the translation layer.
 #[cfg(feature = "axum")]
 impl IntoResponse for ProxyError {
     fn into_response(self) -> Response {
-        let (status, error_type, message) = match &self {
-            ProxyError::Unauthorized(msg) => {
-                (StatusCode::UNAUTHORIZED, "unauthorized", msg.clone())
-            }
-            ProxyError::Forbidden(msg) => (StatusCode::FORBIDDEN, "forbidden", msg.clone()),
-            ProxyError::ModelNotFound(msg) => {
-                (StatusCode::NOT_FOUND, "model_not_found", msg.clone())
-            }
-            ProxyError::RateLimited(msg) => {
-                (StatusCode::TOO_MANY_REQUESTS, "rate_limited", msg.clone())
-            }
-            ProxyError::BudgetExceeded(msg) => (
-                StatusCode::TOO_MANY_REQUESTS,
-                "budget_exceeded",
-                msg.clone(),
-            ),
-            ProxyError::CircuitOpen(msg) => (StatusCode::BAD_GATEWAY, "circuit_open", msg.clone()),
-            ProxyError::ProviderError {
-                status, message, ..
-            } => {
-                let http_status = StatusCode::from_u16(*status).unwrap_or(StatusCode::BAD_GATEWAY);
-                (http_status, "provider_error", message.clone())
-            }
-            ProxyError::UpstreamTimeout(msg) => {
-                (StatusCode::GATEWAY_TIMEOUT, "upstream_timeout", msg.clone())
-            }
-            ProxyError::StreamError(msg) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "stream_error",
-                msg.clone(),
-            ),
-            ProxyError::ConfigError(msg) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "config_error",
-                msg.clone(),
-            ),
-            ProxyError::SerializationError(e) => (
-                StatusCode::BAD_REQUEST,
-                "serialization_error",
-                e.to_string(),
-            ),
-            ProxyError::HttpClientError(e) => {
-                if e.is_timeout() {
-                    (
-                        StatusCode::GATEWAY_TIMEOUT,
-                        "upstream_timeout",
-                        e.to_string(),
-                    )
-                } else {
-                    (StatusCode::BAD_GATEWAY, "http_client_error", e.to_string())
-                }
-            }
-            ProxyError::AwsError(msg) => (StatusCode::BAD_GATEWAY, "aws_error", msg.clone()),
-        };
+        let (status, body) = openai_error_body(&self);
+        let status = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
+        (status, Json(body)).into_response()
+    }
+}
 
-        let body = json!({
-            "error": {
-                "message": message,
-                "type": error_type,
-                "code": status.as_u16()
-            }
+// The mapping functions are framework-free, so their tests are too — they run in
+// the lean build and are the byte-identity contract both surfaces are held to.
+#[cfg(test)]
+mod body_tests {
+    use super::*;
+
+    fn provider_error(status: u16) -> ProxyError {
+        ProxyError::ProviderError {
+            provider: "anthropic".to_string(),
+            status,
+            message: "overloaded".to_string(),
+        }
+    }
+
+    fn serde_error() -> ProxyError {
+        ProxyError::SerializationError(serde_json::from_str::<i32>("nope").unwrap_err())
+    }
+
+    /// A non-timeout `reqwest::Error`. `reqwest::Error` has no public
+    /// constructor, so provoke a real one — connection refused on a closed
+    /// loopback port is deterministic and needs no external network.
+    async fn http_client_error() -> ProxyError {
+        let err = reqwest::Client::new()
+            .get("http://127.0.0.1:1/")
+            .send()
+            .await
+            .expect_err("port 1 on loopback refuses connections");
+        assert!(!err.is_timeout(), "expected a connect error, not a timeout");
+        ProxyError::HttpClientError(err)
+    }
+
+    /// A timeout `reqwest::Error`, provoked by a listener that accepts the
+    /// connection and then never answers.
+    async fn http_timeout_error() -> ProxyError {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // Hold the accepted socket open without writing a response.
+        tokio::spawn(async move {
+            let _held = listener.accept().await;
+            std::future::pending::<()>().await;
         });
 
-        (status, Json(body)).into_response()
+        let err = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_millis(100))
+            .build()
+            .unwrap()
+            .get(format!("http://{addr}/"))
+            .send()
+            .await
+            .expect_err("the server never responds");
+        assert!(err.is_timeout(), "expected a timeout, got {err}");
+        ProxyError::HttpClientError(err)
+    }
+
+    /// Every `ProxyError` variant, so the tables below cannot silently fall
+    /// behind the enum: add a variant and the length assertions fail.
+    const VARIANT_COUNT: usize = 13;
+
+    // ── OpenAI shape ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn openai_shape_covers_every_variant() {
+        // (error, expected status, expected `error.type`)
+        let cases: Vec<(ProxyError, u16, &str)> = vec![
+            (ProxyError::Unauthorized("k".into()), 401, "unauthorized"),
+            (ProxyError::Forbidden("k".into()), 403, "forbidden"),
+            (
+                ProxyError::ModelNotFound("m".into()),
+                404,
+                "model_not_found",
+            ),
+            (ProxyError::RateLimited("r".into()), 429, "rate_limited"),
+            (
+                ProxyError::BudgetExceeded("b".into()),
+                429,
+                "budget_exceeded",
+            ),
+            (ProxyError::CircuitOpen("c".into()), 502, "circuit_open"),
+            (provider_error(503), 503, "provider_error"),
+            (
+                ProxyError::UpstreamTimeout("t".into()),
+                504,
+                "upstream_timeout",
+            ),
+            (ProxyError::StreamError("s".into()), 500, "stream_error"),
+            (ProxyError::ConfigError("c".into()), 500, "config_error"),
+            (serde_error(), 400, "serialization_error"),
+            (ProxyError::AwsError("a".into()), 502, "aws_error"),
+        ];
+
+        assert_eq!(
+            cases.len(),
+            VARIANT_COUNT - 1,
+            "every variant except HttpClientError (covered separately, it branches)"
+        );
+
+        for (err, want_status, want_type) in cases {
+            let (status, body) = openai_error_body(&err);
+            assert_eq!(status, want_status, "status for {want_type}");
+            assert_eq!(body["error"]["type"], want_type);
+            // `code` mirrors the HTTP status — clients read it instead of the header.
+            assert_eq!(body["error"]["code"], want_status);
+            assert!(
+                body["error"]["message"].is_string(),
+                "message present for {want_type}"
+            );
+        }
+    }
+
+    #[test]
+    fn openai_shape_carries_the_message_verbatim() {
+        let (_, body) = openai_error_body(&ProxyError::Forbidden("test msg".into()));
+        assert_eq!(body["error"]["message"], "test msg");
+    }
+
+    // ── Anthropic shape ──────────────────────────────────────────────────────
+
+    #[test]
+    fn anthropic_shape_covers_every_variant() {
+        let cases: Vec<(ProxyError, u16, &str)> = vec![
+            (
+                ProxyError::Unauthorized("k".into()),
+                401,
+                "authentication_error",
+            ),
+            (ProxyError::Forbidden("k".into()), 403, "permission_error"),
+            (
+                ProxyError::ModelNotFound("m".into()),
+                404,
+                "not_found_error",
+            ),
+            (ProxyError::RateLimited("r".into()), 429, "rate_limit_error"),
+            (
+                ProxyError::BudgetExceeded("b".into()),
+                429,
+                "rate_limit_error",
+            ),
+            (ProxyError::CircuitOpen("c".into()), 502, "overloaded_error"),
+            (provider_error(503), 503, "api_error"),
+            (ProxyError::UpstreamTimeout("t".into()), 504, "api_error"),
+            (ProxyError::StreamError("s".into()), 500, "api_error"),
+            // The catch-all arm: everything else is a 500 api_error.
+            (ProxyError::ConfigError("c".into()), 500, "api_error"),
+            (serde_error(), 500, "api_error"),
+            (ProxyError::AwsError("a".into()), 500, "api_error"),
+        ];
+
+        assert_eq!(
+            cases.len(),
+            VARIANT_COUNT - 1,
+            "every variant except HttpClientError (covered separately, it branches)"
+        );
+
+        for (err, want_status, want_type) in cases {
+            let (status, body) = anthropic_error_body(&err);
+            assert_eq!(status, want_status, "status for {err}");
+            assert_eq!(body["type"], "error", "envelope for {err}");
+            assert_eq!(body["error"]["type"], want_type, "type for {err}");
+            assert!(body["error"]["message"].is_string(), "message for {err}");
+        }
+    }
+
+    #[test]
+    fn anthropic_shape_uses_the_upstream_message_for_provider_errors() {
+        // Not the full `Display` (which would prefix "Provider error from …") —
+        // clients see what the upstream said.
+        let (_, body) = anthropic_error_body(&provider_error(503));
+        assert_eq!(body["error"]["message"], "overloaded");
+    }
+
+    #[test]
+    fn anthropic_shape_omits_the_openai_code_field() {
+        let (_, body) = anthropic_error_body(&ProxyError::Forbidden("k".into()));
+        assert!(
+            body["error"].get("code").is_none(),
+            "Anthropic's shape has no `code`: {body}"
+        );
+    }
+
+    // ── HttpClientError: the only variant whose mapping branches ─────────────
+
+    #[tokio::test]
+    async fn http_client_error_maps_by_timeout_on_the_openai_shape() {
+        let (status, body) = openai_error_body(&http_client_error().await);
+        assert_eq!(status, 502);
+        assert_eq!(body["error"]["type"], "http_client_error");
+
+        let (status, body) = openai_error_body(&http_timeout_error().await);
+        assert_eq!(
+            status, 504,
+            "a timeout is a gateway timeout, not a bad gateway"
+        );
+        assert_eq!(body["error"]["type"], "upstream_timeout");
+    }
+
+    #[tokio::test]
+    async fn http_client_error_is_a_500_api_error_on_the_anthropic_shape() {
+        // Both branches fall through the catch-all here. This asymmetry with the
+        // OpenAI shape above is pre-existing behavior, preserved deliberately:
+        // #149 keeps every status and `error.type` string exactly as it was.
+        for err in [http_client_error().await, http_timeout_error().await] {
+            let (status, body) = anthropic_error_body(&err);
+            assert_eq!(status, 500);
+            assert_eq!(body["error"]["type"], "api_error");
+        }
+    }
+
+    // ── Status handling, shared by both shapes ───────────────────────────────
+
+    #[test]
+    fn provider_error_passes_its_own_status_through() {
+        for status in [400u16, 429, 503, 999] {
+            assert_eq!(openai_error_body(&provider_error(status)).0, status);
+            assert_eq!(anthropic_error_body(&provider_error(status)).0, status);
+        }
+    }
+
+    #[test]
+    fn provider_error_with_an_impossible_status_falls_back_to_502() {
+        // `StatusCode::from_u16` accepts 100..=999; the guard must reject the rest
+        // exactly as the axum layer did when it owned this decision.
+        for status in [0u16, 42, 1000, u16::MAX] {
+            assert_eq!(
+                openai_error_body(&provider_error(status)).0,
+                502,
+                "openai fallback for {status}"
+            );
+            assert_eq!(
+                anthropic_error_body(&provider_error(status)).0,
+                502,
+                "anthropic fallback for {status}"
+            );
+        }
     }
 }
 

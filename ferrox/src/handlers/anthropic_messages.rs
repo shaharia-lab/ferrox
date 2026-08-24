@@ -28,58 +28,12 @@ use crate::usage_writer::UsageEvent;
 
 /// Map a `ProxyError` to an Anthropic API error response.
 ///
-/// The Anthropic SDK expects errors in the format:
-/// ```json
-/// { "type": "error", "error": { "type": "<error_type>", "message": "..." } }
-/// ```
+/// The mapping itself lives in `ferrox-providers` so that any consumer exposing
+/// an Anthropic-native surface on the crate emits byte-identical errors; this is
+/// only the axum wrapper around it.
 fn proxy_error_to_anthropic_response(e: &ProxyError) -> Response {
-    let (status, error_type, message) = match e {
-        ProxyError::Unauthorized(msg) => (
-            StatusCode::UNAUTHORIZED,
-            "authentication_error",
-            msg.clone(),
-        ),
-        ProxyError::Forbidden(msg) => (StatusCode::FORBIDDEN, "permission_error", msg.clone()),
-        ProxyError::ModelNotFound(msg) => (StatusCode::NOT_FOUND, "not_found_error", msg.clone()),
-        ProxyError::RateLimited(msg) => (
-            StatusCode::TOO_MANY_REQUESTS,
-            "rate_limit_error",
-            msg.clone(),
-        ),
-        ProxyError::BudgetExceeded(msg) => (
-            StatusCode::TOO_MANY_REQUESTS,
-            "rate_limit_error",
-            msg.clone(),
-        ),
-        ProxyError::CircuitOpen(msg) => {
-            // 529 is Anthropic's "overloaded" status; use BAD_GATEWAY as the closest standard code.
-            (StatusCode::BAD_GATEWAY, "overloaded_error", msg.clone())
-        }
-        ProxyError::ProviderError {
-            status, message, ..
-        } => {
-            let http_status = StatusCode::from_u16(*status).unwrap_or(StatusCode::BAD_GATEWAY);
-            (http_status, "api_error", message.clone())
-        }
-        ProxyError::UpstreamTimeout(msg) => (StatusCode::GATEWAY_TIMEOUT, "api_error", msg.clone()),
-        ProxyError::StreamError(msg) => {
-            (StatusCode::INTERNAL_SERVER_ERROR, "api_error", msg.clone())
-        }
-        other => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "api_error",
-            other.to_string(),
-        ),
-    };
-
-    let body = serde_json::json!({
-        "type": "error",
-        "error": {
-            "type": error_type,
-            "message": message
-        }
-    });
-
+    let (status, body) = ferrox_providers::error::anthropic_error_body(e);
+    let status = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
     (status, Json(body)).into_response()
 }
 
