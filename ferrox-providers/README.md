@@ -83,6 +83,25 @@ With the `axum` feature enabled you get that adapter for axum 0.7 for free, as
 other axum version, take the frames and write the two-line mapping above — do
 not enable the feature, or you will compile a second axum into your tree.
 
+### Error bodies
+
+`ProxyError` maps onto either provider dialect, framework-free — each returns the
+HTTP status alongside the JSON body, so you build the response yourself:
+
+```rust
+use ferrox_providers::error::{anthropic_error_body, openai_error_body};
+
+let (status, body) = openai_error_body(&err);     // {"error":{"message","type","code"}}
+let (status, body) = anthropic_error_body(&err);  // {"type":"error","error":{"type","message"}}
+```
+
+Serve the shape that matches the surface the client called — SDKs parse these and
+branch on `error.type`, so an OpenAI-shaped body on an Anthropic endpoint breaks
+client retry logic. The `axum` feature's `IntoResponse for ProxyError` is a
+convenience wrapper over `openai_error_body`. Ferrox and any other gateway built
+on this crate therefore emit identical error bytes, on both the response and the
+mid-stream SSE `error` event.
+
 Requesting a provider whose feature is disabled fails at `build_registry` time
 with an actionable message, not at compile time — so a config file can name a
 provider the binary was not built for and you get a clear error.
