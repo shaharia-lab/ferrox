@@ -418,3 +418,31 @@ The CI pipeline runs:
 6. Config schema validation (`check-jsonschema`)
 7. `cargo audit` (security advisories)
 8. Docker image build for `ferrox-cp` (push to GHCR on merge to `main`)
+9. Provider crate boundary — asserts the lean `ferrox-providers` build pulls in
+   no `axum`, `utoipa` or `aws-*`, and that every git ref the crate's docs tell
+   consumers to pin actually resolves in this repo
+
+## Releasing `ferrox-providers`
+
+The library is versioned **independently of the gateway** and is not published to
+crates.io, so consumers depend on it by git ref. To cut a new reference point:
+
+1. Bump `version` in `ferrox-providers/Cargo.toml` and merge that — the tag name
+   must match the version the crate declares, or a consumer pinning
+   `providers-v0.2.0` gets a crate calling itself `0.1.0`.
+2. Tag the merged commit, with a plain annotated tag:
+
+```bash
+git tag -a providers-v0.2.0 <sha> -m "ferrox-providers 0.2.0 — <what changed>"
+git push origin providers-v0.2.0
+```
+
+Then update the pin in `ferrox-providers/README.md` and the crate docs in
+`ferrox-providers/src/lib.rs` — the `Provider crate boundary` job fails if they
+name a ref that does not exist, which is what let `providers-v0.1.0` be
+documented for months before it was created (#150).
+
+**Do not publish a `providers-*` tag as a GitHub Release.** `release.yml` triggers
+on `release: [published]`, so doing so would run the gateway's binary, GHCR and
+Homebrew pipeline against a non-semver tag. Pushing the bare tag does not trigger
+anything.

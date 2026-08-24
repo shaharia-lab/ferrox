@@ -10,7 +10,8 @@ of the gateway around them. No routing, load balancing, circuit breaking, rate
 limiting, JWKS or auth.
 
 Ferrox itself consumes this crate, so the translation is exercised by Ferrox's
-compat suite (169 tests live here) rather than maintained in two places.
+compat suite (184 tests with `--all-features`) rather than maintained in two
+places.
 
 ## Usage
 
@@ -23,6 +24,19 @@ ferrox-providers = { git = "https://github.com/shaharia-lab/ferrox", tag = "prov
 Pin to a tag rather than a branch: a merge on Ferrox's `main` should never
 silently change your build. The crate is a workspace member inside the Ferrox
 repo — Cargo resolves that automatically, no separate repository needed.
+
+`providers-v0.1.0` is the first tagged reference point, cut once the crate's
+public surface stopped moving (framework-free SSE frames in #148, framework-free
+error bodies in #149). It is a plain git tag, **not** a GitHub Release, and it is
+versioned independently of Ferrox's own `v*` gateway releases.
+
+The crate is not on crates.io yet, so a git dependency is the only way to consume
+it. To track work that has landed on `main` but is not yet tagged, pin a commit
+instead — never a branch:
+
+```toml
+ferrox-providers = { git = "https://github.com/shaharia-lab/ferrox", rev = "<commit-sha>", … }
+```
 
 ```rust
 use ferrox_providers::config::{DefaultsConfig, ProviderConfig, ProviderType};
