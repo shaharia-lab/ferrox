@@ -890,4 +890,92 @@ mod tests {
             AnthropicImageSource::Url { .. }
         ));
     }
+
+    // ── Image parts, inbound JSON → outbound Anthropic body (#158) ───────────
+
+    fn anthropic_body_from_openai_json(json: &str) -> Value {
+        let req: ChatCompletionRequest = serde_json::from_str(json).unwrap();
+        serde_json::to_value(build_request_body(
+            &req,
+            "glm-4.6",
+            false,
+            &extract_anthropic_extras(&req),
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn image_part_survives_into_the_anthropic_body() {
+        let body = anthropic_body_from_openai_json(
+            r#"{"model":"m","max_tokens":10,"messages":[{"role":"user","content":[
+                {"type":"text","text":"What colour is this?"},
+                {"type":"image_url","image_url":{"url":"data:image/jpeg;base64,AAAA"}}
+            ]}]}"#,
+        );
+        assert_eq!(
+            body["messages"][0]["content"][1],
+            serde_json::json!({
+                "type": "image",
+                "source": {"type": "base64", "media_type": "image/jpeg", "data": "AAAA"}
+            })
+        );
+    }
+
+    #[test]
+    fn url_image_part_becomes_url_source_in_the_anthropic_body() {
+        let body = anthropic_body_from_openai_json(
+            r#"{"model":"m","max_tokens":10,"messages":[{"role":"user","content":[
+                {"type":"text","text":"What is this?"},
+                {"type":"image_url","image_url":{"url":"https://example.com/a.png"}}
+            ]}]}"#,
+        );
+        assert_eq!(
+            body["messages"][0]["content"][1],
+            serde_json::json!({
+                "type": "image",
+                "source": {"type": "url", "url": "https://example.com/a.png"}
+            })
+        );
+    }
+
+    /// `/anthropic/v1/messages` bodies with a base64 and a URL image block, as
+    /// the handler parses them: typed for translation, raw for pass-through.
+    fn anthropic_native_image_request() -> (ChatCompletionRequest, Value) {
+        let json = r#"{"model":"m","max_tokens":10,"messages":[{"role":"user","content":[
+            {"type":"text","text":"Compare these."},
+            {"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAA"}},
+            {"type":"image","source":{"type":"url","url":"https://example.com/a.png"}}
+        ]}]}"#;
+        let raw: Value = serde_json::from_str(json).unwrap();
+        let typed: crate::anthropic_types::AnthropicMessagesRequest =
+            serde_json::from_str(json).unwrap();
+        (
+            crate::anthropic_types::to_chat_completion_request(typed),
+            raw,
+        )
+    }
+
+    #[test]
+    fn anthropic_native_image_block_is_forwarded_verbatim() {
+        let (mut req, raw) = anthropic_native_image_request();
+        req.raw_anthropic_body = Some(raw.clone());
+
+        let body = prepare_body(&req, "glm-4.6", false, &extract_anthropic_extras(&req));
+        assert_eq!(body["messages"], raw["messages"]);
+    }
+
+    #[test]
+    fn anthropic_native_image_block_survives_a_field_by_field_rebuild() {
+        let (req, raw) = anthropic_native_image_request();
+        assert!(req.raw_anthropic_body.is_none());
+
+        let body = prepare_body(&req, "glm-4.6", false, &extract_anthropic_extras(&req));
+        let content = &body["messages"][0]["content"];
+        for i in [1, 2] {
+            assert_eq!(
+                content[i], raw["messages"][0]["content"][i],
+                "image block {i} must rebuild byte-identically"
+            );
+        }
+    }
 }

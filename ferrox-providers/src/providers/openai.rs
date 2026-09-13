@@ -438,6 +438,80 @@ mod tests {
         );
     }
 
+    // ── Image parts, inbound JSON → outbound OpenAI body (#158) ──────────────
+
+    fn openai_body_from_json(json: &str) -> Value {
+        let req: ChatCompletionRequest = serde_json::from_str(json).unwrap();
+        serde_json::to_value(build_request_body(&req, "glm-4.5v", false)).unwrap()
+    }
+
+    #[test]
+    fn image_part_survives_into_the_openai_body() {
+        let body = openai_body_from_json(
+            r#"{"model":"m","max_tokens":10,"messages":[{"role":"user","content":[
+                {"type":"text","text":"What colour is this?"},
+                {"type":"image_url","image_url":{"url":"data:image/jpeg;base64,AAAA"}}
+            ]}]}"#,
+        );
+        let part = &body["messages"][0]["content"][1];
+        assert_eq!(part["type"], "image_url");
+        assert_eq!(part["image_url"]["url"], "data:image/jpeg;base64,AAAA");
+        assert!(
+            part["image_url"].get("detail").is_none(),
+            "unset detail must be omitted, not sent as null: {part}"
+        );
+    }
+
+    #[test]
+    fn url_image_part_survives_into_the_openai_body() {
+        let body = openai_body_from_json(
+            r#"{"model":"m","messages":[{"role":"user","content":[
+                {"type":"text","text":"What is this?"},
+                {"type":"image_url","image_url":{"url":"https://example.com/a.png"}}
+            ]}]}"#,
+        );
+        assert_eq!(
+            body["messages"][0]["content"][1]["image_url"],
+            serde_json::json!({"url": "https://example.com/a.png"})
+        );
+    }
+
+    #[test]
+    fn client_supplied_image_detail_round_trips() {
+        let body = openai_body_from_json(
+            r#"{"model":"m","messages":[{"role":"user","content":[
+                {"type":"image_url","image_url":{"url":"https://example.com/a.png","detail":"high"}}
+            ]}]}"#,
+        );
+        assert_eq!(
+            body["messages"][0]["content"][0]["image_url"],
+            serde_json::json!({"url": "https://example.com/a.png", "detail": "high"})
+        );
+    }
+
+    /// `/anthropic/v1/messages` routed to a `type: openai` provider: the native
+    /// image block is rebuilt as an `image_url` part carrying a `data:` URL.
+    #[test]
+    fn anthropic_native_image_block_reaches_the_openai_body() {
+        let anthropic: crate::anthropic_types::AnthropicMessagesRequest = serde_json::from_str(
+            r#"{"model":"m","max_tokens":10,"messages":[{"role":"user","content":[
+                {"type":"text","text":"What colour is this?"},
+                {"type":"image","source":{"type":"base64","media_type":"image/jpeg","data":"AAAA"}}
+            ]}]}"#,
+        )
+        .unwrap();
+        let req = crate::anthropic_types::to_chat_completion_request(anthropic);
+
+        let body = serde_json::to_value(build_request_body(&req, "k3", false)).unwrap();
+        assert_eq!(
+            body["messages"][0]["content"][1],
+            serde_json::json!({
+                "type": "image_url",
+                "image_url": {"url": "data:image/jpeg;base64,AAAA"}
+            })
+        );
+    }
+
     fn defaults() -> DefaultsConfig {
         DefaultsConfig::default()
     }
