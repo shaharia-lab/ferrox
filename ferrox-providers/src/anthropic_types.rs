@@ -1670,6 +1670,26 @@ mod tests {
     }
 
     #[test]
+    fn url_image_block_is_preserved_as_image_url_part() {
+        let json = r#"{"model":"m","max_tokens":10,"messages":[{"role":"user","content":[
+            {"type":"text","text":"what is this?"},
+            {"type":"image","source":{"type":"url","url":"https://example.com/a.png"}}
+        ]}]}"#;
+        let req: AnthropicMessagesRequest = serde_json::from_str(json).unwrap();
+        let internal = to_chat_completion_request(req);
+        match internal.messages[0].content.as_ref().unwrap() {
+            MessageContent::Parts(parts) => match &parts[1] {
+                ContentPart::ImageUrl { image_url, .. } => {
+                    assert_eq!(image_url.url, "https://example.com/a.png");
+                    assert!(image_url.detail.is_none());
+                }
+                other => panic!("expected an image_url part, got {other:?}"),
+            },
+            other => panic!("expected multimodal Parts, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn url_image_source_passes_through() {
         let src = serde_json::json!({"type":"url","url":"https://x/i.png"});
         assert_eq!(

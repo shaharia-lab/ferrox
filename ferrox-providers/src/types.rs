@@ -135,6 +135,9 @@ pub const ANTHROPIC_SYSTEM_CACHE_CONTROL: &str = "_anthropic_system_cache_contro
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImageUrl {
     pub url: String,
+    /// Omitted from the wire when unset: strict OpenAI-compatible upstreams
+    /// reject an explicit `"detail": null` with a 400.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
 }
 
