@@ -957,10 +957,17 @@ mod tests {
 
     #[test]
     fn anthropic_native_image_block_is_forwarded_verbatim() {
-        let (mut req, raw) = anthropic_native_image_request();
+        let (mut req, mut raw) = anthropic_native_image_request();
+        // A field the rebuild does not model, so this can only pass through the
+        // verbatim branch — a rebuild would produce identical image blocks.
+        raw["service_tier"] = serde_json::json!("auto");
         req.raw_anthropic_body = Some(raw.clone());
 
         let body = prepare_body(&req, "glm-4.6", false, &extract_anthropic_extras(&req));
+        assert_eq!(
+            body["service_tier"], "auto",
+            "verbatim branch must be taken"
+        );
         assert_eq!(body["messages"], raw["messages"]);
     }
 

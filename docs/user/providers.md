@@ -193,13 +193,15 @@ Available models: `GLM-5.1`, `GLM-5`, `GLM-4.7`, `GLM-4.5-air`.
 **Required env var:** `GLM_API_KEY`
 
 > **Vision on coding-plan endpoints.** Ferrox forwards image parts to every
-> provider type, but the GLM and Kimi **coding-plan** endpoints have been
-> observed not to serve vision. Z.AI's Anthropic-compatible
-> `https://api.z.ai/api/anthropic` accepts an image block from any model, never
-> decodes it, charges a flat ~150 prompt tokens regardless of image size, and
-> returns **HTTP 200 with an invented answer** — no error, nothing a gateway can
-> detect. The Kimi coding plan (`https://api.kimi.com/coding/v1`) has shown the
-> same text-only token count. Z.AI's OpenAI-compatible
+> provider type, but the GLM and Kimi **coding-plan** endpoints should not be
+> relied on for vision. Z.AI's Anthropic-compatible
+> `https://api.z.ai/api/anthropic` has been measured accepting an image block
+> from any model, never decoding it, charging a flat ~150 prompt tokens
+> regardless of image size, and returning **HTTP 200 with an invented answer** —
+> no error, nothing a gateway can detect. The Kimi coding plan
+> (`https://api.kimi.com/coding/v1`) could not be verified directly (it was
+> returning errors when tested); treat it as text-only until confirmed. Z.AI's
+> OpenAI-compatible
 > `https://api.z.ai/api/coding/paas/v4` did serve images to the vision model
 > `glm-4.5v`, and rejects image parts sent to non-vision models with an explicit
 > error. If an image request comes back with a confident but wrong answer, compare
