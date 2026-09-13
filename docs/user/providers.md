@@ -193,8 +193,8 @@ Available models: `GLM-5.1`, `GLM-5`, `GLM-4.7`, `GLM-4.5-air`.
 **Required env var:** `GLM_API_KEY`
 
 > **Vision on coding-plan endpoints.** Ferrox forwards image parts to every
-> provider type, but the GLM and Kimi **coding-plan** endpoints should not be
-> relied on for vision. Z.AI's Anthropic-compatible
+> provider type, but Z.AI's Anthropic-compatible coding-plan endpoint and the
+> Kimi coding plan should not be relied on for vision. Z.AI's Anthropic-compatible
 > `https://api.z.ai/api/anthropic` has been measured accepting an image block
 > from any model, never decoding it, charging a flat ~150 prompt tokens
 > regardless of image size, and returning **HTTP 200 with an invented answer** —

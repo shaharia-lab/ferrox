@@ -249,8 +249,8 @@ alone: HTTP 200, a flat ~150-token charge whatever the image size, and a fluent,
 description of a picture the model never saw. Kimi's `https://api.kimi.com/coding/v1` could not
 be verified directly (it was returning errors when tested); treat it as text-only until you have
 confirmed otherwise. Nothing in the response marks a dropped image, so Ferrox cannot warn about
-it. Check `usage.prompt_tokens` with and without the image — if it barely moves, the upstream
-dropped it. See [Providers](providers.md#zai-glm).
+it. Check `usage.input_tokens` (`usage.prompt_tokens` on `/v1/chat/completions`) with and without
+the image — if it barely moves, the upstream dropped it. See [Providers](providers.md#zai-glm).
 
 **404s on every route, or an unexpected HTML page**
 Something else owns the port. Confirm with `ss -ltnp | grep <port>` and check that
