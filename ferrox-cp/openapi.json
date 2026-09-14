@@ -1,0 +1,1590 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "Ferrox Control Plane API",
+    "description": "Control plane for the Ferrox LLM gateway: API client administration, usage and budgets, signing-key rotation and the audit log (admin key required), plus the public token exchange, JWKS and health endpoints.",
+    "license": {
+      "name": "MIT"
+    },
+    "version": "0.1.0"
+  },
+  "paths": {
+    "/.well-known/jwks.json": {
+      "get": {
+        "tags": [
+          "Auth"
+        ],
+        "summary": "`GET /.well-known/jwks.json`",
+        "description": "Returns all active RSA public keys in JWKS format (RFC 7517).\nNo authentication required — this endpoint is called by the gateway.\nResponse is cacheable for 5 minutes via `Cache-Control: max-age=300`.",
+        "operationId": "jwks_handler",
+        "responses": {
+          "200": {
+            "description": "Active RSA public keys (RFC 7517 JWKS), cacheable for 5 minutes",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JwksResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Keys could not be loaded; empty key set, not cacheable",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JwksResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/audit": {
+      "get": {
+        "tags": [
+          "Audit"
+        ],
+        "summary": "`GET /api/audit`",
+        "description": "Lists audit log entries with optional filters.\nQuery parameters: `client_id`, `event`, `since`, `limit`, `offset`.",
+        "operationId": "list_audit",
+        "parameters": [
+          {
+            "name": "client_id",
+            "in": "query",
+            "description": "Only entries for this client.",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "nullable": true
+            }
+          },
+          {
+            "name": "event",
+            "in": "query",
+            "description": "Only entries of this event type (e.g. `token_issued`).",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "nullable": true
+            }
+          },
+          {
+            "name": "since",
+            "in": "query",
+            "description": "Only entries created at or after this time.",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "date-time",
+              "nullable": true
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Page size; larger values are capped at 1000.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "default": 100
+            }
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "description": "Number of entries to skip.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "default": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Audit log entries, newest first",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/AuditEntry"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed query string",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid admin key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Database failure",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "admin_auth": []
+          }
+        ]
+      }
+    },
+    "/api/clients": {
+      "get": {
+        "tags": [
+          "Clients"
+        ],
+        "summary": "`GET /api/clients`",
+        "operationId": "list_clients",
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Page size; larger values are capped at 1000.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "default": 50
+            }
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "description": "Number of records to skip.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "default": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Clients, newest first",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/ClientResponse"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed query string",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid admin key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Database failure",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "admin_auth": []
+          }
+        ]
+      },
+      "post": {
+        "tags": [
+          "Clients"
+        ],
+        "summary": "`POST /api/clients`",
+        "description": "Creates a new API client.  Generates an `sk-cp-` prefixed key, hashes it\nwith bcrypt, stores the hash, and returns the plaintext key once in the\nresponse body.",
+        "operationId": "create_client",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateClientRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Client created; `api_key` is returned only in this response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CreateClientResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed JSON body",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid admin key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A client with this name already exists",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "Missing or non-JSON `Content-Type`",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Request failed validation (JSON), or the body is missing a field or has a wrong type (plain text)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              },
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Database or key-hashing failure",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "admin_auth": []
+          }
+        ]
+      }
+    },
+    "/api/clients/{id}": {
+      "get": {
+        "tags": [
+          "Clients"
+        ],
+        "summary": "`GET /api/clients/:id`",
+        "operationId": "get_client",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Client id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The client",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClientResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed client id",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid admin key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Client not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Database failure",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "admin_auth": []
+          }
+        ]
+      },
+      "delete": {
+        "tags": [
+          "Clients"
+        ],
+        "summary": "`DELETE /api/clients/:id`",
+        "operationId": "revoke_client",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Client id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Client revoked"
+          },
+          "400": {
+            "description": "Malformed client id",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid admin key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Client not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Database failure",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "admin_auth": []
+          }
+        ]
+      }
+    },
+    "/api/clients/{id}/budget": {
+      "patch": {
+        "tags": [
+          "Clients"
+        ],
+        "summary": "`PATCH /api/clients/:id/budget`",
+        "description": "Update token budget settings for a client.",
+        "operationId": "update_client_budget",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Client id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateBudgetRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The updated client",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClientResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed client id or JSON body",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid admin key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Client not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "Missing or non-JSON `Content-Type`",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Request failed validation (JSON), or the body has a wrong type (plain text)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              },
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Database failure",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "admin_auth": []
+          }
+        ]
+      }
+    },
+    "/api/clients/{id}/reactivate": {
+      "post": {
+        "tags": [
+          "Clients"
+        ],
+        "summary": "`POST /api/clients/:id/reactivate`",
+        "description": "Re-activate a revoked client and reset its budget period.",
+        "operationId": "reactivate_client",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Client id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Client reactivated"
+          },
+          "400": {
+            "description": "Malformed client id",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid admin key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Client not found or already active",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Database failure",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "admin_auth": []
+          }
+        ]
+      }
+    },
+    "/api/clients/{id}/usage": {
+      "get": {
+        "tags": [
+          "Clients"
+        ],
+        "summary": "`GET /api/clients/:id/usage`",
+        "description": "Returns aggregated token usage from `usage_log` for the last 24h, 7d, and 30d.",
+        "operationId": "client_usage",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Client id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Token usage over the last 24h, 7d and 30d",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UsageResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed client id",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid admin key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Client not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Database failure",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "admin_auth": []
+          }
+        ]
+      }
+    },
+    "/api/clients/{id}/usage/details": {
+      "get": {
+        "tags": [
+          "Clients"
+        ],
+        "summary": "`GET /api/clients/:id/usage/details`",
+        "description": "Returns paginated per-request usage records from `usage_log`.",
+        "operationId": "client_usage_details",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Client id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "from",
+            "in": "query",
+            "description": "Only records with `created_at >= from`.",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "date-time",
+              "nullable": true
+            }
+          },
+          {
+            "name": "to",
+            "in": "query",
+            "description": "Only records with `created_at < to`.",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "date-time",
+              "nullable": true
+            }
+          },
+          {
+            "name": "model",
+            "in": "query",
+            "description": "Only records for this model alias.",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "nullable": true
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Page size; larger values are capped at 1000.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "default": 50
+            }
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "description": "Number of records to skip.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "default": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Per-request usage records",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/UsageDetailRecord"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed client id or query string",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid admin key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Client not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Database failure",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "admin_auth": []
+          }
+        ]
+      }
+    },
+    "/api/signing-keys": {
+      "get": {
+        "tags": [
+          "Signing keys"
+        ],
+        "summary": "`GET /api/signing-keys`",
+        "description": "Lists all signing keys (active and retired).  Private key material is never\nincluded in the response.",
+        "operationId": "list_signing_keys",
+        "responses": {
+          "200": {
+            "description": "All signing keys, active and retired",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/SigningKeyResponse"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid admin key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Database failure",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "admin_auth": []
+          }
+        ]
+      }
+    },
+    "/api/signing-keys/rotate": {
+      "post": {
+        "tags": [
+          "Signing keys"
+        ],
+        "summary": "`POST /api/signing-keys/rotate`",
+        "description": "Generates a new RSA-2048 keypair and schedules the current active key(s)\nfor retirement after a grace period equal to the longest client token TTL.\nBoth keys remain in the JWKS during the overlap window so in-flight tokens\nstay verifiable.",
+        "operationId": "rotate_keys",
+        "responses": {
+          "201": {
+            "description": "The newly generated signing key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SigningKeyResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid admin key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Key generation, configuration or database failure",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "admin_auth": []
+          }
+        ]
+      }
+    },
+    "/healthz": {
+      "get": {
+        "tags": [
+          "Observability"
+        ],
+        "summary": "`GET /healthz` — liveness + DB connectivity probe.",
+        "description": "Returns `200 {\"status\":\"ok\"}` when the database is reachable.\nReturns `503 {\"status\":\"unavailable\"}` if the `SELECT 1` fails.",
+        "operationId": "health_handler",
+        "responses": {
+          "200": {
+            "description": "Process is alive and the database is reachable",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HealthResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Database unreachable",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HealthResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/token": {
+      "post": {
+        "tags": [
+          "Auth"
+        ],
+        "summary": "`POST /token`",
+        "description": "Exchanges a static client API key for a short-lived JWT.\n\nThe request must carry `Authorization: Bearer sk-cp-<key>`.\nThe key is verified with bcrypt against the stored hash; on success a\nsigned JWT is returned and an audit log entry is written.",
+        "operationId": "token_handler",
+        "responses": {
+          "200": {
+            "description": "Short-lived JWT for the gateway",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TokenResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing, malformed, invalid or revoked client API key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal failure",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "No active signing key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "client_key_auth": []
+          }
+        ]
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "ApiError": {
+        "type": "object",
+        "description": "The control plane's error envelope: `{\"error\": ..., \"message\": ...}`.\n\nSchema-only: admin handlers and the admin-key middleware build it as a JSON\nvalue, and `POST /token` uses `crate::handlers::token::ErrorResponse`; all of\nthem serialize to this shape.",
+        "required": [
+          "error",
+          "message"
+        ],
+        "properties": {
+          "error": {
+            "type": "string",
+            "description": "Short error code: an HTTP status code (e.g. `\"404\"`, most admin handler\nerrors) or a category (e.g. `unauthorized`, `internal_error`).",
+            "example": "404"
+          },
+          "message": {
+            "type": "string",
+            "description": "Human-readable error message.",
+            "example": "client not found"
+          }
+        }
+      },
+      "AuditEntry": {
+        "type": "object",
+        "description": "A single entry in the immutable audit log.",
+        "required": [
+          "id",
+          "event",
+          "created_at"
+        ],
+        "properties": {
+          "client_id": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": true
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "event": {
+            "type": "string",
+            "description": "Event type: `token_issued`, `client_created`, `client_revoked`,\n`key_rotated`, `budget_exceeded`, or any other recorded string.",
+            "example": "token_issued"
+          },
+          "id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "metadata": {
+            "type": "object",
+            "description": "Free-form, event-specific JSON details.",
+            "nullable": true
+          }
+        }
+      },
+      "ClientResponse": {
+        "type": "object",
+        "description": "Safe client representation (no key material).",
+        "required": [
+          "id",
+          "name",
+          "allowed_models",
+          "rpm",
+          "burst",
+          "token_ttl_seconds",
+          "active",
+          "created_at"
+        ],
+        "properties": {
+          "active": {
+            "type": "boolean"
+          },
+          "allowed_models": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "budget_period": {
+            "type": "string",
+            "nullable": true,
+            "pattern": "^(daily|monthly)$"
+          },
+          "budget_reset_at": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
+          },
+          "burst": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "description": {
+            "type": "string",
+            "nullable": true
+          },
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "name": {
+            "type": "string"
+          },
+          "revoked_at": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
+          },
+          "rpm": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "token_budget": {
+            "type": "integer",
+            "format": "int64",
+            "nullable": true
+          },
+          "token_ttl_seconds": {
+            "type": "integer",
+            "format": "int32"
+          }
+        }
+      },
+      "CreateClientRequest": {
+        "type": "object",
+        "required": [
+          "name",
+          "allowed_models",
+          "rpm",
+          "burst",
+          "token_ttl_seconds"
+        ],
+        "properties": {
+          "allowed_models": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Model aliases this client may call; `[\"*\"]` means all.",
+            "minItems": 1
+          },
+          "budget_period": {
+            "type": "string",
+            "description": "Set together with `token_budget`.",
+            "nullable": true,
+            "pattern": "^(daily|monthly)$"
+          },
+          "burst": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 1
+          },
+          "description": {
+            "type": "string",
+            "nullable": true
+          },
+          "name": {
+            "type": "string",
+            "description": "Unique client name; must not be blank.",
+            "minLength": 1
+          },
+          "rpm": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 1
+          },
+          "token_budget": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Tokens allowed per budget period; set together with `budget_period`.",
+            "nullable": true,
+            "minimum": 1
+          },
+          "token_ttl_seconds": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 1
+          }
+        }
+      },
+      "CreateClientResponse": {
+        "type": "object",
+        "description": "Response for `POST /api/clients`.  Includes `api_key` which is shown **once**.",
+        "required": [
+          "id",
+          "name",
+          "api_key",
+          "allowed_models",
+          "rpm",
+          "burst",
+          "token_ttl_seconds",
+          "active",
+          "created_at"
+        ],
+        "properties": {
+          "active": {
+            "type": "boolean"
+          },
+          "allowed_models": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "api_key": {
+            "type": "string",
+            "description": "Plaintext API key — shown exactly once on creation."
+          },
+          "budget_period": {
+            "type": "string",
+            "nullable": true,
+            "pattern": "^(daily|monthly)$"
+          },
+          "burst": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "description": {
+            "type": "string",
+            "nullable": true
+          },
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "name": {
+            "type": "string"
+          },
+          "rpm": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "token_budget": {
+            "type": "integer",
+            "format": "int64",
+            "nullable": true
+          },
+          "token_ttl_seconds": {
+            "type": "integer",
+            "format": "int32"
+          }
+        }
+      },
+      "HealthResponse": {
+        "type": "object",
+        "required": [
+          "status"
+        ],
+        "properties": {
+          "status": {
+            "type": "string",
+            "description": "`ok` or `unavailable`.",
+            "example": "ok"
+          }
+        }
+      },
+      "Jwk": {
+        "type": "object",
+        "description": "A single JWK entry as defined by RFC 7517 for an RSA signing key.",
+        "required": [
+          "kty",
+          "use",
+          "alg",
+          "kid",
+          "n",
+          "e"
+        ],
+        "properties": {
+          "alg": {
+            "type": "string"
+          },
+          "e": {
+            "type": "string",
+            "description": "Base64url-encoded public exponent."
+          },
+          "kid": {
+            "type": "string"
+          },
+          "kty": {
+            "type": "string"
+          },
+          "n": {
+            "type": "string",
+            "description": "Base64url-encoded modulus."
+          },
+          "use": {
+            "type": "string"
+          }
+        }
+      },
+      "JwksResponse": {
+        "type": "object",
+        "required": [
+          "keys"
+        ],
+        "properties": {
+          "keys": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Jwk"
+            }
+          }
+        }
+      },
+      "SigningKeyResponse": {
+        "type": "object",
+        "description": "Public metadata for a signing key — no key material.",
+        "required": [
+          "kid",
+          "algorithm",
+          "active",
+          "created_at"
+        ],
+        "properties": {
+          "active": {
+            "type": "boolean"
+          },
+          "algorithm": {
+            "type": "string"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "kid": {
+            "type": "string"
+          },
+          "retired_at": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
+          }
+        }
+      },
+      "TokenResponse": {
+        "type": "object",
+        "required": [
+          "access_token",
+          "token_type",
+          "expires_in"
+        ],
+        "properties": {
+          "access_token": {
+            "type": "string",
+            "description": "Signed RS256 JWT, verifiable against `/.well-known/jwks.json`."
+          },
+          "expires_in": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Seconds until the token expires."
+          },
+          "token_type": {
+            "type": "string",
+            "example": "Bearer"
+          }
+        }
+      },
+      "UpdateBudgetRequest": {
+        "type": "object",
+        "description": "Both fields set together, or both `null` to remove the budget.",
+        "properties": {
+          "budget_period": {
+            "type": "string",
+            "description": "Set together with `token_budget`.",
+            "nullable": true,
+            "pattern": "^(daily|monthly)$"
+          },
+          "token_budget": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Tokens allowed per budget period; set together with `budget_period`.",
+            "nullable": true,
+            "minimum": 1
+          }
+        }
+      },
+      "UsageDetailRecord": {
+        "type": "object",
+        "required": [
+          "request_id",
+          "model",
+          "provider",
+          "prompt_tokens",
+          "completion_tokens",
+          "total_tokens",
+          "created_at"
+        ],
+        "properties": {
+          "completion_tokens": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "latency_ms": {
+            "type": "integer",
+            "format": "int32",
+            "nullable": true
+          },
+          "model": {
+            "type": "string"
+          },
+          "prompt_tokens": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "provider": {
+            "type": "string"
+          },
+          "request_id": {
+            "type": "string"
+          },
+          "total_tokens": {
+            "type": "integer",
+            "format": "int32"
+          }
+        }
+      },
+      "UsageResponse": {
+        "type": "object",
+        "required": [
+          "last_24h",
+          "last_7d",
+          "last_30d"
+        ],
+        "properties": {
+          "last_24h": {
+            "$ref": "#/components/schemas/UsageSummary"
+          },
+          "last_30d": {
+            "$ref": "#/components/schemas/UsageSummary"
+          },
+          "last_7d": {
+            "$ref": "#/components/schemas/UsageSummary"
+          }
+        }
+      },
+      "UsageSummary": {
+        "type": "object",
+        "description": "Aggregated token usage for a client over a time period.",
+        "required": [
+          "total_prompt_tokens",
+          "total_completion_tokens",
+          "total_tokens",
+          "request_count"
+        ],
+        "properties": {
+          "request_count": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "total_completion_tokens": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "total_prompt_tokens": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "total_tokens": {
+            "type": "integer",
+            "format": "int64"
+          }
+        }
+      }
+    },
+    "securitySchemes": {
+      "admin_auth": {
+        "type": "http",
+        "scheme": "bearer",
+        "description": "The static admin key configured as `CP_ADMIN_KEY`."
+      },
+      "client_key_auth": {
+        "type": "http",
+        "scheme": "bearer",
+        "description": "A client API key (`sk-cp-...`) as returned by `POST /api/clients`."
+      }
+    }
+  },
+  "tags": [
+    {
+      "name": "Clients",
+      "description": "API client CRUD, usage and budgets (admin key)"
+    },
+    {
+      "name": "Signing keys",
+      "description": "JWT signing-key listing and rotation (admin key)"
+    },
+    {
+      "name": "Audit",
+      "description": "Immutable audit log (admin key)"
+    },
+    {
+      "name": "Auth",
+      "description": "Token exchange and JWKS for the gateway"
+    },
+    {
+      "name": "Observability",
+      "description": "Health (public, unauthenticated)"
+    }
+  ]
+}

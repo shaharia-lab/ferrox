@@ -3,6 +3,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
 use serde::Serialize;
 use tracing::{error, info, warn};
+use utoipa::ToSchema;
 
 use crate::crypto::encrypt::decrypt_private_key;
 use crate::crypto::jwt::JwtSigner;
@@ -23,10 +24,13 @@ const API_KEY_PREFIX: &str = "sk-cp-";
 /// This is the hash of the string "dummy" with cost 12.
 const DUMMY_HASH: &str = "$2b$12$Ei1YpGUfDLEH.8ZhFDcKMucYanSmS6.v.roB0DEjxFKnKhMBVFjFC";
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct TokenResponse {
+    /// Signed RS256 JWT, verifiable against `/.well-known/jwks.json`.
     pub access_token: String,
+    #[schema(example = "Bearer")]
     pub token_type: &'static str,
+    /// Seconds until the token expires.
     pub expires_in: i64,
 }
 
@@ -43,6 +47,18 @@ pub struct ErrorResponse {
 /// The request must carry `Authorization: Bearer sk-cp-<key>`.
 /// The key is verified with bcrypt against the stored hash; on success a
 /// signed JWT is returned and an audit log entry is written.
+#[utoipa::path(
+    post,
+    path = "/token",
+    tag = "Auth",
+    security(("client_key_auth" = [])),
+    responses(
+        (status = 200, description = "Short-lived JWT for the gateway", body = TokenResponse),
+        (status = 401, description = "Missing, malformed, invalid or revoked client API key", body = ApiError),
+        (status = 500, description = "Internal failure", body = ApiError),
+        (status = 503, description = "No active signing key", body = ApiError),
+    )
+)]
 pub async fn token_handler(
     State(state): State<CpState>,
     headers: HeaderMap,

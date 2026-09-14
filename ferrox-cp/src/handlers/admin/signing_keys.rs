@@ -4,6 +4,7 @@ use axum::Json;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use tracing::{error, info};
+use utoipa::ToSchema;
 
 use crate::crypto::encrypt::encrypt_private_key;
 use crate::crypto::keys::generate_keypair;
@@ -15,7 +16,7 @@ use crate::state::CpState;
 // ── Response types ────────────────────────────────────────────────────────────
 
 /// Public metadata for a signing key — no key material.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct SigningKeyResponse {
     pub kid: String,
     pub algorithm: String,
@@ -30,6 +31,17 @@ pub struct SigningKeyResponse {
 ///
 /// Lists all signing keys (active and retired).  Private key material is never
 /// included in the response.
+#[utoipa::path(
+    get,
+    path = "/api/signing-keys",
+    tag = "Signing keys",
+    security(("admin_auth" = [])),
+    responses(
+        (status = 200, description = "All signing keys, active and retired", body = Vec<SigningKeyResponse>),
+        (status = 401, description = "Missing or invalid admin key", body = ApiError),
+        (status = 500, description = "Database failure", body = ApiError),
+    )
+)]
 pub async fn list_signing_keys(
     State(state): State<CpState>,
 ) -> Result<Json<Vec<SigningKeyResponse>>, (StatusCode, Json<serde_json::Value>)> {
@@ -48,6 +60,17 @@ pub async fn list_signing_keys(
 /// for retirement after a grace period equal to the longest client token TTL.
 /// Both keys remain in the JWKS during the overlap window so in-flight tokens
 /// stay verifiable.
+#[utoipa::path(
+    post,
+    path = "/api/signing-keys/rotate",
+    tag = "Signing keys",
+    security(("admin_auth" = [])),
+    responses(
+        (status = 201, description = "The newly generated signing key", body = SigningKeyResponse),
+        (status = 401, description = "Missing or invalid admin key", body = ApiError),
+        (status = 500, description = "Key generation, configuration or database failure", body = ApiError),
+    )
+)]
 pub async fn rotate_keys(
     State(state): State<CpState>,
 ) -> Result<(StatusCode, Json<SigningKeyResponse>), (StatusCode, Json<serde_json::Value>)> {

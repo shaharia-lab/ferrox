@@ -1,6 +1,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
+use utoipa::ToSchema;
 use uuid::Uuid;
 
 /// A single per-request token usage record reported by the gateway.
@@ -23,7 +24,7 @@ pub struct UsageRecord {
 }
 
 /// Aggregated token usage for a client over a time period.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct UsageSummary {
     pub total_prompt_tokens: i64,
     pub total_completion_tokens: i64,
@@ -75,11 +76,16 @@ pub struct SigningKey {
 }
 
 /// A single entry in the immutable audit log.
-#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow, ToSchema)]
 pub struct AuditEntry {
     pub id: i64,
     pub client_id: Option<Uuid>,
+    /// Event type: `token_issued`, `client_created`, `client_revoked`,
+    /// `key_rotated`, `budget_exceeded`, or any other recorded string.
+    #[schema(value_type = String, example = "token_issued")]
     pub event: AuditEvent,
+    /// Free-form, event-specific JSON details.
+    #[schema(value_type = Option<Object>)]
     pub metadata: Option<JsonValue>,
     pub created_at: DateTime<Utc>,
 }

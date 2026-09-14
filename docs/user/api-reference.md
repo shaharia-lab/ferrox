@@ -469,6 +469,16 @@ const response = await client.chat.completions.create({
 
 The control plane runs on port 9090 and manages clients, signing keys, and usage data. All admin endpoints require `Authorization: Bearer <CP_ADMIN_KEY>`.
 
+### GET /api-schema · GET /openapi.json
+
+OpenAPI 3.x document describing the control plane's full REST API — every `/api/*` admin route plus `POST /token`, `GET /.well-known/jwks.json` and `GET /healthz` — with request/response schemas and per-route auth (`admin_auth` for `CP_ADMIN_KEY`, `client_key_auth` for the `sk-cp-` client key on `/token`). Content type `application/json`; both paths serve the same document.
+
+No authentication required.
+
+```bash
+curl http://localhost:9090/openapi.json | jq .
+```
+
 ### GET /api/clients/:id/usage
 
 Returns aggregated token usage for a client over the last 24h, 7d, and 30d.
