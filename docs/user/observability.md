@@ -41,6 +41,10 @@ every completed request — streaming and non-streaming, on `request_completed`
 (`/v1/chat/completions`) and `anthropic_request_completed`
 (`/anthropic/v1/messages`) alike.
 
+The same two counters, with the same omit-when-zero rule, are included in the
+`token_usage` webhook payload — see
+[event_endpoints](configuration.md#event-payload).
+
 ---
 
 ## Prometheus metrics
