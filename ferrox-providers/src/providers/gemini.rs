@@ -673,7 +673,9 @@ fn gemini_usage(u: &GeminiUsageMetadata) -> Usage {
     Usage {
         prompt_tokens: u.prompt_token_count.saturating_sub(cached),
         completion_tokens: u.candidates_token_count.unwrap_or(0),
-        total_tokens: u.total_token_count,
+        // Subtracted rather than recomputed: Gemini's total also counts
+        // thinking/tool-use tokens that `candidatesTokenCount` leaves out.
+        total_tokens: u.total_token_count.saturating_sub(cached),
         extra: crate::types::cache_usage_extra(None, u.cached_content_token_count),
     }
 }
@@ -985,7 +987,7 @@ mod tests {
         // 4000 total prompt tokens, 3968 of them cached → 32 non-cached.
         assert_eq!(usage.prompt_tokens, 32);
         assert_eq!(usage.completion_tokens, 2);
-        assert_eq!(usage.total_tokens, 4002);
+        assert_eq!(usage.total_tokens, 34);
         // Same key shape as the Anthropic and Bedrock adapters (#125/#126).
         assert_eq!(usage.extra["prompt_tokens_details"]["cached_tokens"], 3968);
         assert_eq!(usage.extra["cache_read_input_tokens"], 3968);
