@@ -29,15 +29,6 @@ pub struct ApiError {
     pub message: String,
 }
 
-/// Token budget period. Schema-only: the handlers carry it as a `String` and
-/// reject anything else with `422`.
-#[derive(Serialize, ToSchema)]
-#[serde(rename_all = "lowercase")]
-pub enum BudgetPeriod {
-    Daily,
-    Monthly,
-}
-
 /// Adds the two authentication schemes the control plane accepts to the spec's
 /// components so annotated routes can reference them.
 struct SecurityAddon;
@@ -99,7 +90,6 @@ impl Modify for SecurityAddon {
     ),
     components(schemas(
         ApiError,
-        BudgetPeriod,
         crate::handlers::admin::clients::CreateClientRequest,
         crate::handlers::admin::clients::CreateClientResponse,
         crate::handlers::admin::clients::ClientResponse,
@@ -256,6 +246,41 @@ mod tests {
         let sec = &v["components"]["securitySchemes"];
         assert!(sec["admin_auth"].is_object());
         assert!(sec["client_key_auth"].is_object());
+    }
+
+    #[test]
+    fn nullable_schemas_accept_null() {
+        // OpenAPI 3.0 ignores `nullable` unless `type` sits beside it, so a
+        // nullable schema without one (e.g. a nullable `allOf` ref) would reject
+        // the `null` the API really sends.
+        fn walk(node: &serde_json::Value, at: &str) {
+            match node {
+                serde_json::Value::Object(map) => {
+                    if map.get("nullable") == Some(&serde_json::Value::Bool(true)) {
+                        assert!(
+                            map.contains_key("type"),
+                            "nullable schema without `type` at {at}"
+                        );
+                    }
+                    for (k, v) in map {
+                        walk(v, &format!("{at}/{k}"));
+                    }
+                }
+                serde_json::Value::Array(arr) => {
+                    for (i, v) in arr.iter().enumerate() {
+                        walk(v, &format!("{at}/{i}"));
+                    }
+                }
+                _ => {}
+            }
+        }
+        let v = doc();
+        walk(&v, "#");
+        // `budget_period` is `null` for clients without a budget.
+        let period = &v["components"]["schemas"]["ClientResponse"]["properties"]["budget_period"];
+        assert_eq!(period["type"], "string");
+        assert_eq!(period["nullable"], true);
+        assert_eq!(period["pattern"], "^(daily|monthly)$");
     }
 
     #[test]

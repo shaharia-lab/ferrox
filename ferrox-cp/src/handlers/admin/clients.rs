@@ -38,7 +38,7 @@ pub struct CreateClientRequest {
     #[schema(minimum = 1)]
     pub token_budget: Option<i64>,
     /// Set together with `token_budget`.
-    #[schema(value_type = Option<BudgetPeriod>)]
+    #[schema(pattern = "^(daily|monthly)$")]
     pub budget_period: Option<String>,
 }
 
@@ -85,7 +85,7 @@ pub struct UpdateBudgetRequest {
     #[schema(minimum = 1)]
     pub token_budget: Option<i64>,
     /// Set together with `token_budget`.
-    #[schema(value_type = Option<BudgetPeriod>)]
+    #[schema(pattern = "^(daily|monthly)$")]
     pub budget_period: Option<String>,
 }
 
@@ -123,7 +123,7 @@ pub struct CreateClientResponse {
     pub active: bool,
     pub created_at: DateTime<Utc>,
     pub token_budget: Option<i64>,
-    #[schema(value_type = Option<BudgetPeriod>)]
+    #[schema(pattern = "^(daily|monthly)$")]
     pub budget_period: Option<String>,
 }
 
@@ -141,7 +141,7 @@ pub struct ClientResponse {
     pub created_at: DateTime<Utc>,
     pub revoked_at: Option<DateTime<Utc>>,
     pub token_budget: Option<i64>,
-    #[schema(value_type = Option<BudgetPeriod>)]
+    #[schema(pattern = "^(daily|monthly)$")]
     pub budget_period: Option<String>,
     pub budget_reset_at: Option<DateTime<Utc>>,
 }

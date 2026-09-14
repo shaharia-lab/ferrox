@@ -1131,14 +1131,6 @@
           }
         }
       },
-      "BudgetPeriod": {
-        "type": "string",
-        "description": "Token budget period. Schema-only: the handlers carry it as a `String` and\nreject anything else with `422`.",
-        "enum": [
-          "daily",
-          "monthly"
-        ]
-      },
       "ClientResponse": {
         "type": "object",
         "description": "Safe client representation (no key material).",
@@ -1163,12 +1155,9 @@
             }
           },
           "budget_period": {
-            "allOf": [
-              {
-                "$ref": "#/components/schemas/BudgetPeriod"
-              }
-            ],
-            "nullable": true
+            "type": "string",
+            "nullable": true,
+            "pattern": "^(daily|monthly)$"
           },
           "budget_reset_at": {
             "type": "string",
@@ -1233,12 +1222,10 @@
             "minItems": 1
           },
           "budget_period": {
-            "allOf": [
-              {
-                "$ref": "#/components/schemas/BudgetPeriod"
-              }
-            ],
-            "nullable": true
+            "type": "string",
+            "description": "Set together with `token_budget`.",
+            "nullable": true,
+            "pattern": "^(daily|monthly)$"
           },
           "burst": {
             "type": "integer",
@@ -1302,12 +1289,9 @@
             "description": "Plaintext API key — shown exactly once on creation."
           },
           "budget_period": {
-            "allOf": [
-              {
-                "$ref": "#/components/schemas/BudgetPeriod"
-              }
-            ],
-            "nullable": true
+            "type": "string",
+            "nullable": true,
+            "pattern": "^(daily|monthly)$"
           },
           "burst": {
             "type": "integer",
@@ -1462,12 +1446,10 @@
         "description": "Both fields set together, or both `null` to remove the budget.",
         "properties": {
           "budget_period": {
-            "allOf": [
-              {
-                "$ref": "#/components/schemas/BudgetPeriod"
-              }
-            ],
-            "nullable": true
+            "type": "string",
+            "description": "Set together with `token_budget`.",
+            "nullable": true,
+            "pattern": "^(daily|monthly)$"
           },
           "token_budget": {
             "type": "integer",
