@@ -21,13 +21,24 @@ const MAX_LIMIT: i64 = 1000;
 
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct CreateClientRequest {
+    /// Unique client name; must not be blank.
+    #[schema(min_length = 1)]
     pub name: String,
     pub description: Option<String>,
+    /// Model aliases this client may call; `["*"]` means all.
+    #[schema(min_items = 1)]
     pub allowed_models: Vec<String>,
+    #[schema(minimum = 1)]
     pub rpm: i32,
+    #[schema(minimum = 1)]
     pub burst: i32,
+    #[schema(minimum = 1)]
     pub token_ttl_seconds: i32,
+    /// Tokens allowed per budget period; set together with `budget_period`.
+    #[schema(minimum = 1)]
     pub token_budget: Option<i64>,
+    /// Set together with `token_budget`.
+    #[schema(value_type = Option<BudgetPeriod>)]
     pub budget_period: Option<String>,
 }
 
@@ -67,9 +78,14 @@ impl CreateClientRequest {
     }
 }
 
+/// Both fields set together, or both `null` to remove the budget.
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct UpdateBudgetRequest {
+    /// Tokens allowed per budget period; set together with `budget_period`.
+    #[schema(minimum = 1)]
     pub token_budget: Option<i64>,
+    /// Set together with `token_budget`.
+    #[schema(value_type = Option<BudgetPeriod>)]
     pub budget_period: Option<String>,
 }
 
@@ -107,6 +123,7 @@ pub struct CreateClientResponse {
     pub active: bool,
     pub created_at: DateTime<Utc>,
     pub token_budget: Option<i64>,
+    #[schema(value_type = Option<BudgetPeriod>)]
     pub budget_period: Option<String>,
 }
 
@@ -124,6 +141,7 @@ pub struct ClientResponse {
     pub created_at: DateTime<Utc>,
     pub revoked_at: Option<DateTime<Utc>>,
     pub token_budget: Option<i64>,
+    #[schema(value_type = Option<BudgetPeriod>)]
     pub budget_period: Option<String>,
     pub budget_reset_at: Option<DateTime<Utc>>,
 }
@@ -144,9 +162,9 @@ pub struct UsageDetailsParams {
     pub to: Option<DateTime<Utc>>,
     /// Only records for this model alias.
     pub model: Option<String>,
-    /// Page size (capped at 1000).
+    /// Page size; larger values are capped at 1000.
     #[serde(default = "default_limit")]
-    #[param(default = 50, maximum = 1000)]
+    #[param(default = 50)]
     pub limit: i64,
     /// Number of records to skip.
     #[serde(default)]
@@ -169,9 +187,9 @@ pub struct UsageDetailRecord {
 #[derive(Debug, Deserialize, IntoParams)]
 #[into_params(parameter_in = Query)]
 pub struct PaginationParams {
-    /// Page size (capped at 1000).
+    /// Page size; larger values are capped at 1000.
     #[serde(default = "default_limit")]
-    #[param(default = 50, maximum = 1000)]
+    #[param(default = 50)]
     pub limit: i64,
     /// Number of records to skip.
     #[serde(default)]
@@ -198,9 +216,11 @@ fn default_limit() -> i64 {
     request_body = CreateClientRequest,
     responses(
         (status = 201, description = "Client created; `api_key` is returned only in this response", body = CreateClientResponse),
+        (status = 400, description = "Malformed JSON body", body = String, content_type = "text/plain"),
         (status = 401, description = "Missing or invalid admin key", body = ApiError),
         (status = 409, description = "A client with this name already exists", body = ApiError),
-        (status = 422, description = "Request failed validation", body = ApiError),
+        (status = 415, description = "Missing or non-JSON `Content-Type`", body = String, content_type = "text/plain"),
+        (status = 422, description = "Request failed validation (JSON), or the body is missing a field or has a wrong type (plain text)", content(("application/json" = ApiError), ("text/plain" = String))),
         (status = 500, description = "Database or key-hashing failure", body = ApiError),
     )
 )]
@@ -300,6 +320,7 @@ pub async fn create_client(
     params(PaginationParams),
     responses(
         (status = 200, description = "Clients, newest first", body = Vec<ClientResponse>),
+        (status = 400, description = "Malformed query string", body = String, content_type = "text/plain"),
         (status = 401, description = "Missing or invalid admin key", body = ApiError),
         (status = 500, description = "Database failure", body = ApiError),
     )
@@ -327,6 +348,7 @@ pub async fn list_clients(
     params(("id" = Uuid, Path, description = "Client id")),
     responses(
         (status = 200, description = "The client", body = ClientResponse),
+        (status = 400, description = "Malformed client id", body = String, content_type = "text/plain"),
         (status = 401, description = "Missing or invalid admin key", body = ApiError),
         (status = 404, description = "Client not found", body = ApiError),
         (status = 500, description = "Database failure", body = ApiError),
@@ -357,6 +379,7 @@ pub async fn get_client(
     params(("id" = Uuid, Path, description = "Client id")),
     responses(
         (status = 204, description = "Client revoked"),
+        (status = 400, description = "Malformed client id", body = String, content_type = "text/plain"),
         (status = 401, description = "Missing or invalid admin key", body = ApiError),
         (status = 404, description = "Client not found", body = ApiError),
         (status = 500, description = "Database failure", body = ApiError),
@@ -400,6 +423,7 @@ pub async fn revoke_client(
     params(("id" = Uuid, Path, description = "Client id")),
     responses(
         (status = 200, description = "Token usage over the last 24h, 7d and 30d", body = UsageResponse),
+        (status = 400, description = "Malformed client id", body = String, content_type = "text/plain"),
         (status = 401, description = "Missing or invalid admin key", body = ApiError),
         (status = 404, description = "Client not found", body = ApiError),
         (status = 500, description = "Database failure", body = ApiError),
@@ -469,9 +493,11 @@ pub async fn client_usage(
     request_body = UpdateBudgetRequest,
     responses(
         (status = 200, description = "The updated client", body = ClientResponse),
+        (status = 400, description = "Malformed client id or JSON body", body = String, content_type = "text/plain"),
         (status = 401, description = "Missing or invalid admin key", body = ApiError),
         (status = 404, description = "Client not found", body = ApiError),
-        (status = 422, description = "Request failed validation", body = ApiError),
+        (status = 415, description = "Missing or non-JSON `Content-Type`", body = String, content_type = "text/plain"),
+        (status = 422, description = "Request failed validation (JSON), or the body has a wrong type (plain text)", content(("application/json" = ApiError), ("text/plain" = String))),
         (status = 500, description = "Database failure", body = ApiError),
     )
 )]
@@ -511,6 +537,7 @@ pub async fn update_client_budget(
     params(("id" = Uuid, Path, description = "Client id")),
     responses(
         (status = 204, description = "Client reactivated"),
+        (status = 400, description = "Malformed client id", body = String, content_type = "text/plain"),
         (status = 401, description = "Missing or invalid admin key", body = ApiError),
         (status = 404, description = "Client not found or already active", body = ApiError),
         (status = 500, description = "Database failure", body = ApiError),
@@ -545,6 +572,7 @@ pub async fn reactivate_client(
     params(("id" = Uuid, Path, description = "Client id"), UsageDetailsParams),
     responses(
         (status = 200, description = "Per-request usage records", body = Vec<UsageDetailRecord>),
+        (status = 400, description = "Malformed client id or query string", body = String, content_type = "text/plain"),
         (status = 401, description = "Missing or invalid admin key", body = ApiError),
         (status = 404, description = "Client not found", body = ApiError),
         (status = 500, description = "Database failure", body = ApiError),

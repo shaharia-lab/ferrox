@@ -226,15 +226,14 @@ mod tests {
     use super::*;
     use db::signing_key_repo::SigningKeyRepository;
 
-    #[tokio::test]
-    async fn schema_routes_serve_openapi_json_without_auth() {
-        use axum::body::Body;
-        use axum::http::{header, Request, StatusCode};
-        use tower::ServiceExt;
+    use axum::body::Body;
+    use axum::http::{header, Request, StatusCode};
+    use tower::ServiceExt;
 
-        // A lazy pool never connects, so the full router is testable without a
-        // database — the schema routes don't touch it.
-        let state = CpState {
+    /// The full router over a lazy pool that never connects — testable without
+    /// a database for routes that answer before touching it.
+    fn router_without_db() -> Router {
+        build_router(CpState {
             db: sqlx::PgPool::connect_lazy("postgres://unused@localhost/unused").unwrap(),
             config: Arc::new(CpConfig {
                 database_url: String::new(),
@@ -243,8 +242,61 @@ mod tests {
                 admin_key: "test-admin-key".to_string(),
                 port: 9090,
             }),
-        };
-        let app = build_router(state);
+        })
+    }
+
+    /// Ties the schema's per-route security to the real router: every operation
+    /// the document marks as secured must exist and reject an unauthenticated
+    /// request (an unknown path would fall through to the UI with a 200).
+    #[tokio::test]
+    async fn secured_schema_operations_reject_unauthenticated_requests() {
+        let app = router_without_db();
+        let doc: serde_json::Value = serde_json::from_str(openapi::openapi_json()).unwrap();
+        let mut checked = 0;
+        for (path, item) in doc["paths"].as_object().unwrap() {
+            for (method, op) in item.as_object().unwrap() {
+                if op["security"].is_null() {
+                    continue;
+                }
+                let uri = path.replace("{id}", &uuid::Uuid::new_v4().to_string());
+                let resp = app
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .method(method.to_uppercase().as_str())
+                            .uri(&uri)
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let status = resp.status();
+                let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    status,
+                    StatusCode::UNAUTHORIZED,
+                    "{} {path} must require auth",
+                    method.to_uppercase()
+                );
+                let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(
+                    v["error"],
+                    "unauthorized",
+                    "{} {path}",
+                    method.to_uppercase()
+                );
+                checked += 1;
+            }
+        }
+        // 11 admin operations + `POST /token`.
+        assert_eq!(checked, 12);
+    }
+
+    #[tokio::test]
+    async fn schema_routes_serve_openapi_json_without_auth() {
+        let app = router_without_db();
 
         for path in ["/api-schema", "/openapi.json"] {
             let resp = app

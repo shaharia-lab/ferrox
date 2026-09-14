@@ -1,4 +1,4 @@
-//! OpenAPI 3.1 schema for the control plane's REST API.
+//! OpenAPI 3.0 schema for the control plane's REST API.
 //!
 //! The document is built by `utoipa` from the `#[utoipa::path]` annotations on
 //! the handlers plus the `ToSchema`-deriving request/response types, and served
@@ -27,6 +27,15 @@ pub struct ApiError {
     /// Human-readable error message.
     #[schema(example = "client not found")]
     pub message: String,
+}
+
+/// Token budget period. Schema-only: the handlers carry it as a `String` and
+/// reject anything else with `422`.
+#[derive(Serialize, ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum BudgetPeriod {
+    Daily,
+    Monthly,
 }
 
 /// Adds the two authentication schemes the control plane accepts to the spec's
@@ -90,6 +99,7 @@ impl Modify for SecurityAddon {
     ),
     components(schemas(
         ApiError,
+        BudgetPeriod,
         crate::handlers::admin::clients::CreateClientRequest,
         crate::handlers::admin::clients::CreateClientResponse,
         crate::handlers::admin::clients::ClientResponse,

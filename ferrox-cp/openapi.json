@@ -85,13 +85,12 @@
           {
             "name": "limit",
             "in": "query",
-            "description": "Page size (capped at 1000).",
+            "description": "Page size; larger values are capped at 1000.",
             "required": false,
             "schema": {
               "type": "integer",
               "format": "int64",
-              "default": 100,
-              "maximum": 1000
+              "default": 100
             }
           },
           {
@@ -116,6 +115,16 @@
                   "items": {
                     "$ref": "#/components/schemas/AuditEntry"
                   }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed query string",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
                 }
               }
             }
@@ -159,13 +168,12 @@
           {
             "name": "limit",
             "in": "query",
-            "description": "Page size (capped at 1000).",
+            "description": "Page size; larger values are capped at 1000.",
             "required": false,
             "schema": {
               "type": "integer",
               "format": "int64",
-              "default": 50,
-              "maximum": 1000
+              "default": 50
             }
           },
           {
@@ -190,6 +198,16 @@
                   "items": {
                     "$ref": "#/components/schemas/ClientResponse"
                   }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed query string",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
                 }
               }
             }
@@ -249,6 +267,16 @@
               }
             }
           },
+          "400": {
+            "description": "Malformed JSON body",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
           "401": {
             "description": "Missing or invalid admin key",
             "content": {
@@ -269,12 +297,27 @@
               }
             }
           },
+          "415": {
+            "description": "Missing or non-JSON `Content-Type`",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
           "422": {
-            "description": "Request failed validation",
+            "description": "Request failed validation (JSON), or the body is missing a field or has a wrong type (plain text)",
             "content": {
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/ApiError"
+                }
+              },
+              "text/plain": {
+                "schema": {
+                  "type": "string"
                 }
               }
             }
@@ -323,6 +366,16 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/ClientResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed client id",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
                 }
               }
             }
@@ -385,6 +438,16 @@
         "responses": {
           "204": {
             "description": "Client revoked"
+          },
+          "400": {
+            "description": "Malformed client id",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "401": {
             "description": "Missing or invalid admin key",
@@ -465,6 +528,16 @@
               }
             }
           },
+          "400": {
+            "description": "Malformed client id or JSON body",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
           "401": {
             "description": "Missing or invalid admin key",
             "content": {
@@ -485,12 +558,27 @@
               }
             }
           },
+          "415": {
+            "description": "Missing or non-JSON `Content-Type`",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
           "422": {
-            "description": "Request failed validation",
+            "description": "Request failed validation (JSON), or the body has a wrong type (plain text)",
             "content": {
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/ApiError"
+                }
+              },
+              "text/plain": {
+                "schema": {
+                  "type": "string"
                 }
               }
             }
@@ -536,6 +624,16 @@
         "responses": {
           "204": {
             "description": "Client reactivated"
+          },
+          "400": {
+            "description": "Malformed client id",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "401": {
             "description": "Missing or invalid admin key",
@@ -602,6 +700,16 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/UsageResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed client id",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
                 }
               }
             }
@@ -698,13 +806,12 @@
           {
             "name": "limit",
             "in": "query",
-            "description": "Page size (capped at 1000).",
+            "description": "Page size; larger values are capped at 1000.",
             "required": false,
             "schema": {
               "type": "integer",
               "format": "int64",
-              "default": 50,
-              "maximum": 1000
+              "default": 50
             }
           },
           {
@@ -729,6 +836,16 @@
                   "items": {
                     "$ref": "#/components/schemas/UsageDetailRecord"
                   }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed client id or query string",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
                 }
               }
             }
@@ -1014,6 +1131,14 @@
           }
         }
       },
+      "BudgetPeriod": {
+        "type": "string",
+        "description": "Token budget period. Schema-only: the handlers carry it as a `String` and\nreject anything else with `422`.",
+        "enum": [
+          "daily",
+          "monthly"
+        ]
+      },
       "ClientResponse": {
         "type": "object",
         "description": "Safe client representation (no key material).",
@@ -1038,7 +1163,11 @@
             }
           },
           "budget_period": {
-            "type": "string",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/BudgetPeriod"
+              }
+            ],
             "nullable": true
           },
           "budget_reset_at": {
@@ -1099,35 +1228,48 @@
             "type": "array",
             "items": {
               "type": "string"
-            }
+            },
+            "description": "Model aliases this client may call; `[\"*\"]` means all.",
+            "minItems": 1
           },
           "budget_period": {
-            "type": "string",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/BudgetPeriod"
+              }
+            ],
             "nullable": true
           },
           "burst": {
             "type": "integer",
-            "format": "int32"
+            "format": "int32",
+            "minimum": 1
           },
           "description": {
             "type": "string",
             "nullable": true
           },
           "name": {
-            "type": "string"
+            "type": "string",
+            "description": "Unique client name; must not be blank.",
+            "minLength": 1
           },
           "rpm": {
             "type": "integer",
-            "format": "int32"
+            "format": "int32",
+            "minimum": 1
           },
           "token_budget": {
             "type": "integer",
             "format": "int64",
-            "nullable": true
+            "description": "Tokens allowed per budget period; set together with `budget_period`.",
+            "nullable": true,
+            "minimum": 1
           },
           "token_ttl_seconds": {
             "type": "integer",
-            "format": "int32"
+            "format": "int32",
+            "minimum": 1
           }
         }
       },
@@ -1160,7 +1302,11 @@
             "description": "Plaintext API key — shown exactly once on creation."
           },
           "budget_period": {
-            "type": "string",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/BudgetPeriod"
+              }
+            ],
             "nullable": true
           },
           "burst": {
@@ -1313,15 +1459,22 @@
       },
       "UpdateBudgetRequest": {
         "type": "object",
+        "description": "Both fields set together, or both `null` to remove the budget.",
         "properties": {
           "budget_period": {
-            "type": "string",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/BudgetPeriod"
+              }
+            ],
             "nullable": true
           },
           "token_budget": {
             "type": "integer",
             "format": "int64",
-            "nullable": true
+            "description": "Tokens allowed per budget period; set together with `budget_period`.",
+            "nullable": true,
+            "minimum": 1
           }
         }
       },

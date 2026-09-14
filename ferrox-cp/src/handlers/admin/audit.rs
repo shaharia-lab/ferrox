@@ -20,9 +20,9 @@ pub struct AuditQueryParams {
     pub event: Option<String>,
     /// Only entries created at or after this time.
     pub since: Option<DateTime<Utc>>,
-    /// Page size (capped at 1000).
+    /// Page size; larger values are capped at 1000.
     #[serde(default = "default_limit")]
-    #[param(default = 100, maximum = 1000)]
+    #[param(default = 100)]
     pub limit: i64,
     /// Number of entries to skip.
     #[serde(default)]
@@ -48,6 +48,7 @@ fn default_limit() -> i64 {
     params(AuditQueryParams),
     responses(
         (status = 200, description = "Audit log entries, newest first", body = Vec<AuditEntry>),
+        (status = 400, description = "Malformed query string", body = String, content_type = "text/plain"),
         (status = 401, description = "Missing or invalid admin key", body = ApiError),
         (status = 500, description = "Database failure", body = ApiError),
     )
