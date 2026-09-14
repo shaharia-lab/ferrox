@@ -132,6 +132,15 @@ pub const CACHE_CONTROL: &str = "cache_control";
 /// and `_anthropic_betas`.
 pub const ANTHROPIC_SYSTEM_CACHE_CONTROL: &str = "_anthropic_system_cache_control";
 
+/// Request-level [`ChatCompletionRequest::extra`] key holding the `cache_control`
+/// of the **tool definitions**.
+///
+/// The internal (OpenAI-shaped) `tools` array has no per-tool attributes, so a
+/// breakpoint on an Anthropic tool definition is hoisted here, exactly like
+/// [`ANTHROPIC_SYSTEM_CACHE_CONTROL`]. It marks the tool list as a whole as a
+/// cacheable prefix.
+pub const ANTHROPIC_TOOLS_CACHE_CONTROL: &str = "_anthropic_tools_cache_control";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImageUrl {
     pub url: String,
