@@ -78,7 +78,7 @@ Providers that support prompt caching report two extra `type` values on
 
 | `type` | Meaning |
 |---|---|
-| `cache_read` | Tokens served from the prompt cache (Anthropic `cache_read_input_tokens`, Bedrock `cacheReadInputTokens`) |
+| `cache_read` | Tokens served from the prompt cache (Anthropic `cache_read_input_tokens`, Bedrock `cacheReadInputTokens`, Gemini `cachedContentTokenCount`) |
 | `cache_write` | Tokens written to the prompt cache (Anthropic `cache_creation_input_tokens`, Bedrock `cacheWriteInputTokens`) |
 
 These series are created **only when a provider actually reports cache usage**,

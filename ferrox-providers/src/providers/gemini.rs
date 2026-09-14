@@ -666,8 +666,12 @@ struct GeminiUsageMetadata {
 /// Convert Gemini `usageMetadata` to OpenAI usage (shared by the streaming and
 /// non-streaming paths), surfacing cache reads the same way as other adapters.
 fn gemini_usage(u: &GeminiUsageMetadata) -> Usage {
+    // `promptTokenCount` includes cached content, but Ferrox's `prompt_tokens`
+    // is the non-cached input (as for Anthropic/Bedrock) — subtract, or cache
+    // reads would be counted twice.
+    let cached = u.cached_content_token_count.unwrap_or(0);
     Usage {
-        prompt_tokens: u.prompt_token_count,
+        prompt_tokens: u.prompt_token_count.saturating_sub(cached),
         completion_tokens: u.candidates_token_count.unwrap_or(0),
         total_tokens: u.total_token_count,
         extra: crate::types::cache_usage_extra(None, u.cached_content_token_count),
@@ -978,7 +982,8 @@ mod tests {
     }
 
     fn assert_cache_read(usage: &Usage) {
-        assert_eq!(usage.prompt_tokens, 4000);
+        // 4000 total prompt tokens, 3968 of them cached → 32 non-cached.
+        assert_eq!(usage.prompt_tokens, 32);
         assert_eq!(usage.completion_tokens, 2);
         assert_eq!(usage.total_tokens, 4002);
         // Same key shape as the Anthropic and Bedrock adapters (#125/#126).
