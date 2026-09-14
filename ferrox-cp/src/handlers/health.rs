@@ -2,11 +2,14 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::Json;
 use serde::Serialize;
+use utoipa::ToSchema;
 
 use crate::state::CpState;
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct HealthResponse {
+    /// `ok` or `unavailable`.
+    #[schema(example = "ok")]
     pub status: &'static str,
 }
 
@@ -14,6 +17,15 @@ pub struct HealthResponse {
 ///
 /// Returns `200 {"status":"ok"}` when the database is reachable.
 /// Returns `503 {"status":"unavailable"}` if the `SELECT 1` fails.
+#[utoipa::path(
+    get,
+    path = "/healthz",
+    tag = "Observability",
+    responses(
+        (status = 200, description = "Process is alive and the database is reachable", body = HealthResponse),
+        (status = 503, description = "Database unreachable", body = HealthResponse),
+    )
+)]
 pub async fn health_handler(State(state): State<CpState>) -> (StatusCode, Json<HealthResponse>) {
     match sqlx::query("SELECT 1").execute(&state.db).await {
         Ok(_) => (StatusCode::OK, Json(HealthResponse { status: "ok" })),

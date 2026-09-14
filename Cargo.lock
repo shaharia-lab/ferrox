@@ -1467,6 +1467,7 @@ dependencies = [
  "tower 0.5.3",
  "tracing",
  "tracing-subscriber",
+ "utoipa",
  "uuid",
 ]
 
@@ -4434,6 +4435,7 @@ dependencies = [
  "quote",
  "regex",
  "syn 2.0.119",
+ "uuid",
 ]
 
 [[package]]
