@@ -19,7 +19,7 @@
 //! not pin your application to Ferrox's `axum` or `utoipa` versions.
 //!
 //! ```toml
-//! ferrox-providers = { git = "https://github.com/shaharia-lab/ferrox", tag = "providers-v0.2.0",
+//! ferrox-providers = { git = "https://github.com/shaharia-lab/ferrox", tag = "providers-v0.1.0",
 //!                      default-features = false, features = ["anthropic", "openai"] }
 //! ```
 //!
