@@ -242,6 +242,16 @@ Ferrox matches aliases exactly. Check `GET /anthropic/v1/models` for the list it
 Kimi K3 is a reasoning-only model — a small `max_tokens` is consumed entirely by reasoning before
 any text is emitted. Allow at least a few hundred tokens.
 
+**Wrong answers about images, with no error**
+The coding-plan endpoints in this guide should not be relied on for vision. Ferrox forwards the
+image, but Z.AI's `https://api.z.ai/api/anthropic` has been measured answering from the text
+alone: HTTP 200, a flat ~150-token charge whatever the image size, and a fluent, invented
+description of a picture the model never saw. Kimi's `https://api.kimi.com/coding/v1` could not
+be verified directly (it was returning errors when tested); treat it as text-only until you have
+confirmed otherwise. Nothing in the response marks a dropped image, so Ferrox cannot warn about
+it. Check `usage.input_tokens` (`usage.prompt_tokens` on `/v1/chat/completions`) with and without
+the image — if it barely moves, the upstream dropped it. See [Providers](providers.md#zai-glm).
+
 **404s on every route, or an unexpected HTML page**
 Something else owns the port. Confirm with `ss -ltnp | grep <port>` and check that
 `docker ps` shows a port mapping for the Ferrox container.

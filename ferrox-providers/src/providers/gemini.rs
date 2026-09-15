@@ -268,12 +268,7 @@ impl ProviderAdapter for GeminiAdapter {
                     }
                 };
 
-                let usage = gemini_resp.usage_metadata.as_ref().map(|u| Usage {
-                    prompt_tokens: u.prompt_token_count,
-                    completion_tokens: u.candidates_token_count.unwrap_or(0),
-                    total_tokens: u.total_token_count,
-        extra: Default::default(),
-                });
+                let usage = gemini_resp.usage_metadata.as_ref().map(gemini_usage);
 
                 let candidate = match gemini_resp.candidates.into_iter().next() {
                     Some(c) => c,
@@ -662,6 +657,27 @@ struct GeminiUsageMetadata {
     candidates_token_count: Option<u32>,
     #[serde(rename = "totalTokenCount")]
     total_token_count: u32,
+    /// Prompt tokens served from Gemini's context cache — implicit caching is on
+    /// by default for 2.5+ models. Gemini reports no cache-write counter.
+    #[serde(rename = "cachedContentTokenCount")]
+    cached_content_token_count: Option<u32>,
+}
+
+/// Convert Gemini `usageMetadata` to OpenAI usage (shared by the streaming and
+/// non-streaming paths), surfacing cache reads the same way as other adapters.
+fn gemini_usage(u: &GeminiUsageMetadata) -> Usage {
+    // `promptTokenCount` includes cached content, but Ferrox's `prompt_tokens`
+    // is the non-cached input (as for Anthropic/Bedrock) — subtract, or cache
+    // reads would be counted twice.
+    let cached = u.cached_content_token_count.unwrap_or(0);
+    Usage {
+        prompt_tokens: u.prompt_token_count.saturating_sub(cached),
+        completion_tokens: u.candidates_token_count.unwrap_or(0),
+        // Subtracted rather than recomputed: Gemini's total also counts
+        // thinking/tool-use tokens that `candidatesTokenCount` leaves out.
+        total_tokens: u.total_token_count.saturating_sub(cached),
+        extra: crate::types::cache_usage_extra(None, u.cached_content_token_count),
+    }
 }
 
 /// Collect all of a candidate's parts into concatenated text + tool calls
@@ -707,12 +723,7 @@ fn map_gemini_finish_reason(reason: &str, has_tool_calls: bool) -> String {
 fn gemini_to_openai_response(resp: GeminiResponse, model_id: &str) -> ChatCompletionResponse {
     let id = Uuid::new_v4().to_string();
 
-    let usage = resp.usage_metadata.map(|u| Usage {
-        prompt_tokens: u.prompt_token_count,
-        completion_tokens: u.candidates_token_count.unwrap_or(0),
-        total_tokens: u.total_token_count,
-        extra: Default::default(),
-    });
+    let usage = resp.usage_metadata.as_ref().map(gemini_usage);
 
     let choices = resp
         .candidates
@@ -955,5 +966,72 @@ mod tests {
     fn safety_finish_reason_maps_to_content_filter() {
         assert_eq!(map_gemini_finish_reason("SAFETY", false), "content_filter");
         assert_eq!(map_gemini_finish_reason("STOP", true), "tool_calls");
+    }
+
+    // ── Prompt caching: implicit cache reads ─────────────────────────────────
+
+    const CACHED_RESPONSE: &str = r#"{"candidates":[{"content":{"role":"model","parts":[{"text":"hi"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":4000,"candidatesTokenCount":2,"totalTokenCount":4002,"cachedContentTokenCount":3968}}"#;
+    const UNCACHED_RESPONSE: &str = r#"{"candidates":[{"content":{"role":"model","parts":[{"text":"hi"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":5,"candidatesTokenCount":3,"totalTokenCount":8}}"#;
+
+    /// The usage a streamed chunk carries, via the same parse + conversion the
+    /// `chat_stream` loop applies to each SSE `data:` payload.
+    fn stream_chunk_usage(data: &str) -> Usage {
+        let resp: GeminiResponse = serde_json::from_str(data).unwrap();
+        resp.usage_metadata
+            .as_ref()
+            .map(gemini_usage)
+            .expect("usage must be present")
+    }
+
+    fn assert_cache_read(usage: &Usage) {
+        // 4000 total prompt tokens, 3968 of them cached → 32 non-cached.
+        assert_eq!(usage.prompt_tokens, 32);
+        assert_eq!(usage.completion_tokens, 2);
+        assert_eq!(usage.total_tokens, 34);
+        // Same key shape as the Anthropic and Bedrock adapters (#125/#126).
+        assert_eq!(usage.extra["prompt_tokens_details"]["cached_tokens"], 3968);
+        assert_eq!(usage.extra["cache_read_input_tokens"], 3968);
+        // Gemini has no write-side counter.
+        assert!(!usage.extra.contains_key("cache_creation_input_tokens"));
+    }
+
+    fn assert_no_cache_keys(usage: &Usage) {
+        assert_eq!(usage.prompt_tokens, 5);
+        assert_eq!(usage.completion_tokens, 3);
+        assert_eq!(usage.total_tokens, 8);
+        assert!(
+            usage.extra.is_empty(),
+            "no cachedContentTokenCount upstream must mean no extra keys: {:?}",
+            usage.extra
+        );
+    }
+
+    #[test]
+    fn non_streaming_cached_content_tokens_land_in_usage_extra() {
+        let resp: GeminiResponse = serde_json::from_str(CACHED_RESPONSE).unwrap();
+        let out = gemini_to_openai_response(resp, "gemini");
+        assert_cache_read(out.usage.as_ref().expect("usage must be present"));
+    }
+
+    #[test]
+    fn non_streaming_absent_cached_content_tokens_leave_usage_extra_empty() {
+        let resp: GeminiResponse = serde_json::from_str(UNCACHED_RESPONSE).unwrap();
+        let out = gemini_to_openai_response(resp, "gemini");
+        let usage = out.usage.expect("usage must be present");
+        assert_no_cache_keys(&usage);
+        assert!(serde_json::to_value(&usage)
+            .unwrap()
+            .get("prompt_tokens_details")
+            .is_none());
+    }
+
+    #[test]
+    fn streaming_cached_content_tokens_land_in_usage_extra() {
+        assert_cache_read(&stream_chunk_usage(CACHED_RESPONSE));
+    }
+
+    #[test]
+    fn streaming_absent_cached_content_tokens_leave_usage_extra_empty() {
+        assert_no_cache_keys(&stream_chunk_usage(UNCACHED_RESPONSE));
     }
 }

@@ -6,6 +6,7 @@ use base64::Engine;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tracing::{error, info};
+use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
 
 use crate::db::audit_repo::AuditRepository;
@@ -18,15 +19,26 @@ use crate::state::CpState;
 
 const MAX_LIMIT: i64 = 1000;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct CreateClientRequest {
+    /// Unique client name; must not be blank.
+    #[schema(min_length = 1)]
     pub name: String,
     pub description: Option<String>,
+    /// Model aliases this client may call; `["*"]` means all.
+    #[schema(min_items = 1)]
     pub allowed_models: Vec<String>,
+    #[schema(minimum = 1)]
     pub rpm: i32,
+    #[schema(minimum = 1)]
     pub burst: i32,
+    #[schema(minimum = 1)]
     pub token_ttl_seconds: i32,
+    /// Tokens allowed per budget period; set together with `budget_period`.
+    #[schema(minimum = 1)]
     pub token_budget: Option<i64>,
+    /// Set together with `token_budget`.
+    #[schema(pattern = "^(daily|monthly)$")]
     pub budget_period: Option<String>,
 }
 
@@ -66,9 +78,14 @@ impl CreateClientRequest {
     }
 }
 
-#[derive(Debug, Deserialize)]
+/// Both fields set together, or both `null` to remove the budget.
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct UpdateBudgetRequest {
+    /// Tokens allowed per budget period; set together with `budget_period`.
+    #[schema(minimum = 1)]
     pub token_budget: Option<i64>,
+    /// Set together with `token_budget`.
+    #[schema(pattern = "^(daily|monthly)$")]
     pub budget_period: Option<String>,
 }
 
@@ -92,7 +109,7 @@ impl UpdateBudgetRequest {
 }
 
 /// Response for `POST /api/clients`.  Includes `api_key` which is shown **once**.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct CreateClientResponse {
     pub id: Uuid,
     pub name: String,
@@ -106,11 +123,12 @@ pub struct CreateClientResponse {
     pub active: bool,
     pub created_at: DateTime<Utc>,
     pub token_budget: Option<i64>,
+    #[schema(pattern = "^(daily|monthly)$")]
     pub budget_period: Option<String>,
 }
 
 /// Safe client representation (no key material).
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct ClientResponse {
     pub id: Uuid,
     pub name: String,
@@ -123,29 +141,38 @@ pub struct ClientResponse {
     pub created_at: DateTime<Utc>,
     pub revoked_at: Option<DateTime<Utc>>,
     pub token_budget: Option<i64>,
+    #[schema(pattern = "^(daily|monthly)$")]
     pub budget_period: Option<String>,
     pub budget_reset_at: Option<DateTime<Utc>>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct UsageResponse {
     pub last_24h: UsageSummary,
     pub last_7d: UsageSummary,
     pub last_30d: UsageSummary,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct UsageDetailsParams {
+    /// Only records with `created_at >= from`.
     pub from: Option<DateTime<Utc>>,
+    /// Only records with `created_at < to`.
     pub to: Option<DateTime<Utc>>,
+    /// Only records for this model alias.
     pub model: Option<String>,
+    /// Page size; larger values are capped at 1000.
     #[serde(default = "default_limit")]
+    #[param(default = 50)]
     pub limit: i64,
+    /// Number of records to skip.
     #[serde(default)]
+    #[param(default = 0)]
     pub offset: i64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct UsageDetailRecord {
     pub request_id: String,
     pub model: String,
@@ -157,11 +184,16 @@ pub struct UsageDetailRecord {
     pub created_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct PaginationParams {
+    /// Page size; larger values are capped at 1000.
     #[serde(default = "default_limit")]
+    #[param(default = 50)]
     pub limit: i64,
+    /// Number of records to skip.
     #[serde(default)]
+    #[param(default = 0)]
     pub offset: i64,
 }
 
@@ -176,6 +208,22 @@ fn default_limit() -> i64 {
 /// Creates a new API client.  Generates an `sk-cp-` prefixed key, hashes it
 /// with bcrypt, stores the hash, and returns the plaintext key once in the
 /// response body.
+#[utoipa::path(
+    post,
+    path = "/api/clients",
+    tag = "Clients",
+    security(("admin_auth" = [])),
+    request_body = CreateClientRequest,
+    responses(
+        (status = 201, description = "Client created; `api_key` is returned only in this response", body = CreateClientResponse),
+        (status = 400, description = "Malformed JSON body", body = String, content_type = "text/plain"),
+        (status = 401, description = "Missing or invalid admin key", body = ApiError),
+        (status = 409, description = "A client with this name already exists", body = ApiError),
+        (status = 415, description = "Missing or non-JSON `Content-Type`", body = String, content_type = "text/plain"),
+        (status = 422, description = "Request failed validation (JSON), or the body is missing a field or has a wrong type (plain text)", content(("application/json" = ApiError), ("text/plain" = String))),
+        (status = 500, description = "Database or key-hashing failure", body = ApiError),
+    )
+)]
 pub async fn create_client(
     State(state): State<CpState>,
     Json(req): Json<CreateClientRequest>,
@@ -264,6 +312,19 @@ pub async fn create_client(
 }
 
 /// `GET /api/clients`
+#[utoipa::path(
+    get,
+    path = "/api/clients",
+    tag = "Clients",
+    security(("admin_auth" = [])),
+    params(PaginationParams),
+    responses(
+        (status = 200, description = "Clients, newest first", body = Vec<ClientResponse>),
+        (status = 400, description = "Malformed query string", body = String, content_type = "text/plain"),
+        (status = 401, description = "Missing or invalid admin key", body = ApiError),
+        (status = 500, description = "Database failure", body = ApiError),
+    )
+)]
 pub async fn list_clients(
     State(state): State<CpState>,
     Query(params): Query<PaginationParams>,
@@ -279,6 +340,20 @@ pub async fn list_clients(
 }
 
 /// `GET /api/clients/:id`
+#[utoipa::path(
+    get,
+    path = "/api/clients/{id}",
+    tag = "Clients",
+    security(("admin_auth" = [])),
+    params(("id" = Uuid, Path, description = "Client id")),
+    responses(
+        (status = 200, description = "The client", body = ClientResponse),
+        (status = 400, description = "Malformed client id", body = String, content_type = "text/plain"),
+        (status = 401, description = "Missing or invalid admin key", body = ApiError),
+        (status = 404, description = "Client not found", body = ApiError),
+        (status = 500, description = "Database failure", body = ApiError),
+    )
+)]
 pub async fn get_client(
     State(state): State<CpState>,
     Path(id): Path<Uuid>,
@@ -296,6 +371,20 @@ pub async fn get_client(
 }
 
 /// `DELETE /api/clients/:id`
+#[utoipa::path(
+    delete,
+    path = "/api/clients/{id}",
+    tag = "Clients",
+    security(("admin_auth" = [])),
+    params(("id" = Uuid, Path, description = "Client id")),
+    responses(
+        (status = 204, description = "Client revoked"),
+        (status = 400, description = "Malformed client id", body = String, content_type = "text/plain"),
+        (status = 401, description = "Missing or invalid admin key", body = ApiError),
+        (status = 404, description = "Client not found", body = ApiError),
+        (status = 500, description = "Database failure", body = ApiError),
+    )
+)]
 pub async fn revoke_client(
     State(state): State<CpState>,
     Path(id): Path<Uuid>,
@@ -326,6 +415,20 @@ pub async fn revoke_client(
 /// `GET /api/clients/:id/usage`
 ///
 /// Returns aggregated token usage from `usage_log` for the last 24h, 7d, and 30d.
+#[utoipa::path(
+    get,
+    path = "/api/clients/{id}/usage",
+    tag = "Clients",
+    security(("admin_auth" = [])),
+    params(("id" = Uuid, Path, description = "Client id")),
+    responses(
+        (status = 200, description = "Token usage over the last 24h, 7d and 30d", body = UsageResponse),
+        (status = 400, description = "Malformed client id", body = String, content_type = "text/plain"),
+        (status = 401, description = "Missing or invalid admin key", body = ApiError),
+        (status = 404, description = "Client not found", body = ApiError),
+        (status = 500, description = "Database failure", body = ApiError),
+    )
+)]
 pub async fn client_usage(
     State(state): State<CpState>,
     Path(id): Path<Uuid>,
@@ -381,6 +484,23 @@ pub async fn client_usage(
 /// `PATCH /api/clients/:id/budget`
 ///
 /// Update token budget settings for a client.
+#[utoipa::path(
+    patch,
+    path = "/api/clients/{id}/budget",
+    tag = "Clients",
+    security(("admin_auth" = [])),
+    params(("id" = Uuid, Path, description = "Client id")),
+    request_body = UpdateBudgetRequest,
+    responses(
+        (status = 200, description = "The updated client", body = ClientResponse),
+        (status = 400, description = "Malformed client id or JSON body", body = String, content_type = "text/plain"),
+        (status = 401, description = "Missing or invalid admin key", body = ApiError),
+        (status = 404, description = "Client not found", body = ApiError),
+        (status = 415, description = "Missing or non-JSON `Content-Type`", body = String, content_type = "text/plain"),
+        (status = 422, description = "Request failed validation (JSON), or the body has a wrong type (plain text)", content(("application/json" = ApiError), ("text/plain" = String))),
+        (status = 500, description = "Database failure", body = ApiError),
+    )
+)]
 pub async fn update_client_budget(
     State(state): State<CpState>,
     Path(id): Path<Uuid>,
@@ -409,6 +529,20 @@ pub async fn update_client_budget(
 /// `POST /api/clients/:id/reactivate`
 ///
 /// Re-activate a revoked client and reset its budget period.
+#[utoipa::path(
+    post,
+    path = "/api/clients/{id}/reactivate",
+    tag = "Clients",
+    security(("admin_auth" = [])),
+    params(("id" = Uuid, Path, description = "Client id")),
+    responses(
+        (status = 204, description = "Client reactivated"),
+        (status = 400, description = "Malformed client id", body = String, content_type = "text/plain"),
+        (status = 401, description = "Missing or invalid admin key", body = ApiError),
+        (status = 404, description = "Client not found or already active", body = ApiError),
+        (status = 500, description = "Database failure", body = ApiError),
+    )
+)]
 pub async fn reactivate_client(
     State(state): State<CpState>,
     Path(id): Path<Uuid>,
@@ -430,6 +564,20 @@ pub async fn reactivate_client(
 /// `GET /api/clients/:id/usage/details`
 ///
 /// Returns paginated per-request usage records from `usage_log`.
+#[utoipa::path(
+    get,
+    path = "/api/clients/{id}/usage/details",
+    tag = "Clients",
+    security(("admin_auth" = [])),
+    params(("id" = Uuid, Path, description = "Client id"), UsageDetailsParams),
+    responses(
+        (status = 200, description = "Per-request usage records", body = Vec<UsageDetailRecord>),
+        (status = 400, description = "Malformed client id or query string", body = String, content_type = "text/plain"),
+        (status = 401, description = "Missing or invalid admin key", body = ApiError),
+        (status = 404, description = "Client not found", body = ApiError),
+        (status = 500, description = "Database failure", body = ApiError),
+    )
+)]
 pub async fn client_usage_details(
     State(state): State<CpState>,
     Path(id): Path<Uuid>,

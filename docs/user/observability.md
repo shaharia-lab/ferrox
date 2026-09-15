@@ -41,6 +41,10 @@ every completed request — streaming and non-streaming, on `request_completed`
 (`/v1/chat/completions`) and `anthropic_request_completed`
 (`/anthropic/v1/messages`) alike.
 
+The same two counters, with the same omit-when-zero rule, are included in the
+`token_usage` webhook payload — see
+[event_endpoints](configuration.md#event-payload).
+
 ---
 
 ## Prometheus metrics
@@ -78,7 +82,7 @@ Providers that support prompt caching report two extra `type` values on
 
 | `type` | Meaning |
 |---|---|
-| `cache_read` | Tokens served from the prompt cache (Anthropic `cache_read_input_tokens`, Bedrock `cacheReadInputTokens`) |
+| `cache_read` | Tokens served from the prompt cache (Anthropic `cache_read_input_tokens`, Bedrock `cacheReadInputTokens`, Gemini `cachedContentTokenCount`) |
 | `cache_write` | Tokens written to the prompt cache (Anthropic `cache_creation_input_tokens`, Bedrock `cacheWriteInputTokens`) |
 
 These series are created **only when a provider actually reports cache usage**,

@@ -3,11 +3,12 @@ use rsa::pkcs8::DecodePublicKey;
 use rsa::traits::PublicKeyParts;
 use rsa::RsaPublicKey;
 use serde::Serialize;
+use utoipa::ToSchema;
 
 use crate::error::CpError;
 
 /// A single JWK entry as defined by RFC 7517 for an RSA signing key.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct Jwk {
     pub kty: String,
     #[serde(rename = "use")]

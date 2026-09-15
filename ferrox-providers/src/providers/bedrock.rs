@@ -284,9 +284,10 @@ fn build_converse_request(
     req: &ChatCompletionRequest,
     model_id: &str,
 ) -> Result<ConverseRequest, ProxyError> {
+    let mut tools = build_tools(req)?;
     let mut system = build_system(req);
     let mut entries = build_message_entries(req)?;
-    apply_cache_point_policy(&mut system, &mut entries, model_id);
+    apply_cache_point_policy(&mut tools, &mut system, &mut entries, model_id);
 
     let messages = entries
         .into_iter()
@@ -303,7 +304,7 @@ fn build_converse_request(
         system,
         messages,
         inference: Some(build_inference(req, model_id)),
-        tools: build_tool_config(req, model_id)?,
+        tools: build_tool_config(req, model_id, tools)?,
     })
 }
 
@@ -338,14 +339,19 @@ fn supports_cache_points(model_id: &str) -> bool {
 /// caching is prefix-based, so a later breakpoint covers everything an earlier
 /// one would have, and is strictly more valuable.
 fn apply_cache_point_policy(
+    tools: &mut Vec<Tool>,
     system: &mut Vec<SystemContentBlock>,
     entries: &mut [(ConversationRole, Vec<ContentBlock>)],
     model_id: &str,
 ) {
-    let total = system
+    let total = tools
         .iter()
-        .filter(|b| matches!(b, SystemContentBlock::CachePoint(_)))
+        .filter(|t| matches!(t, Tool::CachePoint(_)))
         .count()
+        + system
+            .iter()
+            .filter(|b| matches!(b, SystemContentBlock::CachePoint(_)))
+            .count()
         + entries
             .iter()
             .flat_map(|(_, blocks)| blocks.iter())
@@ -375,7 +381,15 @@ fn apply_cache_point_policy(
         total
     };
 
-    // Drop from the front, in request order: system blocks precede messages.
+    // Drop from the front, in prefix order: tools, then system, then messages.
+    tools.retain(|t| {
+        if to_drop > 0 && matches!(t, Tool::CachePoint(_)) {
+            to_drop -= 1;
+            false
+        } else {
+            true
+        }
+    });
     system.retain(|b| {
         if to_drop > 0 && matches!(b, SystemContentBlock::CachePoint(_)) {
             to_drop -= 1;
@@ -482,6 +496,11 @@ fn build_message_entries(
                             .map_err(build_err)?;
                         blocks.push(ContentBlock::ToolUse(block));
                     }
+                }
+                // A breakpoint on the turn terminates the span after its content;
+                // with no content there is nothing for it to terminate.
+                if !blocks.is_empty() && m.extra.contains_key(crate::types::CACHE_CONTROL) {
+                    blocks.push(ContentBlock::CachePoint(cache_point()));
                 }
                 // An assistant turn with neither text nor tool calls is dropped:
                 // Converse rejects empty-content messages.
@@ -605,25 +624,23 @@ fn build_inference(req: &ChatCompletionRequest, model_id: &str) -> InferenceConf
     ic.build()
 }
 
-/// Build the Converse `toolConfig` from OpenAI `tools` + `tool_choice`.
-fn build_tool_config(
-    req: &ChatCompletionRequest,
-    model_id: &str,
-) -> Result<Option<ToolConfiguration>, ProxyError> {
+/// OpenAI `tools` → the entries of Converse `toolConfig.tools`. Empty when no
+/// `toolConfig` is to be sent at all.
+fn build_tools(req: &ChatCompletionRequest) -> Result<Vec<Tool>, ProxyError> {
     let Some(tools) = &req.tools else {
-        return Ok(None);
+        return Ok(Vec::new());
     };
     if tools.is_empty() {
-        return Ok(None);
+        return Ok(Vec::new());
     }
     // OpenAI `tool_choice: "none"` means the model must not call a tool. Converse
     // has no "none", so omit the whole toolConfig: with no tools advertised the
     // model can't call one, which is the faithful behaviour for this turn.
     if req.tool_choice.as_ref().and_then(|v| v.as_str()) == Some("none") {
-        return Ok(None);
+        return Ok(Vec::new());
     }
 
-    let mut tc = ToolConfiguration::builder();
+    let mut out = Vec::with_capacity(tools.len() + 1);
     for t in tools {
         let schema = t
             .function
@@ -636,8 +653,32 @@ fn build_tool_config(
         if let Some(desc) = &t.function.description {
             spec = spec.description(desc.clone());
         }
-        tc = tc.tools(Tool::ToolSpec(spec.build().map_err(build_err)?));
+        out.push(Tool::ToolSpec(spec.build().map_err(build_err)?));
     }
+    // A breakpoint on the tool definitions arrives at request level (internal
+    // tools have no per-tool attributes) — see `types::
+    // ANTHROPIC_TOOLS_CACHE_CONTROL`. Terminate the tool list here.
+    if req
+        .extra
+        .contains_key(crate::types::ANTHROPIC_TOOLS_CACHE_CONTROL)
+    {
+        out.push(Tool::CachePoint(cache_point()));
+    }
+    Ok(out)
+}
+
+/// Build the Converse `toolConfig` from the entries [`build_tools`] produced
+/// (after the cache-point policy) + `tool_choice`.
+fn build_tool_config(
+    req: &ChatCompletionRequest,
+    model_id: &str,
+    tools: Vec<Tool>,
+) -> Result<Option<ToolConfiguration>, ProxyError> {
+    if tools.is_empty() {
+        return Ok(None);
+    }
+
+    let mut tc = ToolConfiguration::builder().set_tools(Some(tools));
 
     // Llama 3.1 on Bedrock does not support toolChoice; omit it there.
     if !model_id.contains("llama3-1") {
@@ -854,6 +895,8 @@ fn text_of(content: &Option<MessageContent>) -> String {
 mod tests {
     use super::*;
     use crate::types::{ContentPart, ImageUrl, Tool, ToolFunction};
+    // `Tool` above is the OpenAI-shaped request type; this is Converse's.
+    use aws_sdk_bedrockruntime::types::Tool as SdkTool;
 
     /// Entries → `Message`s, mirroring what `build_converse_request` does, so
     /// message-shape tests can assert on the built SDK type.
@@ -989,9 +1032,13 @@ mod tests {
         assert_eq!(blocks.len(), 2);
     }
 
+    fn tool_config(r: &ChatCompletionRequest, model_id: &str) -> Option<ToolConfiguration> {
+        build_tool_config(r, model_id, build_tools(r).unwrap()).unwrap()
+    }
+
     #[test]
     fn tools_and_tool_choice_map_to_config() {
-        let cfg = build_tool_config(
+        let cfg = tool_config(
             &req(
                 vec![text_msg("user", "hi")],
                 true,
@@ -999,7 +1046,6 @@ mod tests {
             ),
             "claude",
         )
-        .unwrap()
         .expect("tool config present");
         assert_eq!(cfg.tools().len(), 1);
         assert!(matches!(cfg.tool_choice(), Some(ToolChoice::Any(_))));
@@ -1008,21 +1054,20 @@ mod tests {
     #[test]
     fn tool_choice_none_omits_tool_config() {
         // "none" must suppress tool use — no toolConfig is sent at all.
-        let cfg = build_tool_config(
+        let cfg = tool_config(
             &req(
                 vec![text_msg("user", "hi")],
                 true,
                 Some(serde_json::json!("none")),
             ),
             "claude",
-        )
-        .unwrap();
+        );
         assert!(cfg.is_none(), "tool_choice=none drops the tool config");
     }
 
     #[test]
     fn llama_3_1_omits_tool_choice() {
-        let cfg = build_tool_config(
+        let cfg = tool_config(
             &req(
                 vec![text_msg("user", "hi")],
                 true,
@@ -1030,7 +1075,6 @@ mod tests {
             ),
             "meta.llama3-1-70b-instruct-v1:0",
         )
-        .unwrap()
         .expect("tool config present");
         assert!(cfg.tool_choice().is_none(), "llama 3.1 drops tool_choice");
     }
@@ -1230,17 +1274,45 @@ mod tests {
     }
 
     fn count_cache_points(built: &ConverseRequest) -> usize {
-        built
-            .system
-            .iter()
-            .filter(|b| matches!(b, SystemContentBlock::CachePoint(_)))
-            .count()
+        tool_cache_points(built)
+            + built
+                .system
+                .iter()
+                .filter(|b| matches!(b, SystemContentBlock::CachePoint(_)))
+                .count()
             + built
                 .messages
                 .iter()
                 .flat_map(|m| m.content().iter())
                 .filter(|b| matches!(b, ContentBlock::CachePoint(_)))
                 .count()
+    }
+
+    fn tool_cache_points(built: &ConverseRequest) -> usize {
+        built.tools.as_ref().map_or(0, |tc| {
+            tc.tools()
+                .iter()
+                .filter(|t| matches!(t, SdkTool::CachePoint(_)))
+                .count()
+        })
+    }
+
+    /// An assistant turn (text + one tool call) with an optional message-level
+    /// breakpoint.
+    fn asst_turn(cached: bool) -> ChatMessage {
+        let mut m = asst_tool_call();
+        m.content = Some(MessageContent::Text("let me check".into()));
+        if cached {
+            m.extra = ephemeral();
+        }
+        m
+    }
+
+    fn mark_tools_cacheable(r: &mut ChatCompletionRequest) {
+        r.extra.insert(
+            crate::types::ANTHROPIC_TOOLS_CACHE_CONTROL.to_string(),
+            serde_json::json!({"type": "ephemeral"}),
+        );
     }
 
     #[test]
@@ -1257,6 +1329,78 @@ mod tests {
             built.messages[0].content()[0],
             ContentBlock::Text(_)
         ));
+    }
+
+    #[test]
+    fn no_breakpoints_with_tools_and_assistant_turn_emit_no_cache_points() {
+        let built = build_converse_request(
+            &req(vec![text_msg("user", "hi"), asst_turn(false)], true, None),
+            "anthropic.claude-sonnet-4",
+        )
+        .unwrap();
+        assert_eq!(count_cache_points(&built), 0);
+        let tools = built.tools.as_ref().expect("tool config present").tools();
+        assert_eq!(tools.len(), 1, "tool spec only");
+        assert_eq!(built.messages[1].content().len(), 2, "text, toolUse");
+    }
+
+    #[test]
+    fn assistant_breakpoint_emits_cache_point_after_the_turn() {
+        let built = build_converse_request(
+            &req(vec![text_msg("user", "hi"), asst_turn(true)], false, None),
+            "anthropic.claude-sonnet-4",
+        )
+        .unwrap();
+
+        let blocks = built.messages[1].content();
+        assert_eq!(blocks.len(), 3, "text, toolUse, cachePoint");
+        assert!(matches!(blocks[0], ContentBlock::Text(_)));
+        assert!(matches!(blocks[1], ContentBlock::ToolUse(_)));
+        assert!(
+            matches!(blocks[2], ContentBlock::CachePoint(_)),
+            "cache point must follow the whole turn"
+        );
+    }
+
+    #[test]
+    fn assistant_breakpoint_on_empty_turn_emits_nothing() {
+        let mut empty = text_msg("assistant", "");
+        empty.extra = ephemeral();
+        let built = build_converse_request(
+            &req(vec![text_msg("user", "hi"), empty], false, None),
+            "anthropic.claude-sonnet-4",
+        )
+        .unwrap();
+        assert_eq!(count_cache_points(&built), 0);
+        assert_eq!(built.messages.len(), 1, "empty assistant turn dropped");
+    }
+
+    #[test]
+    fn tools_breakpoint_emits_cache_point_at_end_of_tool_config() {
+        let mut r = req(vec![text_msg("user", "hi")], true, None);
+        mark_tools_cacheable(&mut r);
+
+        let built = build_converse_request(&r, "anthropic.claude-sonnet-4").unwrap();
+        let tools = built.tools.as_ref().expect("tool config present").tools();
+        assert_eq!(tools.len(), 2, "toolSpec, cachePoint");
+        assert!(matches!(tools[0], SdkTool::ToolSpec(_)));
+        assert!(matches!(tools[1], SdkTool::CachePoint(_)));
+    }
+
+    #[test]
+    fn tools_breakpoint_without_tool_config_emits_nothing() {
+        // tool_choice "none" omits toolConfig entirely; the breakpoint has
+        // nothing to terminate.
+        let mut r = req(
+            vec![text_msg("user", "hi")],
+            true,
+            Some(serde_json::json!("none")),
+        );
+        mark_tools_cacheable(&mut r);
+
+        let built = build_converse_request(&r, "anthropic.claude-sonnet-4").unwrap();
+        assert!(built.tools.is_none());
+        assert_eq!(count_cache_points(&built), 0);
     }
 
     #[test]
@@ -1363,6 +1507,68 @@ mod tests {
         .unwrap();
         assert_eq!(count_cache_points(&built), 0);
         assert_eq!(built.messages[0].content().len(), 1, "text only");
+    }
+
+    #[test]
+    fn cap_applies_across_all_positions_dropping_tools_then_system_first() {
+        // tools + system + user + assistant + two more user = 6 breakpoints.
+        // Prefix order is tools → system → messages, so those two go.
+        let mut r = req(
+            vec![
+                msg_with_breakpoints(&[("a", true)]),
+                asst_turn(true),
+                msg_with_breakpoints(&[("c", true), ("d", true)]),
+            ],
+            true,
+            None,
+        );
+        r.system = Some("sys".into());
+        r.extra.insert(
+            crate::types::ANTHROPIC_SYSTEM_CACHE_CONTROL.to_string(),
+            serde_json::json!({"type": "ephemeral"}),
+        );
+        mark_tools_cacheable(&mut r);
+
+        let built = build_converse_request(&r, "anthropic.claude-sonnet-4").unwrap();
+        assert_eq!(count_cache_points(&built), MAX_CACHE_POINTS);
+        assert_eq!(tool_cache_points(&built), 0, "tool cache point dropped");
+        assert_eq!(built.system.len(), 1, "system cache point dropped");
+        assert!(matches!(
+            built.messages[1].content().last(),
+            Some(ContentBlock::CachePoint(_))
+        ));
+    }
+
+    #[test]
+    fn cap_keeps_tool_cache_point_when_within_limit() {
+        let mut r = req(
+            vec![msg_with_breakpoints(&[("a", true)]), asst_turn(true)],
+            true,
+            None,
+        );
+        mark_tools_cacheable(&mut r);
+
+        let built = build_converse_request(&r, "anthropic.claude-sonnet-4").unwrap();
+        assert_eq!(count_cache_points(&built), 3);
+        assert_eq!(tool_cache_points(&built), 1);
+    }
+
+    #[test]
+    fn unsupported_model_family_drops_tool_and_assistant_cache_points() {
+        let mut r = req(vec![text_msg("user", "hi"), asst_turn(true)], true, None);
+        mark_tools_cacheable(&mut r);
+
+        let built = build_converse_request(&r, "meta.llama3-70b-instruct-v1:0").unwrap();
+        assert_eq!(count_cache_points(&built), 0);
+        assert_eq!(
+            built
+                .tools
+                .as_ref()
+                .expect("tool config present")
+                .tools()
+                .len(),
+            1
+        );
     }
 
     #[test]

@@ -175,6 +175,8 @@ pub async fn chat_completions(
                                 prompt_tokens: prompt,
                                 completion_tokens: completion,
                                 total_tokens: prompt + completion,
+                                cache_read_tokens: (cache_read > 0).then_some(cache_read),
+                                cache_write_tokens: (cache_write > 0).then_some(cache_write),
                                 latency_ms: Some((latency * 1000.0) as u64),
                                 timestamp: chrono::Utc::now(),
                             });
@@ -288,6 +290,8 @@ pub async fn chat_completions(
                         prompt_tokens: usage.prompt_tokens,
                         completion_tokens: usage.completion_tokens,
                         total_tokens: usage.prompt_tokens + usage.completion_tokens,
+                        cache_read_tokens: (cache_read > 0).then_some(cache_read),
+                        cache_write_tokens: (cache_write > 0).then_some(cache_write),
                         latency_ms: Some((latency * 1000.0) as u64),
                         timestamp: chrono::Utc::now(),
                     });

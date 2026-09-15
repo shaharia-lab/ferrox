@@ -4,20 +4,29 @@ use axum::Json;
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use tracing::error;
+use utoipa::IntoParams;
 use uuid::Uuid;
 
 use crate::db::audit_repo::{AuditFilter, AuditRepository};
-use crate::db::models::AuditEvent;
+use crate::db::models::{AuditEntry, AuditEvent};
 use crate::state::CpState;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct AuditQueryParams {
+    /// Only entries for this client.
     pub client_id: Option<Uuid>,
+    /// Only entries of this event type (e.g. `token_issued`).
     pub event: Option<String>,
+    /// Only entries created at or after this time.
     pub since: Option<DateTime<Utc>>,
+    /// Page size; larger values are capped at 1000.
     #[serde(default = "default_limit")]
+    #[param(default = 100)]
     pub limit: i64,
+    /// Number of entries to skip.
     #[serde(default)]
+    #[param(default = 0)]
     pub offset: i64,
 }
 
@@ -31,10 +40,23 @@ fn default_limit() -> i64 {
 ///
 /// Lists audit log entries with optional filters.
 /// Query parameters: `client_id`, `event`, `since`, `limit`, `offset`.
+#[utoipa::path(
+    get,
+    path = "/api/audit",
+    tag = "Audit",
+    security(("admin_auth" = [])),
+    params(AuditQueryParams),
+    responses(
+        (status = 200, description = "Audit log entries, newest first", body = Vec<AuditEntry>),
+        (status = 400, description = "Malformed query string", body = String, content_type = "text/plain"),
+        (status = 401, description = "Missing or invalid admin key", body = ApiError),
+        (status = 500, description = "Database failure", body = ApiError),
+    )
+)]
 pub async fn list_audit(
     State(state): State<CpState>,
     Query(params): Query<AuditQueryParams>,
-) -> Result<Json<Vec<crate::db::models::AuditEntry>>, (StatusCode, Json<serde_json::Value>)> {
+) -> Result<Json<Vec<AuditEntry>>, (StatusCode, Json<serde_json::Value>)> {
     let event = params.event.as_deref().map(|s| match s {
         "token_issued" => AuditEvent::TokenIssued,
         "client_created" => AuditEvent::ClientCreated,
