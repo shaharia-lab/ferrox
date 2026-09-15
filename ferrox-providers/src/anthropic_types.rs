@@ -241,18 +241,18 @@ pub fn to_chat_completion_request(req: AnthropicMessagesRequest) -> ChatCompleti
     let tools = req.tools.map(|tools| {
         tools
             .into_iter()
-            .inspect(|t| {
+            .map(|t| {
                 if t.cache_control.is_some() {
-                    tools_cache_control = t.cache_control.clone();
+                    tools_cache_control = t.cache_control;
                 }
-            })
-            .map(|t| Tool {
-                r#type: "function".to_string(),
-                function: ToolFunction {
-                    name: t.name,
-                    description: t.description,
-                    parameters: Some(t.input_schema),
-                },
+                Tool {
+                    r#type: "function".to_string(),
+                    function: ToolFunction {
+                        name: t.name,
+                        description: t.description,
+                        parameters: Some(t.input_schema),
+                    },
+                }
             })
             .collect()
     });

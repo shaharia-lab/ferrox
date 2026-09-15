@@ -166,7 +166,7 @@ Where a breakpoint can go, and how a client sets it:
 | **Tool definitions** | `cache_control` on a tool definition in `/anthropic/v1/messages` `tools`. OpenAI-format `tools` have no per-tool field, so tools cannot be marked cacheable from `/v1/chat/completions`. | One `cachePoint` at the **end** of `toolConfig.tools` — the whole tool list is cached, whichever tool carried the breakpoint. |
 | **System prompt** | `cache_control` on a `system` block (`/anthropic/v1/messages`), or on a `role: "system"` message. | After the system text. |
 | **User content** | `cache_control` on a content block. | After that block. |
-| **Assistant turn** | `cache_control` on the assistant message itself (e.g. a message-level `"cache_control"` on a `/v1/chat/completions` assistant message). | After that turn's text and `toolUse` blocks. |
+| **Assistant turn** | A message-level `"cache_control"` on the assistant message (`/v1/chat/completions`). Block-level `cache_control` on assistant content — the only form `/anthropic/v1/messages` has — is not honoured on Bedrock. | After that turn's text and `toolUse` blocks. |
 
 Bedrock-specific constraints:
 
