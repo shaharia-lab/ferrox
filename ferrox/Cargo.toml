@@ -12,7 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 # Provider translation layer (workspace member; also consumable standalone)
-ferrox-providers = { path = "../ferrox-providers", version = "0.1", features = [
+ferrox-providers = { path = "../ferrox-providers", version = "0.2", features = [
     "anthropic",
     "openai",
     "gemini",
