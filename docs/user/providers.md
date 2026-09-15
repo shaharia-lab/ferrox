@@ -159,11 +159,20 @@ after the content they terminate. The cache token counters Bedrock returns
 streaming and non-streaming paths, in the same shape as every other provider, so
 they flow into metrics, logs and `usage_log` automatically.
 
+Where a breakpoint can go, and how a client sets it:
+
+| Position | Client-facing mechanism | Resulting `cachePoint` |
+|---|---|---|
+| **Tool definitions** | `cache_control` on a tool definition in `/anthropic/v1/messages` `tools`. OpenAI-format `tools` have no per-tool field, so tools cannot be marked cacheable from `/v1/chat/completions`. | One `cachePoint` at the **end** of `toolConfig.tools` — the whole tool list is cached, whichever tool carried the breakpoint. |
+| **System prompt** | `cache_control` on a `system` block (`/anthropic/v1/messages`), or on a `role: "system"` message. | After the system text. |
+| **User content** | `cache_control` on a content block. | After that block. |
+| **Assistant turn** | A message-level `"cache_control"` on the assistant message (`/v1/chat/completions`). Block-level `cache_control` on assistant content — the only form `/anthropic/v1/messages` has — is not honoured on Bedrock. | After that turn's text and `toolUse` blocks. |
+
 Bedrock-specific constraints:
 
 | Constraint | Behaviour |
 |---|---|
-| **Max 4 cache points per request** | If more are requested, Ferrox keeps the **last 4** and logs the rest at `debug`. Caching is prefix-based, so a later breakpoint covers everything an earlier one would. System breakpoints come first in request order and are therefore dropped first. |
+| **Max 4 cache points per request** | Counted across all positions above. If more are requested, Ferrox keeps the **last 4** and logs the rest at `debug`. Caching is prefix-based, so a later breakpoint covers everything an earlier one would. The prefix order is tool definitions, then system, then messages, so a tool breakpoint is dropped first, then system breakpoints. |
 | **Supported model families** | `cachePoint` is emitted only for Anthropic Claude and Amazon Nova models. Other families reject the block outright, so an unrecognised model deliberately gets no cache points rather than a failed request. |
 | **TTL is fixed at 5 minutes** | Refreshed on each cache hit; not configurable. |
 | **Minimum cacheable prefix varies by family** | Below the minimum a `cachePoint` is a **silent no-op**, not an error — the request succeeds with no caching. Watch `ferrox_tokens_total{type="cache_write"}` to confirm caching is actually happening. |
