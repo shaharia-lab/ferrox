@@ -433,14 +433,50 @@ mod tests {
         let body = serde_json::to_value(build_request_body(&req, "kimi-k2", false)).unwrap();
         assert_eq!(
             body["messages"][0],
-            serde_json::json!({
-                "role": "user",
-                "content": "hi",
-                "name": null,
-                "tool_calls": null,
-                "tool_call_id": null
-            })
+            serde_json::json!({"role": "user", "content": "hi"})
         );
+    }
+
+    // ── Unset optional message fields are omitted, not sent as null (#159) ───
+
+    #[test]
+    fn minimal_user_message_omits_unset_optional_fields() {
+        // Groq and Google's OpenAI-compatible endpoint 400 on `"name": null`.
+        let body = openai_body_from_json(
+            r#"{"model":"m","max_tokens":10,"messages":[{"role":"user","content":"hi"}]}"#,
+        );
+        let message = body["messages"][0].as_object().unwrap();
+        for key in ["name", "tool_calls", "tool_call_id"] {
+            assert!(
+                !message.contains_key(key),
+                "unset {key} must be omitted, not sent as null: {message:?}"
+            );
+        }
+        assert_eq!(
+            body["messages"][0],
+            serde_json::json!({"role": "user", "content": "hi"})
+        );
+    }
+
+    #[test]
+    fn set_optional_message_fields_round_trip() {
+        let body = openai_body_from_json(
+            r#"{"model":"m","messages":[
+                {"role":"user","content":"hi","name":"alice"},
+                {"role":"assistant","content":null,"tool_calls":[
+                    {"id":"call_1","type":"function","function":{"name":"lookup","arguments":"{}"}}
+                ]},
+                {"role":"tool","content":"42","tool_call_id":"call_1"}
+            ]}"#,
+        );
+        assert_eq!(body["messages"][0]["name"], "alice");
+        assert_eq!(
+            body["messages"][1]["tool_calls"],
+            serde_json::json!([
+                {"id":"call_1","type":"function","function":{"name":"lookup","arguments":"{}"}}
+            ])
+        );
+        assert_eq!(body["messages"][2]["tool_call_id"], "call_1");
     }
 
     // ── Image parts, inbound JSON → outbound OpenAI body (#158) ──────────────
