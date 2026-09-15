@@ -8,6 +8,7 @@ mod db;
 mod error;
 mod handlers;
 mod middleware;
+mod openapi;
 mod state;
 mod ui;
 
@@ -97,11 +98,32 @@ async fn main() -> anyhow::Result<()> {
     // Runs every 60 seconds.
     budget::spawn_budget_checker(state.db.clone(), Duration::from_secs(60));
 
+    let app = build_router(state);
+
+    let addr = format!("0.0.0.0:{}", config.port);
+    let listener = TcpListener::bind(&addr)
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to bind {}: {}", addr, e))?;
+
+    info!(addr = %addr, "ferrox-cp listening");
+    axum::serve(listener, app)
+        .await
+        .map_err(|e| anyhow::anyhow!("server error: {}", e))
+}
+
+/// Build the full control-plane router: public routes, admin routes behind
+/// `CP_ADMIN_KEY`, and the embedded UI as the fallback.
+fn build_router(state: CpState) -> Router {
     // ── Public routes (no auth) ──────────────────────────────────────────────
     let public_routes = Router::new()
         .route("/.well-known/jwks.json", get(jwks_handler))
         .route("/token", post(token_handler))
-        .route("/healthz", get(health_handler));
+        .route("/healthz", get(health_handler))
+        // OpenAPI schema for the REST API. Cold, unauthenticated;
+        // `/openapi.json` is the auto-detected convention, `/api-schema` a
+        // friendly alias.
+        .route("/api-schema", get(schema_handler))
+        .route("/openapi.json", get(schema_handler));
 
     // ── Admin routes (CP_ADMIN_KEY required) ────────────────────────────────
     let admin_routes = Router::new()
@@ -122,21 +144,20 @@ async fn main() -> anyhow::Result<()> {
             require_admin_key,
         ));
 
-    let app = Router::new()
+    Router::new()
         .merge(public_routes)
         .merge(admin_routes)
         .fallback(ui::serve_spa)
-        .with_state(state);
+        .with_state(state)
+}
 
-    let addr = format!("0.0.0.0:{}", config.port);
-    let listener = TcpListener::bind(&addr)
-        .await
-        .map_err(|e| anyhow::anyhow!("failed to bind {}: {}", addr, e))?;
-
-    info!(addr = %addr, "ferrox-cp listening");
-    axum::serve(listener, app)
-        .await
-        .map_err(|e| anyhow::anyhow!("server error: {}", e))
+/// Serve the pre-built OpenAPI document as `application/json`. The body is
+/// cached (built once), so this route allocates nothing per request.
+async fn schema_handler() -> impl axum::response::IntoResponse {
+    (
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        openapi::openapi_json(),
+    )
 }
 
 /// Parse the 64 hex-character `CP_ENCRYPTION_KEY` into a 32-byte array.
@@ -204,6 +225,110 @@ async fn seed_signing_key(db: &sqlx::PgPool, encryption_key: &[u8; 32]) -> Resul
 mod tests {
     use super::*;
     use db::signing_key_repo::SigningKeyRepository;
+
+    use axum::body::Body;
+    use axum::http::{header, Request, StatusCode};
+    use tower::ServiceExt;
+
+    /// The full router over a lazy pool that never connects — testable without
+    /// a database for routes that answer before touching it.
+    fn router_without_db() -> Router {
+        build_router(CpState {
+            db: sqlx::PgPool::connect_lazy("postgres://unused@localhost/unused").unwrap(),
+            config: Arc::new(CpConfig {
+                database_url: String::new(),
+                cp_issuer: "https://ferrox-cp".to_string(),
+                cp_encryption_key: "0".repeat(64),
+                admin_key: "test-admin-key".to_string(),
+                port: 9090,
+            }),
+        })
+    }
+
+    /// Ties the schema's per-route security to the real router: every operation
+    /// the document marks as secured must exist and reject an unauthenticated
+    /// request (an unknown path would fall through to the UI with a 200).
+    #[tokio::test]
+    async fn secured_schema_operations_reject_unauthenticated_requests() {
+        let app = router_without_db();
+        let doc: serde_json::Value = serde_json::from_str(openapi::openapi_json()).unwrap();
+        let mut checked = 0;
+        for (path, item) in doc["paths"].as_object().unwrap() {
+            for (method, op) in item.as_object().unwrap() {
+                if op["security"].is_null() {
+                    continue;
+                }
+                let uri = path.replace("{id}", &uuid::Uuid::new_v4().to_string());
+                let resp = app
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .method(method.to_uppercase().as_str())
+                            .uri(&uri)
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let status = resp.status();
+                let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    status,
+                    StatusCode::UNAUTHORIZED,
+                    "{} {path} must require auth",
+                    method.to_uppercase()
+                );
+                let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(
+                    v["error"],
+                    "unauthorized",
+                    "{} {path}",
+                    method.to_uppercase()
+                );
+                checked += 1;
+            }
+        }
+        // 11 admin operations + `POST /token`.
+        assert_eq!(checked, 12);
+    }
+
+    #[tokio::test]
+    async fn schema_routes_serve_openapi_json_without_auth() {
+        let app = router_without_db();
+
+        for path in ["/api-schema", "/openapi.json"] {
+            let resp = app
+                .clone()
+                .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::OK,
+                "{path} should be public + 200"
+            );
+            let content_type = resp.headers()[header::CONTENT_TYPE].to_str().unwrap();
+            assert!(
+                content_type.starts_with("application/json"),
+                "{path} content-type was {content_type}"
+            );
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let doc: serde_json::Value = serde_json::from_slice(&body)
+                .unwrap_or_else(|e| panic!("{path} body must be JSON: {e}"));
+            assert!(
+                doc["openapi"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .starts_with("3."),
+                "{path} must be an OpenAPI 3.x document"
+            );
+            assert!(doc["paths"]["/api/clients"].is_object());
+        }
+    }
 
     #[test]
     fn parse_encryption_key_valid_hex() {

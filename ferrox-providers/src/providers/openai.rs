@@ -367,10 +367,10 @@ mod tests {
     }
 
     #[test]
-    fn system_cache_control_key_does_not_leak_to_openai_upstreams() {
-        // The hoisted system breakpoint is gateway-private; the `_` prefix is
-        // what keeps it out of the outbound body. Pin that explicitly, since a
-        // rename without the prefix would silently start leaking it.
+    fn hoisted_cache_control_keys_do_not_leak_to_openai_upstreams() {
+        // The hoisted system and tool breakpoints are gateway-private; the `_`
+        // prefix is what keeps them out of the outbound body. Pin that
+        // explicitly, since a rename without the prefix would silently leak.
         let mut req = ChatCompletionRequest {
             model: "m".to_string(),
             messages: vec![],
@@ -386,17 +386,22 @@ mod tests {
             raw_anthropic_body: None,
             extra: Default::default(),
         };
-        req.extra.insert(
-            crate::types::ANTHROPIC_SYSTEM_CACHE_CONTROL.to_string(),
-            serde_json::json!({"type": "ephemeral"}),
-        );
+        let keys = [
+            crate::types::ANTHROPIC_SYSTEM_CACHE_CONTROL,
+            crate::types::ANTHROPIC_TOOLS_CACHE_CONTROL,
+        ];
+        for key in keys {
+            req.extra
+                .insert(key.to_string(), serde_json::json!({"type": "ephemeral"}));
+        }
 
         let body = serde_json::to_value(build_request_body(&req, "kimi-k2", false)).unwrap();
-        assert!(
-            body.get(crate::types::ANTHROPIC_SYSTEM_CACHE_CONTROL)
-                .is_none(),
-            "gateway-private key leaked upstream: {body}"
-        );
+        for key in keys {
+            assert!(
+                body.get(key).is_none(),
+                "gateway-private key {key} leaked upstream: {body}"
+            );
+        }
     }
 
     #[test]
@@ -428,12 +433,122 @@ mod tests {
         let body = serde_json::to_value(build_request_body(&req, "kimi-k2", false)).unwrap();
         assert_eq!(
             body["messages"][0],
+            serde_json::json!({"role": "user", "content": "hi"})
+        );
+    }
+
+    // ── Unset optional message fields are omitted, not sent as null (#159) ───
+
+    #[test]
+    fn minimal_user_message_omits_unset_optional_fields() {
+        // Groq and Google's OpenAI-compatible endpoint 400 on `"name": null`.
+        let body = openai_body_from_json(
+            r#"{"model":"m","max_tokens":10,"messages":[{"role":"user","content":"hi"}]}"#,
+        );
+        let message = body["messages"][0].as_object().unwrap();
+        for key in ["name", "tool_calls", "tool_call_id"] {
+            assert!(
+                !message.contains_key(key),
+                "unset {key} must be omitted, not sent as null: {message:?}"
+            );
+        }
+        assert_eq!(
+            body["messages"][0],
+            serde_json::json!({"role": "user", "content": "hi"})
+        );
+    }
+
+    #[test]
+    fn set_optional_message_fields_round_trip() {
+        let body = openai_body_from_json(
+            r#"{"model":"m","messages":[
+                {"role":"user","content":"hi","name":"alice"},
+                {"role":"assistant","content":null,"tool_calls":[
+                    {"id":"call_1","type":"function","function":{"name":"lookup","arguments":"{}"}}
+                ]},
+                {"role":"tool","content":"42","tool_call_id":"call_1"}
+            ]}"#,
+        );
+        assert_eq!(body["messages"][0]["name"], "alice");
+        assert_eq!(
+            body["messages"][1]["tool_calls"],
+            serde_json::json!([
+                {"id":"call_1","type":"function","function":{"name":"lookup","arguments":"{}"}}
+            ])
+        );
+        assert_eq!(body["messages"][2]["tool_call_id"], "call_1");
+    }
+
+    // ── Image parts, inbound JSON → outbound OpenAI body (#158) ──────────────
+
+    fn openai_body_from_json(json: &str) -> Value {
+        let req: ChatCompletionRequest = serde_json::from_str(json).unwrap();
+        serde_json::to_value(build_request_body(&req, "glm-4.5v", false)).unwrap()
+    }
+
+    #[test]
+    fn image_part_survives_into_the_openai_body() {
+        let body = openai_body_from_json(
+            r#"{"model":"m","max_tokens":10,"messages":[{"role":"user","content":[
+                {"type":"text","text":"What colour is this?"},
+                {"type":"image_url","image_url":{"url":"data:image/jpeg;base64,AAAA"}}
+            ]}]}"#,
+        );
+        let part = &body["messages"][0]["content"][1];
+        assert_eq!(part["type"], "image_url");
+        assert_eq!(part["image_url"]["url"], "data:image/jpeg;base64,AAAA");
+        assert!(
+            part["image_url"].get("detail").is_none(),
+            "unset detail must be omitted, not sent as null: {part}"
+        );
+    }
+
+    #[test]
+    fn url_image_part_survives_into_the_openai_body() {
+        let body = openai_body_from_json(
+            r#"{"model":"m","messages":[{"role":"user","content":[
+                {"type":"text","text":"What is this?"},
+                {"type":"image_url","image_url":{"url":"https://example.com/a.png"}}
+            ]}]}"#,
+        );
+        assert_eq!(
+            body["messages"][0]["content"][1]["image_url"],
+            serde_json::json!({"url": "https://example.com/a.png"})
+        );
+    }
+
+    #[test]
+    fn client_supplied_image_detail_round_trips() {
+        let body = openai_body_from_json(
+            r#"{"model":"m","messages":[{"role":"user","content":[
+                {"type":"image_url","image_url":{"url":"https://example.com/a.png","detail":"high"}}
+            ]}]}"#,
+        );
+        assert_eq!(
+            body["messages"][0]["content"][0]["image_url"],
+            serde_json::json!({"url": "https://example.com/a.png", "detail": "high"})
+        );
+    }
+
+    /// `/anthropic/v1/messages` routed to a `type: openai` provider: the native
+    /// image block is rebuilt as an `image_url` part carrying a `data:` URL.
+    #[test]
+    fn anthropic_native_image_block_reaches_the_openai_body() {
+        let anthropic: crate::anthropic_types::AnthropicMessagesRequest = serde_json::from_str(
+            r#"{"model":"m","max_tokens":10,"messages":[{"role":"user","content":[
+                {"type":"text","text":"What colour is this?"},
+                {"type":"image","source":{"type":"base64","media_type":"image/jpeg","data":"AAAA"}}
+            ]}]}"#,
+        )
+        .unwrap();
+        let req = crate::anthropic_types::to_chat_completion_request(anthropic);
+
+        let body = serde_json::to_value(build_request_body(&req, "k3", false)).unwrap();
+        assert_eq!(
+            body["messages"][0]["content"][1],
             serde_json::json!({
-                "role": "user",
-                "content": "hi",
-                "name": null,
-                "tool_calls": null,
-                "tool_call_id": null
+                "type": "image_url",
+                "image_url": {"url": "data:image/jpeg;base64,AAAA"}
             })
         );
     }

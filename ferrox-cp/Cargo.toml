@@ -42,6 +42,9 @@ base64 = "0.22"
 # HTTP server
 axum = "0.7"
 tower = { version = "0.5", features = ["util"] }
+# OpenAPI schema generation for the REST API (served at /api-schema).
+# `chrono` + `uuid` let `ToSchema` model the DateTime/Uuid fields directly.
+utoipa = { version = "4", features = ["axum_extras", "chrono", "uuid"] }
 # bcrypt for API key verification
 bcrypt = "0.15"
 # Tracing

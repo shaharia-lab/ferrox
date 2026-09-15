@@ -348,10 +348,17 @@ Each event is sent as an HTTP POST with `Content-Type: application/json` and `Au
   "prompt_tokens": 120,
   "completion_tokens": 80,
   "total_tokens": 200,
+  "cache_read_tokens": 3968,
+  "cache_write_tokens": 100,
   "latency_ms": 843,
   "timestamp": "2026-04-06T15:36:12.471Z"
 }
 ```
+
+`cache_read_tokens` and `cache_write_tokens` are prompt-cache counters, reported
+separately from `prompt_tokens`. Each is **omitted entirely** when the provider
+reported no usage of that kind, so payloads for non-caching requests are
+unchanged.
 
 The `request_id` field is unique per request and can be used for idempotent processing on the receiver side.
 

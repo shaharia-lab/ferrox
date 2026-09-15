@@ -21,6 +21,12 @@ pub struct TokenUsageEvent {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
     pub total_tokens: u32,
+    /// Prompt-cache counters. Omitted when the provider reported no cache
+    /// usage, so non-caching payloads stay byte-identical.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_read_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_write_tokens: Option<u32>,
     pub latency_ms: Option<u64>,
     pub timestamp: DateTime<Utc>,
 }
@@ -227,6 +233,8 @@ mod tests {
             prompt_tokens: 100,
             completion_tokens: 50,
             total_tokens: 150,
+            cache_read_tokens: None,
+            cache_write_tokens: None,
             latency_ms: Some(200),
             timestamp: Utc::now(),
         }
@@ -251,6 +259,8 @@ mod tests {
             prompt_tokens: 120,
             completion_tokens: 80,
             total_tokens: 200,
+            cache_read_tokens: None,
+            cache_write_tokens: None,
             latency_ms: Some(843),
             timestamp: Utc::now(),
         };
@@ -260,6 +270,47 @@ mod tests {
         assert_eq!(json["key_name"], "my-app");
         // client_id should be absent when None
         assert!(json.get("client_id").is_none());
+    }
+
+    #[tokio::test]
+    async fn serialization_omits_cache_counters_when_absent() {
+        let json = serde_json::to_value(sample_event()).unwrap();
+        let mut keys: Vec<&str> = json
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        // Exactly the pre-cache-counter key set: no new keys, no nulls.
+        assert_eq!(
+            keys,
+            [
+                "client_id",
+                "completion_tokens",
+                "event",
+                "key_name",
+                "latency_ms",
+                "model",
+                "prompt_tokens",
+                "provider",
+                "request_id",
+                "timestamp",
+                "total_tokens",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn serialization_includes_cache_counters_when_present() {
+        let event = TokenUsageEvent {
+            cache_read_tokens: Some(3968),
+            cache_write_tokens: Some(100),
+            ..sample_event()
+        };
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(json["cache_read_tokens"], 3968);
+        assert_eq!(json["cache_write_tokens"], 100);
     }
 
     #[tokio::test]

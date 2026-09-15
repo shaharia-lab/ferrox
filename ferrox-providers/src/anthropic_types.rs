@@ -117,6 +117,9 @@ pub struct AnthropicTool {
     pub description: Option<String>,
     /// JSON Schema object describing the tool's input.
     pub input_schema: serde_json::Value,
+    /// Prompt-cache breakpoint: caches the tool definitions up to this one.
+    #[serde(default)]
+    pub cache_control: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -232,16 +235,24 @@ pub fn to_chat_completion_request(req: AnthropicMessagesRequest) -> ChatCompleti
 
     let messages = anthropic_messages_to_internal(req.messages);
 
+    // Internal tools carry no per-tool attributes either, so a tool breakpoint is
+    // hoisted the same way as the system one (last wins, for the same reason).
+    let mut tools_cache_control: Option<serde_json::Value> = None;
     let tools = req.tools.map(|tools| {
         tools
             .into_iter()
-            .map(|t| Tool {
-                r#type: "function".to_string(),
-                function: ToolFunction {
-                    name: t.name,
-                    description: t.description,
-                    parameters: Some(t.input_schema),
-                },
+            .map(|t| {
+                if t.cache_control.is_some() {
+                    tools_cache_control = t.cache_control;
+                }
+                Tool {
+                    r#type: "function".to_string(),
+                    function: ToolFunction {
+                        name: t.name,
+                        description: t.description,
+                        parameters: Some(t.input_schema),
+                    },
+                }
             })
             .collect()
     });
@@ -285,6 +296,9 @@ pub fn to_chat_completion_request(req: AnthropicMessagesRequest) -> ChatCompleti
     }
     if let Some(cc) = system_cache_control {
         extra.insert(crate::types::ANTHROPIC_SYSTEM_CACHE_CONTROL.to_string(), cc);
+    }
+    if let Some(cc) = tools_cache_control {
+        extra.insert(crate::types::ANTHROPIC_TOOLS_CACHE_CONTROL.to_string(), cc);
     }
 
     ChatCompletionRequest {
@@ -1288,6 +1302,7 @@ mod tests {
             name: "search".to_string(),
             description: Some("Search the web".to_string()),
             input_schema: serde_json::json!({"type": "object", "properties": {"q": {"type": "string"}}}),
+            cache_control: None,
         }]);
         let out = to_chat_completion_request(req);
         let tools = out.tools.unwrap();
@@ -1575,6 +1590,35 @@ mod tests {
     }
 
     #[test]
+    fn cache_control_on_tool_definition_is_hoisted_to_request_extra() {
+        // Internal tools are OpenAI-shaped and have no per-tool attributes.
+        let json = r#"{"model":"m","max_tokens":10,
+            "tools":[
+                {"name":"a","input_schema":{"type":"object"}},
+                {"name":"b","input_schema":{"type":"object"},"cache_control":{"type":"ephemeral"}}
+            ],
+            "messages":[{"role":"user","content":"hi"}]}"#;
+        let req: AnthropicMessagesRequest = serde_json::from_str(json).unwrap();
+        let internal = to_chat_completion_request(req);
+
+        assert_eq!(internal.tools.as_ref().map(Vec::len), Some(2));
+        assert_eq!(
+            internal.extra[crate::types::ANTHROPIC_TOOLS_CACHE_CONTROL],
+            serde_json::json!({"type":"ephemeral"})
+        );
+    }
+
+    #[test]
+    fn tools_without_cache_control_add_no_request_extra() {
+        let json = r#"{"model":"m","max_tokens":10,
+            "tools":[{"name":"a","input_schema":{"type":"object"}}],
+            "messages":[{"role":"user","content":"hi"}]}"#;
+        let req: AnthropicMessagesRequest = serde_json::from_str(json).unwrap();
+        let internal = to_chat_completion_request(req);
+        assert!(internal.extra.is_empty());
+    }
+
+    #[test]
     fn system_without_cache_control_adds_no_request_extra() {
         let json = r#"{"model":"m","max_tokens":10,
             "system":[{"type":"text","text":"You are helpful."}],
@@ -1665,6 +1709,26 @@ mod tests {
                 );
                 assert!(parts.iter().any(|p| matches!(p, ContentPart::Text { .. })));
             }
+            other => panic!("expected multimodal Parts, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn url_image_block_is_preserved_as_image_url_part() {
+        let json = r#"{"model":"m","max_tokens":10,"messages":[{"role":"user","content":[
+            {"type":"text","text":"what is this?"},
+            {"type":"image","source":{"type":"url","url":"https://example.com/a.png"}}
+        ]}]}"#;
+        let req: AnthropicMessagesRequest = serde_json::from_str(json).unwrap();
+        let internal = to_chat_completion_request(req);
+        match internal.messages[0].content.as_ref().unwrap() {
+            MessageContent::Parts(parts) => match &parts[1] {
+                ContentPart::ImageUrl { image_url, .. } => {
+                    assert_eq!(image_url.url, "https://example.com/a.png");
+                    assert!(image_url.detail.is_none());
+                }
+                other => panic!("expected an image_url part, got {other:?}"),
+            },
             other => panic!("expected multimodal Parts, got {other:?}"),
         }
     }

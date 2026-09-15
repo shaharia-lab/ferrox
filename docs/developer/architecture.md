@@ -260,8 +260,10 @@ The gateway serves its own OpenAPI 3.x document (built at compile time by
 `utoipa` from `#[utoipa::path]` handler annotations and `ToSchema` types) from a
 cold, unauthenticated `GET /api-schema` (alias `GET /openapi.json`) — the only
 API-discovery surface for gateway-only deployments. The committed
-`ferrox/openapi.json` snapshot is drift-guarded by a test. The control-plane's
-REST API is tracked separately for its own schema.
+`ferrox/openapi.json` snapshot is drift-guarded by a test. The control plane
+does the same for its REST API: `ferrox-cp/src/openapi.rs` serves a fully
+modeled document at `GET /api-schema` (alias `GET /openapi.json`), with the
+committed `ferrox-cp/openapi.json` snapshot drift-guarded the same way.
 
 ---
 

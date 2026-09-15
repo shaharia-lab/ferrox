@@ -4,12 +4,13 @@ use axum::response::IntoResponse;
 use axum::Json;
 use serde::Serialize;
 use tracing::error;
+use utoipa::ToSchema;
 
 use crate::crypto::jwks::{public_key_to_jwk, Jwk};
 use crate::db::signing_key_repo::SigningKeyRepository;
 use crate::state::CpState;
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct JwksResponse {
     pub keys: Vec<Jwk>,
 }
@@ -19,6 +20,15 @@ pub struct JwksResponse {
 /// Returns all active RSA public keys in JWKS format (RFC 7517).
 /// No authentication required — this endpoint is called by the gateway.
 /// Response is cacheable for 5 minutes via `Cache-Control: max-age=300`.
+#[utoipa::path(
+    get,
+    path = "/.well-known/jwks.json",
+    tag = "Auth",
+    responses(
+        (status = 200, description = "Active RSA public keys (RFC 7517 JWKS), cacheable for 5 minutes", body = JwksResponse),
+        (status = 500, description = "Keys could not be loaded; empty key set, not cacheable", body = JwksResponse),
+    )
+)]
 pub async fn jwks_handler(State(state): State<CpState>) -> impl IntoResponse {
     let repo = SigningKeyRepository::new(&state.db);
 
