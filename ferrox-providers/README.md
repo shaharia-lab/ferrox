@@ -17,7 +17,7 @@ places.
 
 ```toml
 [dependencies]
-ferrox-providers = { git = "https://github.com/shaharia-lab/ferrox", tag = "providers-v0.1.0",
+ferrox-providers = { git = "https://github.com/shaharia-lab/ferrox", tag = "providers-v0.2.0",
                      default-features = false, features = ["anthropic", "openai"] }
 ```
 
@@ -27,7 +27,9 @@ repo — Cargo resolves that automatically, no separate repository needed.
 
 `providers-v0.1.0` is the first tagged reference point, cut once the crate's
 public surface stopped moving (framework-free SSE frames in #148, framework-free
-error bodies in #149). It is a plain git tag, **not** a GitHub Release, and it is
+error bodies in #149). `providers-v0.2.0` follows with Bedrock `cachePoint`
+support, Gemini implicit-cache token reporting, and image-part/ChatMessage
+serialization fixes. It is a plain git tag, **not** a GitHub Release, and it is
 versioned independently of Ferrox's own `v*` gateway releases.
 
 The crate is not on crates.io yet, so a git dependency is the only way to consume
