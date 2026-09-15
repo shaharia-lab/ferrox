@@ -67,8 +67,13 @@ impl ChatCompletionRequest {
 pub struct ChatMessage {
     pub role: String,
     pub content: Option<MessageContent>,
+    /// Omitted when unset: strict OpenAI-compatible upstreams (Groq, Google)
+    /// 400 on an explicit `"name": null` (#159).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCall>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
     /// Chain-of-thought / extended-thinking text. Reasoning models on
     /// OpenAI-compatible APIs (Kimi, GLM, DeepSeek) return this alongside
