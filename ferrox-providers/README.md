@@ -149,7 +149,9 @@ with `output_config.effort` on Claude 4.6+ (thinking summaries requested on
 (room for thinking is added to `max_tokens` only when the client set none, or
 one too small for the 1024 minimum),
 nothing for older Claude, non-Claude upstreams (GLM, Kimi) or unparsed ids —
-and then drops `temperature` and a `top_p` below 0.95 and downgrades a forced
+and then drops `temperature` and a `top_p` below 0.95 (any `top_p` on 4.7+),
+skips manual thinking on a tool-call turn it has no thinking block to replay
+for, and downgrades a forced
 `tool_choice` to `auto`, which Anthropic requires alongside thinking. An
 explicit `_anthropic_thinking` wins. A `reasoning` item whose `encrypted_content`
 Ferrox encoded is replayed as a signed `thinking` block at the start of the
@@ -184,7 +186,7 @@ before any event becomes a bare `error` event. With the `axum` feature,
 `responses_stream_to_sse` is the axum adapter. An adapter that puts an Anthropic
 thinking signature on `_anthropic_thinking_signature` (message / chunk-choice
 `extra`) gets it back as the reasoning item's `encrypted_content`. The Anthropic
-adapter (and Bedrock's, which shares the stream parser) does: from each
+adapter does: from each
 streamed `signature_delta`, and from a non-streaming response with exactly one
 signed thinking block (several blocks are joined into one reasoning text that
 no single signature verifies).

@@ -199,6 +199,9 @@ struct AnthropicExtras {
     /// `tool_choice`) are dropped. A client-supplied `_anthropic_thinking` is
     /// forwarded with the request as the client wrote it.
     derived_thinking: bool,
+    /// Drop `top_p` whatever its value (Claude 4.7+). Otherwise derived
+    /// thinking only drops a `top_p` below 0.95.
+    drop_top_p: bool,
 }
 
 #[derive(Serialize, Clone)]
@@ -291,8 +294,40 @@ fn extract_anthropic_extras(req: &ChatCompletionRequest, model_id: &str) -> Anth
     req.extra
         .get("reasoning_effort")
         .and_then(Value::as_str)
-        .map(|effort| thinking_for_effort(effort, model_id, req.max_tokens))
+        .map(|effort| thinking_for_effort(effort, model_id, req))
         .unwrap_or_default()
+}
+
+/// Whether the last assistant turn made tool calls with no thinking block to
+/// replay in front of it. Manual thinking requires that turn to start with
+/// one, so it cannot be switched on for such a request — a Chat Completions
+/// tool loop never has one, and a Responses one only when a signature came
+/// back for it.
+fn tool_turn_without_thinking(req: &ChatCompletionRequest) -> bool {
+    let Some((index, last)) = req
+        .messages
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, m)| m.role == "assistant")
+    else {
+        return false;
+    };
+    if last
+        .tool_calls
+        .as_ref()
+        .is_none_or(|calls| calls.is_empty())
+    {
+        return false;
+    }
+    let replayed = match req.extra.get(RESPONSES_ANTHROPIC_THINKING_BLOCKS) {
+        Some(Value::Array(blocks)) => blocks.iter().any(|b| {
+            b.get("message_index").and_then(Value::as_u64) == Some(index as u64)
+                && b.get("signature").and_then(Value::as_str).is_some()
+        }),
+        _ => false,
+    };
+    !replayed
 }
 
 /// How a model takes extended thinking.
@@ -372,7 +407,12 @@ fn thinking_budget(effort: &str) -> Option<u32> {
 /// Map an OpenAI-style `reasoning_effort` to Anthropic thinking for
 /// `model_id`. `none`, unknown values and models without derived thinking
 /// leave the request as it was.
-fn thinking_for_effort(effort: &str, model_id: &str, max_tokens: Option<u32>) -> AnthropicExtras {
+fn thinking_for_effort(
+    effort: &str,
+    model_id: &str,
+    req: &ChatCompletionRequest,
+) -> AnthropicExtras {
+    let max_tokens = req.max_tokens;
     let Some(style) = thinking_style(model_id) else {
         return AnthropicExtras::default();
     };
@@ -399,8 +439,11 @@ fn thinking_for_effort(effort: &str, model_id: &str, max_tokens: Option<u32>) ->
                 // is likely to think.
                 max_tokens: max_tokens.is_none().then_some(DEFAULT_MAX_TOKENS + budget),
                 derived_thinking: true,
+                // 4.7+ rejects `top_p` outright; 4.6 accepts 0.95–1 while thinking.
+                drop_top_p: since_4_7,
             }
         }
+        ThinkingStyle::Manual if tool_turn_without_thinking(req) => AnthropicExtras::default(),
         ThinkingStyle::Manual => {
             // `max_tokens` covers thinking and answer together, and the budget
             // must stay below it. Without a client limit the default answer
@@ -418,6 +461,7 @@ fn thinking_for_effort(effort: &str, model_id: &str, max_tokens: Option<u32>) ->
                 output_config: None,
                 max_tokens: Some(max_tokens),
                 derived_thinking: true,
+                drop_top_p: false,
             }
         }
     }
@@ -594,9 +638,11 @@ fn build_request_body(
             .unwrap_or(DEFAULT_MAX_TOKENS),
         stream: if stream { Some(true) } else { None },
         // While thinking, `temperature` must be left at its default and
-        // `top_p` must be at least 0.95.
+        // `top_p` must be at least 0.95 (and absent on 4.7+).
         temperature: req.temperature.filter(|_| !extras.derived_thinking),
-        top_p: req.top_p.filter(|p| !extras.derived_thinking || *p >= 0.95),
+        top_p: req
+            .top_p
+            .filter(|p| !extras.drop_top_p && (!extras.derived_thinking || *p >= 0.95)),
         stop_sequences,
         tools,
         tool_choice,
@@ -1458,7 +1504,7 @@ mod tests {
     fn derived_thinking_drops_temperature_and_forced_tool_choice() {
         let tools = serde_json::json!([{"type": "function", "function": {"name": "f",
             "parameters": {"type": "object", "properties": {}}}}]);
-        for model in ["claude-opus-4-7", "claude-haiku-4-5"] {
+        for model in ["claude-opus-4-7", "claude-sonnet-4-6", "claude-haiku-4-5"] {
             for forced in [
                 serde_json::json!("required"),
                 serde_json::json!({"type": "function", "function": {"name": "f"}}),
@@ -1477,8 +1523,10 @@ mod tests {
                     "{model}: {forced}"
                 );
             }
-            // `top_p` below 0.95 is rejected while thinking; at or above, kept.
-            for (top_p, kept) in [(0.5, false), (0.95, true), (1.0, true)] {
+            // `top_p` below 0.95 is rejected while thinking, and any `top_p`
+            // on 4.7+.
+            let since_4_7 = model == "claude-opus-4-7";
+            for (top_p, kept) in [(0.5, false), (0.95, !since_4_7), (1.0, !since_4_7)] {
                 let body = body_for(
                     serde_json::json!({"model": "a", "reasoning_effort": "low", "top_p": top_p,
                         "messages": [{"role": "user", "content": "hi"}]}),
@@ -1504,6 +1552,42 @@ mod tests {
         assert!(body.get("temperature").is_some());
         assert!(body.get("top_p").is_some());
         assert_eq!(body["tool_choice"], serde_json::json!({"type": "any"}));
+    }
+
+    #[test]
+    fn manual_thinking_skips_a_tool_turn_with_no_thinking_to_replay() {
+        // A Chat Completions tool loop: the assistant turn cannot start with a
+        // thinking block, which manual thinking requires.
+        let tool_loop = |model: &str| {
+            body_for(
+                serde_json::json!({"model": "a", "reasoning_effort": "high", "messages": [
+                    {"role": "user", "content": "hi"},
+                    {"role": "assistant", "content": null, "tool_calls": [{"id": "c1",
+                        "type": "function", "function": {"name": "f", "arguments": "{}"}}]},
+                    {"role": "tool", "tool_call_id": "c1", "content": "42"}
+                ]}),
+                model,
+            )
+        };
+        let body = tool_loop("claude-sonnet-4-5");
+        assert!(body.get("thinking").is_none());
+        assert_eq!(body["max_tokens"], DEFAULT_MAX_TOKENS);
+        // Adaptive thinking has no such rule.
+        assert_eq!(tool_loop("claude-opus-4-7")["thinking"]["type"], "adaptive");
+
+        // A finished tool loop (the last assistant turn is plain text) is fine.
+        let body = body_for(
+            serde_json::json!({"model": "a", "reasoning_effort": "high", "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": null, "tool_calls": [{"id": "c1",
+                    "type": "function", "function": {"name": "f", "arguments": "{}"}}]},
+                {"role": "tool", "tool_call_id": "c1", "content": "42"},
+                {"role": "assistant", "content": "done"},
+                {"role": "user", "content": "thanks"}
+            ]}),
+            "claude-sonnet-4-5",
+        );
+        assert_eq!(body["thinking"]["type"], "enabled");
     }
 
     #[test]
