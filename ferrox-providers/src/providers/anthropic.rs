@@ -308,25 +308,26 @@ enum ThinkingStyle {
         /// for explicitly.
         omits_display: bool,
     },
-    /// `{"type":"enabled","budget_tokens":N}` with `N < max_tokens` — older
-    /// Claude models, and other Anthropic-protocol upstreams (e.g. GLM).
+    /// `{"type":"enabled","budget_tokens":N}` with `N < max_tokens`
+    /// (Claude 3.7 up to 4.5).
     Manual,
 }
 
-/// Classify a model id by the thinking style it accepts.
+/// Classify a model id by the thinking style it accepts, or `None` when it
+/// takes no derived thinking.
 ///
 /// Understands first-party (`claude-opus-4-7`, `claude-3-7-sonnet-20250219`),
 /// Bedrock (`us.anthropic.claude-sonnet-4-6-v1:0`) and Vertex
 /// (`claude-opus-4-5@20251101`) ids. The version is the first one- or
 /// two-digit number and the one right after it, so a date suffix is never
 /// read as a minor version. Families newer than Opus (`fable`, `mythos`) and
-/// any Claude 4.7+ are adaptive; anything unrecognised gets manual thinking,
-/// the form every Anthropic-protocol upstream understands.
-fn thinking_style(model_id: &str) -> ThinkingStyle {
+/// any Claude 4.7+ are adaptive. Claude before 3.7 has no extended thinking,
+/// and non-Claude models behind this adapter (Z.AI GLM, Kimi) or ids that do
+/// not parse get `None`: never inventing thinking is the one choice that
+/// cannot turn a working request into a 400.
+fn thinking_style(model_id: &str) -> Option<ThinkingStyle> {
     let lower = model_id.to_ascii_lowercase();
-    let Some(rest) = lower.split_once("claude-").map(|(_, r)| r) else {
-        return ThinkingStyle::Manual;
-    };
+    let (_, rest) = lower.split_once("claude-")?;
     let mut tokens = rest.split(['-', '@', ':', '.']).peekable();
     let mut version: Option<(u32, u32)> = None;
     let mut modern_family = false;
@@ -350,10 +351,11 @@ fn thinking_style(model_id: &str) -> ThinkingStyle {
         omits_display: xhigh,
     };
     match version {
-        _ if modern_family => adaptive(true),
-        Some(v) if v >= (4, 7) => adaptive(true),
-        Some(v) if v >= (4, 6) => adaptive(false),
-        _ => ThinkingStyle::Manual,
+        _ if modern_family => Some(adaptive(true)),
+        Some(v) if v >= (4, 7) => Some(adaptive(true)),
+        Some(v) if v >= (4, 6) => Some(adaptive(false)),
+        Some(v) if v >= (3, 7) => Some(ThinkingStyle::Manual),
+        _ => None,
     }
 }
 
@@ -361,23 +363,22 @@ fn thinking_style(model_id: &str) -> ThinkingStyle {
 fn manual_budget(effort: &str) -> Option<u32> {
     match effort {
         "minimal" | "low" => Some(1024),
-        "medium" => Some(2048),
-        "high" => Some(4096),
-        "xhigh" | "max" => Some(8192),
+        "medium" => Some(4096),
+        "high" | "xhigh" | "max" => Some(16384),
         _ => None,
     }
 }
 
-const MIN_THINKING_BUDGET: u32 = 1024;
-
 /// Map an OpenAI-style `reasoning_effort` to Anthropic thinking for
-/// `model_id`. `none` and unknown values leave thinking off.
+/// `model_id`. `none`, unknown values and models without derived thinking
+/// leave the request as it was.
 fn thinking_for_effort(effort: &str, model_id: &str, max_tokens: Option<u32>) -> AnthropicExtras {
     match thinking_style(model_id) {
-        ThinkingStyle::Adaptive {
+        None => AnthropicExtras::default(),
+        Some(ThinkingStyle::Adaptive {
             xhigh,
             omits_display,
-        } => {
+        }) => {
             let level = match effort {
                 "minimal" | "low" => "low",
                 "medium" => "medium",
@@ -399,21 +400,16 @@ fn thinking_for_effort(effort: &str, model_id: &str, max_tokens: Option<u32>) ->
                 derived_thinking: true,
             }
         }
-        ThinkingStyle::Manual => {
+        Some(ThinkingStyle::Manual) => {
             let Some(budget) = manual_budget(effort) else {
                 return AnthropicExtras::default();
             };
-            // The budget has to fit below `max_tokens`. With no client limit,
-            // make room for it on top of the default answer length; with one,
-            // shrink the budget, and skip thinking when even the minimum
-            // does not fit.
-            let (budget, max_tokens) = match max_tokens {
-                None => (budget, DEFAULT_MAX_TOKENS + budget),
-                Some(max) => (budget.min(max.saturating_sub(1)), max),
-            };
-            if budget < MIN_THINKING_BUDGET {
-                return AnthropicExtras::default();
-            }
+            // `max_tokens` covers thinking and answer together, and the budget
+            // must stay below it. A limit that already leaves at least half
+            // for the answer is kept; a smaller one is raised by the budget so
+            // the answer keeps the room the client asked for.
+            let max = max_tokens.unwrap_or(DEFAULT_MAX_TOKENS);
+            let max_tokens = if budget <= max / 2 { max } else { max + budget };
             AnthropicExtras {
                 thinking: Some(serde_json::json!({"type": "enabled", "budget_tokens": budget})),
                 output_config: None,
@@ -575,15 +571,13 @@ fn build_request_body(
         .as_ref()
         .map(openai_tool_choice_to_anthropic);
     if extras.derived_thinking {
-        // Anthropic rejects a forced tool choice while thinking; fall back to
-        // its default (`auto`).
-        let forced = tool_choice
-            .as_ref()
-            .and_then(|tc| tc.get("type"))
-            .and_then(Value::as_str)
-            .is_some_and(|t| t == "any" || t == "tool");
-        if forced {
-            tool_choice = None;
+        // Anthropic rejects a forced tool choice while thinking; downgrade it
+        // to `auto`, keeping any other setting (`disable_parallel_tool_use`).
+        if let Some(Value::Object(tc)) = tool_choice.as_mut() {
+            if matches!(tc.get("type").and_then(Value::as_str), Some("any" | "tool")) {
+                tc.insert("type".to_string(), Value::from("auto"));
+                tc.remove("name");
+            }
         }
     }
 
@@ -596,9 +590,10 @@ fn build_request_body(
             .or(req.max_tokens)
             .unwrap_or(DEFAULT_MAX_TOKENS),
         stream: if stream { Some(true) } else { None },
-        // `temperature` must be left at its default while thinking.
+        // While thinking, `temperature` must be left at its default and
+        // `top_p` must be at least 0.95.
         temperature: req.temperature.filter(|_| !extras.derived_thinking),
-        top_p: req.top_p,
+        top_p: req.top_p.filter(|p| !extras.derived_thinking || *p >= 0.95),
         stop_sequences,
         tools,
         tool_choice,
@@ -1311,14 +1306,15 @@ mod tests {
 
     #[test]
     fn thinking_style_per_model_family() {
-        let adaptive_new = ThinkingStyle::Adaptive {
+        let adaptive_new = Some(ThinkingStyle::Adaptive {
             xhigh: true,
             omits_display: true,
-        };
-        let adaptive_46 = ThinkingStyle::Adaptive {
+        });
+        let adaptive_46 = Some(ThinkingStyle::Adaptive {
             xhigh: false,
             omits_display: false,
-        };
+        });
+        let manual = Some(ThinkingStyle::Manual);
         let cases = [
             ("claude-opus-4-7", &adaptive_new),
             ("claude-opus-4-8", &adaptive_new),
@@ -1330,16 +1326,46 @@ mod tests {
             ("us.anthropic.claude-opus-4-7-v1:0", &adaptive_new),
             ("claude-opus-4-6", &adaptive_46),
             ("claude-sonnet-4-6", &adaptive_46),
-            ("anthropic.claude-sonnet-4-6", &adaptive_46),
-            ("claude-haiku-4-5-20251001", &ThinkingStyle::Manual),
-            ("claude-opus-4-5@20251101", &ThinkingStyle::Manual),
+            ("eu.anthropic.claude-sonnet-4-6", &adaptive_46),
+            ("claude-sonnet-4-5", &manual),
+            ("claude-haiku-4-5-20251001", &manual),
+            ("claude-opus-4-5@20251101", &manual),
             // A date suffix is not a minor version.
-            ("claude-opus-4-20250514", &ThinkingStyle::Manual),
-            ("claude-3-7-sonnet-20250219", &ThinkingStyle::Manual),
-            ("glm-4.6", &ThinkingStyle::Manual),
+            ("claude-opus-4-20250514", &manual),
+            ("claude-3-7-sonnet-20250219", &manual),
+            // Before 3.7 there is no extended thinking.
+            ("claude-3-5-haiku-20241022", &None),
+            ("claude-3-haiku-20240307", &None),
+            // Non-Claude upstreams and ids that do not parse.
+            ("glm-4.6", &None),
+            ("glm-5.1", &None),
+            ("kimi-k2", &None),
+            ("kimi-for-coding", &None),
+            ("claude-latest", &None),
         ];
         for (model, want) in cases {
             assert_eq!(&thinking_style(model), want, "{model}");
+        }
+    }
+
+    #[test]
+    fn effort_on_non_claude_models_changes_nothing() {
+        let tools = serde_json::json!([{"type": "function", "function": {"name": "f",
+            "parameters": {"type": "object", "properties": {}}}}]);
+        for model in ["glm-4.6", "kimi-k2", "claude-3-5-haiku-20241022"] {
+            let body = body_for(
+                serde_json::json!({"model": "a", "reasoning_effort": "high",
+                    "temperature": 0.2, "top_p": 0.5, "tools": tools,
+                    "tool_choice": "required",
+                    "messages": [{"role": "user", "content": "hi"}]}),
+                model,
+            );
+            assert!(body.get("thinking").is_none(), "{model}");
+            assert!(body.get("output_config").is_none(), "{model}");
+            assert_eq!(body["max_tokens"], DEFAULT_MAX_TOKENS, "{model}");
+            assert!(body.get("temperature").is_some(), "{model}");
+            assert_eq!(body["top_p"], 0.5, "{model}");
+            assert_eq!(body["tool_choice"], serde_json::json!({"type": "any"}));
         }
     }
 
@@ -1377,33 +1403,39 @@ mod tests {
 
     #[test]
     fn effort_on_older_models_is_a_manual_budget_below_max_tokens() {
-        let body = effort_body("claude-haiku-4-5", "high");
-        assert_eq!(
-            body["thinking"],
-            serde_json::json!({"type": "enabled", "budget_tokens": 4096})
-        );
-        assert!(body.get("output_config").is_none());
-        // No client limit: room is made for the budget on top of the default.
-        assert_eq!(body["max_tokens"], DEFAULT_MAX_TOKENS + 4096);
+        // No client limit: the default is kept while it leaves half for the
+        // answer, else the budget is added on top.
+        for (effort, budget, max) in [
+            ("low", 1024, DEFAULT_MAX_TOKENS),
+            ("medium", 4096, DEFAULT_MAX_TOKENS + 4096),
+            ("high", 16384, DEFAULT_MAX_TOKENS + 16384),
+        ] {
+            let body = effort_body("claude-sonnet-4-5", effort);
+            assert_eq!(
+                body["thinking"],
+                serde_json::json!({"type": "enabled", "budget_tokens": budget})
+            );
+            assert!(body.get("output_config").is_none());
+            assert_eq!(body["max_tokens"], max, "{effort}");
+        }
 
-        // A client limit is kept and the budget shrinks below it.
+        // A limit that leaves at least half for the answer is kept.
         let body = body_for(
-            serde_json::json!({"model": "a", "reasoning_effort": "xhigh", "max_tokens": 3000,
+            serde_json::json!({"model": "a", "reasoning_effort": "high", "max_tokens": 64000,
                 "messages": [{"role": "user", "content": "hi"}]}),
             "claude-3-7-sonnet-20250219",
         );
-        assert_eq!(body["thinking"]["budget_tokens"], 2999);
-        assert_eq!(body["max_tokens"], 3000);
+        assert_eq!(body["thinking"]["budget_tokens"], 16384);
+        assert_eq!(body["max_tokens"], 64000);
 
-        // Even the 1024 minimum does not fit: no thinking at all.
+        // A small one is raised by the budget, never shrinking the answer.
         let body = body_for(
-            serde_json::json!({"model": "a", "reasoning_effort": "low", "max_tokens": 1024,
-                "temperature": 0.3, "messages": [{"role": "user", "content": "hi"}]}),
+            serde_json::json!({"model": "a", "reasoning_effort": "low", "max_tokens": 1000,
+                "messages": [{"role": "user", "content": "hi"}]}),
             "claude-haiku-4-5",
         );
-        assert!(body.get("thinking").is_none());
-        assert_eq!(body["max_tokens"], 1024);
-        assert!(body.get("temperature").is_some());
+        assert_eq!(body["thinking"]["budget_tokens"], 1024);
+        assert_eq!(body["max_tokens"], 2024);
     }
 
     #[test]
@@ -1412,6 +1444,7 @@ mod tests {
             ("claude-opus-4-7", "none"),
             ("claude-sonnet-4-6", "bogus"),
             ("claude-haiku-4-5", "none"),
+            ("claude-haiku-4-5", "bogus"),
         ] {
             let body = effort_body(model, effort);
             assert!(body.get("thinking").is_none(), "{model}/{effort}");
@@ -1436,7 +1469,20 @@ mod tests {
                 );
                 assert!(body.get("thinking").is_some(), "{model}");
                 assert!(body.get("temperature").is_none(), "{model}");
-                assert!(body.get("tool_choice").is_none(), "{model}: {forced}");
+                assert_eq!(
+                    body["tool_choice"],
+                    serde_json::json!({"type": "auto"}),
+                    "{model}: {forced}"
+                );
+            }
+            // `top_p` below 0.95 is rejected while thinking; at or above, kept.
+            for (top_p, kept) in [(0.5, false), (0.95, true), (1.0, true)] {
+                let body = body_for(
+                    serde_json::json!({"model": "a", "reasoning_effort": "low", "top_p": top_p,
+                        "messages": [{"role": "user", "content": "hi"}]}),
+                    model,
+                );
+                assert_eq!(body.get("top_p").is_some(), kept, "{model}: {top_p}");
             }
             // A non-forced choice is kept.
             let body = body_for(
@@ -1447,13 +1493,14 @@ mod tests {
             );
             assert_eq!(body["tool_choice"], serde_json::json!({"type": "none"}));
         }
-        // Without thinking, both are forwarded as before.
+        // Without thinking, all are forwarded as before.
         let body = body_for(
-            serde_json::json!({"model": "a", "temperature": 0.2, "tools": tools,
+            serde_json::json!({"model": "a", "temperature": 0.2, "top_p": 0.5, "tools": tools,
                 "tool_choice": "required", "messages": [{"role": "user", "content": "hi"}]}),
             "claude-opus-4-7",
         );
         assert!(body.get("temperature").is_some());
+        assert!(body.get("top_p").is_some());
         assert_eq!(body["tool_choice"], serde_json::json!({"type": "any"}));
     }
 

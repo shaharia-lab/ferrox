@@ -79,7 +79,7 @@ name.
 - **Reasoning.** Reasoning from providers that return it (GLM, Kimi, Claude) comes back as
   `reasoning` output items. On Anthropic, Codex's `model_reasoning_effort` turns on extended
   thinking for the target model: adaptive thinking with that effort on Claude 4.6+, a thinking
-  budget on older models. The thinking block's signature comes back as the item's
+  budget on Claude 3.7–4.5. GLM and Kimi behind the Anthropic adapter are left as they are. The thinking block's signature comes back as the item's
   `encrypted_content`, so the next turn replays it and tool loops keep working.
 
 ## Troubleshooting
