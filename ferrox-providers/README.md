@@ -152,6 +152,29 @@ as `ProxyError::InvalidRequest` — an `invalid_request_error` 400 whose `param`
 names the offending field — rather than silently dropped. `store` is accepted
 and ignored.
 
+`responses_emitter` goes the other way. `to_responses_response` encodes a chat
+completion as a `response` object (a `reasoning` item, a `message` item, then one
+`function_call` / `custom_tool_call` per tool call; `finish_reason: length` →
+`incomplete` with `max_output_tokens`; the request echoed back, `store: false`).
+`ResponsesEmitter` is the streaming state machine — framework-free, emitting
+`SseFrame`s like the Anthropic emitter:
+
+```rust
+use ferrox_providers::responses_emitter::{new_response_id, responses_stream_to_frames, ResponsesEmitter};
+
+let frames = responses_stream_to_frames(ResponsesEmitter::new(&req, new_response_id()), upstream);
+```
+
+It produces `response.created` → `response.in_progress` → per item
+`output_item.added` … `output_item.done` → exactly one of `response.completed`,
+`response.incomplete` or `response.failed` (which carries the full `response`
+and its `usage`), each with a monotonic `sequence_number` and **no** `[DONE]`.
+Chat `reasoning_content` streams as `reasoning_text` events. An upstream error
+before any event becomes a bare `error` event. With the `axum` feature,
+`responses_stream_to_sse` is the axum adapter. An adapter that puts an Anthropic
+thinking signature on `_anthropic_thinking_signature` (message / chunk-choice
+`extra`) gets it back as the reasoning item's `encrypted_content`.
+
 ## MSRV
 
 **1.88**, upheld for every feature combination *except* `bedrock`: the AWS SDK

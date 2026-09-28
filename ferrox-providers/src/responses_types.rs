@@ -609,6 +609,11 @@ pub enum OutputContent {
     Refusal {
         refusal: String,
     },
+    /// Only in the `content_part.added` / `.done` events of a `reasoning`
+    /// item; never inside a `message`.
+    ReasoningText {
+        text: String,
+    },
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -625,6 +630,10 @@ pub struct ResponseUsage {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct InputTokensDetails {
     pub cached_tokens: u32,
+    /// Tokens written to the prompt cache. Required by `openai-python`'s
+    /// `InputTokensDetails`; `0` when the upstream reported none.
+    #[serde(default)]
+    pub cache_write_tokens: u32,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -802,6 +811,22 @@ pub enum ResponseStreamEvent {
         text: String,
         sequence_number: u64,
     },
+    #[serde(rename = "response.reasoning_text.delta")]
+    ReasoningTextDelta {
+        item_id: String,
+        output_index: u32,
+        content_index: u32,
+        delta: String,
+        sequence_number: u64,
+    },
+    #[serde(rename = "response.reasoning_text.done")]
+    ReasoningTextDone {
+        item_id: String,
+        output_index: u32,
+        content_index: u32,
+        text: String,
+        sequence_number: u64,
+    },
     #[serde(rename = "error")]
     Error {
         #[serde(default)]
@@ -838,6 +863,8 @@ impl ResponseStreamEvent {
             Self::ReasoningSummaryPartDone { .. } => "response.reasoning_summary_part.done",
             Self::ReasoningSummaryTextDelta { .. } => "response.reasoning_summary_text.delta",
             Self::ReasoningSummaryTextDone { .. } => "response.reasoning_summary_text.done",
+            Self::ReasoningTextDelta { .. } => "response.reasoning_text.delta",
+            Self::ReasoningTextDone { .. } => "response.reasoning_text.done",
             Self::Error { .. } => "error",
         }
     }
@@ -2061,7 +2088,10 @@ mod tests {
             ],
             usage: Some(ResponseUsage {
                 input_tokens: 10,
-                input_tokens_details: InputTokensDetails { cached_tokens: 4 },
+                input_tokens_details: InputTokensDetails {
+                    cached_tokens: 4,
+                    cache_write_tokens: 0,
+                },
                 output_tokens: 5,
                 output_tokens_details: OutputTokensDetails {
                     reasoning_tokens: 2,
