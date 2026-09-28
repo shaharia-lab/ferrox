@@ -1400,7 +1400,7 @@ pub fn reject_native_stateful_features(req: &ResponsesRequest) -> Result<(), Pro
     if req.store == Some(true) {
         return Err(invalid(
             "`store: true` is not supported: this endpoint is stateless — \
-             send `store: false` or omit it",
+             send `store: false`",
             "store",
         ));
     }

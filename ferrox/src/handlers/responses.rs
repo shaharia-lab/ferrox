@@ -17,12 +17,14 @@
 //! through the shared [`RequestFinalizer`]. All wire logic lives in
 //! `ferrox-providers`.
 //!
-//! The endpoint is stateless: nothing is stored, so `previous_response_id`,
+//! The endpoint is stateless: Ferrox stores nothing, so `previous_response_id`,
 //! `conversation`, `prompt` and `background` are rejected with an
 //! OpenAI-shaped 400, and so is `store: true` on an alias with a native
-//! target. Hosted built-in tools and Files-API inputs (`input_file`,
-//! `input_image` by `file_id`) cannot be translated: they are served only by
-//! native targets, and rejected with a 400 when none can take the request.
+//! target (where an omitted `store` follows the upstream's default, so
+//! clients should send `store: false`). Hosted built-in tools and Files-API
+//! inputs (`input_file`, `input_image` by `file_id`) cannot be translated:
+//! they are served only by native targets, and rejected with a 400 when none
+//! can take the request.
 
 use std::time::Instant;
 
@@ -157,9 +159,10 @@ pub async fn responses(
         .await;
         match served {
             Ok((Served::Native(events), provider_name, model_id)) => {
-                // Verbatim pass-through; the finalizer reads usage from the
-                // terminal event before the stream ends, and an upstream
-                // failure part-way ends it with an `error` event.
+                // Verbatim pass-through. The finalizer reads usage from the
+                // terminal event and holds that event back until the request
+                // is settled; an upstream failure part-way ends the stream
+                // with an `error` event.
                 let sse_stream = native_stream_with_terminal_error(
                     finalizer(provider_name, model_id).wrap_stream(events),
                 )
