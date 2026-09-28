@@ -301,12 +301,10 @@ enum ThinkingStyle {
     /// `{"type":"adaptive"}` + `output_config.effort` (Claude 4.6+). Manual
     /// budgets are rejected with a 400 on 4.7+.
     Adaptive {
-        /// Accepts `xhigh` (4.7+).
-        xhigh: bool,
-        /// Defaults `thinking.display` to `"omitted"` (4.7+), which would
-        /// leave nothing to surface as reasoning — so `"summarized"` is asked
-        /// for explicitly.
-        omits_display: bool,
+        /// Claude 4.7+: accepts `xhigh`, and defaults `thinking.display` to
+        /// `"omitted"`, which would leave nothing to surface as reasoning —
+        /// so `"summarized"` is asked for explicitly.
+        since_4_7: bool,
     },
     /// `{"type":"enabled","budget_tokens":N}` with `N < max_tokens`
     /// (Claude 3.7 up to 4.5).
@@ -346,10 +344,7 @@ fn thinking_style(model_id: &str) -> Option<ThinkingStyle> {
             }
         }
     }
-    let adaptive = |xhigh| ThinkingStyle::Adaptive {
-        xhigh,
-        omits_display: xhigh,
-    };
+    let adaptive = |since_4_7| ThinkingStyle::Adaptive { since_4_7 };
     match version {
         _ if modern_family => Some(adaptive(true)),
         Some(v) if v >= (4, 7) => Some(adaptive(true)),
@@ -359,10 +354,15 @@ fn thinking_style(model_id: &str) -> Option<ThinkingStyle> {
     }
 }
 
-/// Manual-mode thinking budget per effort. The API minimum is 1024.
-fn manual_budget(effort: &str) -> Option<u32> {
+/// Smallest manual thinking budget the API accepts.
+const MIN_THINKING_BUDGET: u32 = 1024;
+
+/// Thinking tokens per effort: the manual budget, and the headroom given to
+/// adaptive thinking when the client set no `max_tokens`. `None` for `none`
+/// and unknown values, which leave thinking off.
+fn thinking_budget(effort: &str) -> Option<u32> {
     match effort {
-        "minimal" | "low" => Some(1024),
+        "minimal" | "low" => Some(MIN_THINKING_BUDGET),
         "medium" => Some(4096),
         "high" | "xhigh" | "max" => Some(16384),
         _ => None,
@@ -373,22 +373,20 @@ fn manual_budget(effort: &str) -> Option<u32> {
 /// `model_id`. `none`, unknown values and models without derived thinking
 /// leave the request as it was.
 fn thinking_for_effort(effort: &str, model_id: &str, max_tokens: Option<u32>) -> AnthropicExtras {
-    match thinking_style(model_id) {
-        None => AnthropicExtras::default(),
-        Some(ThinkingStyle::Adaptive {
-            xhigh,
-            omits_display,
-        }) => {
+    let Some(style) = thinking_style(model_id) else {
+        return AnthropicExtras::default();
+    };
+    let Some(budget) = thinking_budget(effort) else {
+        return AnthropicExtras::default();
+    };
+    match style {
+        ThinkingStyle::Adaptive { since_4_7 } => {
             let level = match effort {
                 "minimal" | "low" => "low",
-                "medium" => "medium",
-                "high" => "high",
-                "xhigh" if xhigh => "xhigh",
-                "xhigh" => "high",
-                "max" => "max",
-                _ => return AnthropicExtras::default(),
+                "xhigh" if !since_4_7 => "high",
+                other => other,
             };
-            let thinking = if omits_display {
+            let thinking = if since_4_7 {
                 serde_json::json!({"type": "adaptive", "display": "summarized"})
             } else {
                 serde_json::json!({"type": "adaptive"})
@@ -396,20 +394,25 @@ fn thinking_for_effort(effort: &str, model_id: &str, max_tokens: Option<u32>) ->
             AnthropicExtras {
                 thinking: Some(thinking),
                 output_config: Some(serde_json::json!({ "effort": level })),
-                max_tokens: None,
+                // Thinking counts toward `max_tokens`; without a client limit,
+                // leave the default answer room on top of what this effort
+                // is likely to think.
+                max_tokens: max_tokens.is_none().then_some(DEFAULT_MAX_TOKENS + budget),
                 derived_thinking: true,
             }
         }
-        Some(ThinkingStyle::Manual) => {
-            let Some(budget) = manual_budget(effort) else {
-                return AnthropicExtras::default();
-            };
+        ThinkingStyle::Manual => {
             // `max_tokens` covers thinking and answer together, and the budget
-            // must stay below it. A limit that already leaves at least half
-            // for the answer is kept; a smaller one is raised by the budget so
-            // the answer keeps the room the client asked for.
-            let max = max_tokens.unwrap_or(DEFAULT_MAX_TOKENS);
-            let max_tokens = if budget <= max / 2 { max } else { max + budget };
+            // must stay below it. Without a client limit the default answer
+            // room goes on top of the budget. A client limit is never raised
+            // past what is needed: the budget shrinks to half of it, and only
+            // a limit too small for the 1024 minimum grows by that minimum.
+            let (budget, max_tokens) = match max_tokens {
+                None => (budget, DEFAULT_MAX_TOKENS + budget),
+                Some(max) if budget <= max / 2 => (budget, max),
+                Some(max) if max / 2 >= MIN_THINKING_BUDGET => (max / 2, max),
+                Some(max) => (MIN_THINKING_BUDGET, max + MIN_THINKING_BUDGET),
+            };
             AnthropicExtras {
                 thinking: Some(serde_json::json!({"type": "enabled", "budget_tokens": budget})),
                 output_config: None,
@@ -423,7 +426,7 @@ fn thinking_for_effort(effort: &str, model_id: &str, max_tokens: Option<u32>) ->
 /// Thinking blocks to replay, from the Responses translation's
 /// `_responses_anthropic_thinking_blocks`, keyed by the index in
 /// `req.messages` of the assistant message each one precedes.
-fn replayed_thinking(req: &ChatCompletionRequest) -> Vec<(usize, AnthropicPart)> {
+fn replayed_thinking(req: &ChatCompletionRequest) -> Vec<(usize, Option<AnthropicPart>)> {
     let Some(Value::Array(blocks)) = req.extra.get(RESPONSES_ANTHROPIC_THINKING_BLOCKS) else {
         return Vec::new();
     };
@@ -439,10 +442,10 @@ fn replayed_thinking(req: &ChatCompletionRequest) -> Vec<(usize, AnthropicPart)>
                 .to_string();
             Some((
                 index,
-                AnthropicPart::Thinking {
+                Some(AnthropicPart::Thinking {
                     thinking,
                     signature,
-                },
+                }),
             ))
         })
         .collect()
@@ -524,7 +527,7 @@ fn build_request_body(
     // Filter out system messages; Anthropic does not allow them in the messages
     // array. Replayed thinking blocks are indexed against the unfiltered list,
     // so they are attached before filtering.
-    let thinking = replayed_thinking(req);
+    let mut thinking = replayed_thinking(req);
     let messages: Vec<AnthropicMessage> = req
         .messages
         .iter()
@@ -534,9 +537,9 @@ fn build_request_body(
             let mut converted = convert_message(m);
             if m.role == "assistant" {
                 let leading: Vec<AnthropicPart> = thinking
-                    .iter()
+                    .iter_mut()
                     .filter(|(at, _)| *at == i)
-                    .map(|(_, part)| part.clone())
+                    .filter_map(|(_, part)| part.take())
                     .collect();
                 if !leading.is_empty() {
                     converted.content = prepend_parts(converted.content, leading);
@@ -1306,14 +1309,8 @@ mod tests {
 
     #[test]
     fn thinking_style_per_model_family() {
-        let adaptive_new = Some(ThinkingStyle::Adaptive {
-            xhigh: true,
-            omits_display: true,
-        });
-        let adaptive_46 = Some(ThinkingStyle::Adaptive {
-            xhigh: false,
-            omits_display: false,
-        });
+        let adaptive_new = Some(ThinkingStyle::Adaptive { since_4_7: true });
+        let adaptive_46 = Some(ThinkingStyle::Adaptive { since_4_7: false });
         let manual = Some(ThinkingStyle::Manual);
         let cases = [
             ("claude-opus-4-7", &adaptive_new),
@@ -1382,8 +1379,17 @@ mod tests {
                 body["output_config"],
                 serde_json::json!({"effort": "xhigh"})
             );
-            assert_eq!(body["max_tokens"], DEFAULT_MAX_TOKENS);
+            // Room for thinking on top of the default answer length.
+            assert_eq!(body["max_tokens"], DEFAULT_MAX_TOKENS + 16384);
         }
+        // A client limit is left alone.
+        let body = body_for(
+            serde_json::json!({"model": "a", "reasoning_effort": "high", "max_tokens": 900,
+                "messages": [{"role": "user", "content": "hi"}]}),
+            "claude-opus-4-7",
+        );
+        assert_eq!(body["max_tokens"], 900);
+        assert_eq!(body["output_config"]["effort"], "high");
         assert_eq!(
             effort_body("claude-opus-4-7", "minimal")["output_config"]["effort"],
             "low"
@@ -1403,39 +1409,35 @@ mod tests {
 
     #[test]
     fn effort_on_older_models_is_a_manual_budget_below_max_tokens() {
-        // No client limit: the default is kept while it leaves half for the
-        // answer, else the budget is added on top.
-        for (effort, budget, max) in [
-            ("low", 1024, DEFAULT_MAX_TOKENS),
-            ("medium", 4096, DEFAULT_MAX_TOKENS + 4096),
-            ("high", 16384, DEFAULT_MAX_TOKENS + 16384),
-        ] {
+        for (effort, budget) in [("low", 1024), ("medium", 4096), ("high", 16384)] {
             let body = effort_body("claude-sonnet-4-5", effort);
             assert_eq!(
                 body["thinking"],
                 serde_json::json!({"type": "enabled", "budget_tokens": budget})
             );
             assert!(body.get("output_config").is_none());
-            assert_eq!(body["max_tokens"], max, "{effort}");
+            // No client limit: the default answer room goes on top.
+            assert_eq!(body["max_tokens"], DEFAULT_MAX_TOKENS + budget, "{effort}");
         }
 
-        // A limit that leaves at least half for the answer is kept.
-        let body = body_for(
-            serde_json::json!({"model": "a", "reasoning_effort": "high", "max_tokens": 64000,
-                "messages": [{"role": "user", "content": "hi"}]}),
-            "claude-3-7-sonnet-20250219",
-        );
-        assert_eq!(body["thinking"]["budget_tokens"], 16384);
-        assert_eq!(body["max_tokens"], 64000);
-
-        // A small one is raised by the budget, never shrinking the answer.
-        let body = body_for(
-            serde_json::json!({"model": "a", "reasoning_effort": "low", "max_tokens": 1000,
-                "messages": [{"role": "user", "content": "hi"}]}),
-            "claude-haiku-4-5",
-        );
-        assert_eq!(body["thinking"]["budget_tokens"], 1024);
-        assert_eq!(body["max_tokens"], 2024);
+        let with_max = |effort: &str, max: u32| {
+            let body = body_for(
+                serde_json::json!({"model": "a", "reasoning_effort": effort, "max_tokens": max,
+                    "messages": [{"role": "user", "content": "hi"}]}),
+                "claude-3-7-sonnet-20250219",
+            );
+            (
+                body["thinking"]["budget_tokens"].as_u64().unwrap(),
+                body["max_tokens"].as_u64().unwrap(),
+            )
+        };
+        // The budget fits in half the limit: both kept.
+        assert_eq!(with_max("high", 64000), (16384, 64000));
+        // It does not: it shrinks to half, and the limit is never raised --
+        // raising 20000 by the budget would pass Opus 4's 32K output cap.
+        assert_eq!(with_max("high", 20000), (10000, 20000));
+        // Too small for the 1024 minimum: grows by just that minimum.
+        assert_eq!(with_max("low", 1000), (1024, 2024));
     }
 
     #[test]

@@ -145,7 +145,9 @@ Responses-only knobs (`include`, `reasoning.summary`, `text.verbosity`,
 which no adapter forwards upstream. `reasoning.effort` becomes `reasoning_effort`
 only; the Anthropic adapter maps it to thinking per model — adaptive thinking
 with `output_config.effort` on Claude 4.6+ (thinking summaries requested on
-4.7+), `thinking.type: "enabled"` with a budget below `max_tokens` on Claude 3.7–4.5,
+4.7+), `thinking.type: "enabled"` with a budget below `max_tokens` on Claude 3.7–4.5
+(room for thinking is added to `max_tokens` only when the client set none, or
+one too small for the 1024 minimum),
 nothing for older Claude, non-Claude upstreams (GLM, Kimi) or unparsed ids —
 and then drops `temperature` and a `top_p` below 0.95 and downgrades a forced
 `tool_choice` to `auto`, which Anthropic requires alongside thinking. An
