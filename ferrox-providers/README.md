@@ -143,7 +143,14 @@ let chat = to_chat_completion_request(&req)?; // Err → an OpenAI 400 naming `p
 Responses-only knobs (`include`, `reasoning.summary`, `text.verbosity`,
 `truncation`, the custom-tool names) ride on `_responses_*` keys in `extra`,
 which no adapter forwards upstream. `reasoning.effort` becomes `reasoning_effort`
-only; it does not switch on Anthropic extended thinking.
+only; the Anthropic adapter maps it to thinking per model — adaptive thinking
+with `output_config.effort` on Claude 4.6+ (thinking summaries requested on
+4.7+), `thinking.type: "enabled"` with a budget below `max_tokens` on older
+models and other Anthropic-protocol upstreams — and then drops `temperature`
+and a forced `tool_choice`, which Anthropic rejects alongside thinking. An
+explicit `_anthropic_thinking` wins. A `reasoning` item whose `encrypted_content`
+Ferrox encoded is replayed as a signed `thinking` block at the start of the
+assistant turn it preceded.
 
 The translation is **stateless**: `previous_response_id`, `conversation`,
 stored `prompt` templates, `background: true`, OpenAI-hosted built-in tools (`web_search`, `file_search`,
@@ -173,7 +180,11 @@ Chat `reasoning_content` streams as `reasoning_text` events. An upstream error
 before any event becomes a bare `error` event. With the `axum` feature,
 `responses_stream_to_sse` is the axum adapter. An adapter that puts an Anthropic
 thinking signature on `_anthropic_thinking_signature` (message / chunk-choice
-`extra`) gets it back as the reasoning item's `encrypted_content`.
+`extra`) gets it back as the reasoning item's `encrypted_content`. The Anthropic
+adapter (and Bedrock's, which shares the stream parser) does: from each
+streamed `signature_delta`, and from a non-streaming response with exactly one
+signed thinking block (several blocks are joined into one reasoning text that
+no single signature verifies).
 
 **Native passthrough.** A provider configured with `responses: native`
 (`ResponsesMode::Native`; the OpenAI adapter only) reports

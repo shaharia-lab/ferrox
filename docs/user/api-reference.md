@@ -172,7 +172,8 @@ The endpoint is **stateless**: nothing is stored, `store` is accepted and always
 | `tools` | `function` and `custom` (free-form text input) tools |
 | `tool_choice`, `parallel_tool_calls`, `max_tool_calls` | |
 | `text.format` | `text`, `json_object`, `json_schema` (mapped to the chat `response_format`; schema adherence depends on the upstream model) |
-| `reasoning.effort`, `reasoning.summary`, `text.verbosity`, `include`, `truncation` | Forwarded as hints |
+| `reasoning.effort` | Forwarded as `reasoning_effort`. On an Anthropic target it turns on extended thinking for the model (adaptive + `output_config.effort` on Claude 4.6+, a `budget_tokens` below `max_tokens` on older models) and drops `temperature` and a forced `tool_choice`; `none` leaves thinking off |
+| `reasoning.summary`, `text.verbosity`, `include`, `truncation` | Forwarded as hints |
 | `metadata`, `prompt_cache_key`, `safety_identifier`, `user`, `service_tier` | Passed through |
 
 Unknown top-level fields are ignored, so a newer SDK still works.
