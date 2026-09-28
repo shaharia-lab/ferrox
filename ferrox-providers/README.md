@@ -10,7 +10,7 @@ of the gateway around them. No routing, load balancing, circuit breaking, rate
 limiting, JWKS or auth.
 
 Ferrox itself consumes this crate, so the translation is exercised by Ferrox's
-compat suite (184 tests with `--all-features`) rather than maintained in two
+compat suite (264 tests with `--all-features`) rather than maintained in two
 places.
 
 ## Usage
@@ -107,7 +107,7 @@ HTTP status alongside the JSON body, so you build the response yourself:
 ```rust
 use ferrox_providers::error::{anthropic_error_body, openai_error_body};
 
-let (status, body) = openai_error_body(&err);     // {"error":{"message","type","code"}}
+let (status, body) = openai_error_body(&err);     // {"error":{"message","type","code"}} (+ "param" for InvalidRequest)
 let (status, body) = anthropic_error_body(&err);  // {"type":"error","error":{"type","message"}}
 ```
 
@@ -121,6 +121,35 @@ mid-stream SSE `error` event.
 Requesting a provider whose feature is disabled fails at `build_registry` time
 with an actionable message, not at compile time — so a config file can name a
 provider the binary was not built for and you get a clear error.
+
+### OpenAI Responses API
+
+`responses_types` holds the Responses wire types — the request, the `response`
+object with its output items and usage, and the streaming events — plus
+`to_chat_completion_request`, which translates a Responses create request into
+the internal `ChatCompletionRequest` so every adapter above can serve it:
+
+```rust
+use ferrox_providers::responses_types::{to_chat_completion_request, ResponsesRequest};
+
+let req: ResponsesRequest = serde_json::from_slice(&body)?;
+let chat = to_chat_completion_request(&req)?; // Err → an OpenAI 400 naming `param`
+```
+
+`input` items map onto chat messages (`developer` → `system`, a run of
+`function_call` items → one assistant message keyed by `call_id`,
+`function_call_output` → a `tool` message), flat tools become nested ones, and a
+`custom` tool becomes a function with a single string parameter `input`.
+Responses-only knobs (`include`, `reasoning.summary`, `text.verbosity`,
+`truncation`, the custom-tool names) ride on `_responses_*` keys in `extra`,
+which no adapter forwards upstream.
+
+The translation is **stateless**: `previous_response_id`, `conversation`,
+`background: true`, OpenAI-hosted built-in tools (`web_search`, `file_search`,
+`code_interpreter`, `computer`, `mcp`, …) and `input_file` content are rejected
+as `ProxyError::InvalidRequest` — an `invalid_request_error` 400 whose `param`
+names the offending field — rather than silently dropped. `store` is accepted
+and ignored.
 
 ## MSRV
 

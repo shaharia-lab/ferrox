@@ -173,6 +173,10 @@ pub struct ToolFunction {
     pub name: String,
     pub description: Option<String>,
     pub parameters: Option<serde_json::Value>,
+    /// OpenAI structured-outputs flag. Omitted when unset so non-OpenAI
+    /// upstreams never see it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strict: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -640,6 +640,48 @@ mod tests {
         );
     }
 
+    /// A translated Responses request keeps its Responses-only knobs under
+    /// `_responses_*` keys; none of them may reach an OpenAI-format upstream,
+    /// while the real Chat Completions fields it maps to must.
+    #[test]
+    fn responses_private_keys_are_stripped_from_the_upstream_body() {
+        let req: crate::responses_types::ResponsesRequest =
+            serde_json::from_value(serde_json::json!({
+                "model": "m",
+                "input": "hi",
+                "tools": [
+                    {"type": "function", "name": "f", "strict": true, "parameters": {}},
+                    {"type": "custom", "name": "apply_patch"}
+                ],
+                "reasoning": {"effort": "low", "summary": "auto"},
+                "include": ["reasoning.encrypted_content"],
+                "text": {"verbosity": "low", "format": {"type": "json_object"}},
+                "truncation": "auto",
+                "max_tool_calls": 3,
+                "prompt_cache_key": "k"
+            }))
+            .unwrap();
+        let chat = crate::responses_types::to_chat_completion_request(&req).unwrap();
+        assert!(chat.extra.keys().any(|k| k.starts_with("_responses_")));
+
+        let json = serde_json::to_value(build_request_body(&chat, "m", false)).unwrap();
+        let leaked: Vec<&String> = json
+            .as_object()
+            .unwrap()
+            .keys()
+            .filter(|k| k.starts_with('_'))
+            .collect();
+        assert!(
+            leaked.is_empty(),
+            "private keys leaked upstream: {leaked:?}"
+        );
+        assert_eq!(json["reasoning_effort"], "low");
+        assert_eq!(json["response_format"]["type"], "json_object");
+        assert_eq!(json["prompt_cache_key"], "k");
+        assert_eq!(json["tools"][0]["function"]["strict"], true);
+        assert!(json["tools"][1]["function"].get("strict").is_none());
+    }
+
     #[test]
     fn client_reserved_key_does_not_duplicate() {
         // A client-sent `stream_options` must not collide with the one we set.

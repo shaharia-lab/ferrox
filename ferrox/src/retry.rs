@@ -20,6 +20,7 @@ pub fn is_retryable(e: &ProxyError) -> bool {
         // Non-transient — do not retry
         ProxyError::Unauthorized(_) => false,
         ProxyError::Forbidden(_) => false,
+        ProxyError::InvalidRequest { .. } => false,
         ProxyError::ModelNotFound(_) => false,
         ProxyError::RateLimited(_) => false,
         ProxyError::ConfigError(_) => false,

@@ -251,6 +251,7 @@ pub fn to_chat_completion_request(req: AnthropicMessagesRequest) -> ChatCompleti
                         name: t.name,
                         description: t.description,
                         parameters: Some(t.input_schema),
+                        strict: None,
                     },
                 }
             })
