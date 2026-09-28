@@ -35,6 +35,13 @@ impl UsageWriter {
             tracing::warn!("usage writer buffer full, dropping event");
         }
     }
+
+    /// A writer whose events land on the returned receiver, for tests.
+    #[cfg(test)]
+    pub(crate) fn channel(capacity: usize) -> (Self, mpsc::Receiver<UsageEvent>) {
+        let (tx, rx) = mpsc::channel(capacity);
+        (Self { tx }, rx)
+    }
 }
 
 /// A no-op writer that silently discards all events.

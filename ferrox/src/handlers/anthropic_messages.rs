@@ -15,14 +15,12 @@ use crate::anthropic_types::{
     AnthropicMessagesRequest,
 };
 use crate::error::ProxyError;
-use crate::event_dispatcher::TokenUsageEvent;
 use crate::handlers::chat::{dispatch_non_stream, dispatch_stream, is_model_allowed};
-use crate::state::AppState;
-use crate::telemetry::metrics::{
-    self, ACTIVE_STREAMS, ERRORS_TOTAL, REQUESTS_TOTAL, REQUEST_DURATION_SECONDS,
+use crate::handlers::finalize::{
+    record_error_count, record_error_metrics, RequestFinalizer, Surface,
 };
+use crate::state::AppState;
 use crate::types::RequestContext;
-use crate::usage_writer::UsageEvent;
 
 // ── Anthropic-format error responses ─────────────────────────────────────────
 
@@ -142,166 +140,29 @@ pub async fn anthropic_messages(
 
     if is_streaming {
         let msg_id = format!("msg_{}", Uuid::new_v4().simple());
-        let result = dispatch_stream(&pool, &internal_req, retry_config).await;
 
-        match result {
+        match dispatch_stream(&pool, &internal_req, retry_config).await {
             Ok((stream, provider_name, model_id)) => {
-                let alias = model_alias.clone();
-
-                ACTIVE_STREAMS
-                    .with_label_values(&[provider_name.as_str(), alias.as_str()])
-                    .inc();
-
-                let p1 = provider_name.clone();
-                let a1 = alias.clone();
-                let k1 = ctx.key_name.clone();
-                let accumulated_prompt = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
-                let accumulated_completion =
-                    std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
-                let accumulated_cache_read =
-                    std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
-                let accumulated_cache_write =
-                    std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
-                let acc_p = accumulated_prompt.clone();
-                let acc_c = accumulated_completion.clone();
-                let acc_cr = accumulated_cache_read.clone();
-                let acc_cw = accumulated_cache_write.clone();
-
-                // Wrap the OpenAI-format stream to capture token usage before
-                // converting to Anthropic SSE format.
-                let metered_stream = stream.map(move |chunk_result| {
-                    chunk_result.inspect(|chunk| {
-                        if let Some(usage) = &chunk.usage {
-                            let (cache_read, cache_write) = crate::types::cache_tokens(usage);
-                            metrics::record_tokens(
-                                &p1,
-                                &a1,
-                                &k1,
-                                usage.prompt_tokens,
-                                usage.completion_tokens,
-                                cache_read,
-                                cache_write,
-                            );
-                            acc_p.store(usage.prompt_tokens, std::sync::atomic::Ordering::Relaxed);
-                            acc_c.store(
-                                usage.completion_tokens,
-                                std::sync::atomic::Ordering::Relaxed,
-                            );
-                            acc_cr.store(cache_read, std::sync::atomic::Ordering::Relaxed);
-                            acc_cw.store(cache_write, std::sync::atomic::Ordering::Relaxed);
-                        }
-                    })
-                });
-
-                let p2 = provider_name.clone();
-                let a2 = alias.clone();
-                let k2 = ctx.key_name.clone();
-                let m2 = model_id.clone();
-                let usage_writer = state.usage_writer.clone();
-                let budget_enforcer = state.budget_enforcer.clone();
-                let event_dispatcher = state.event_dispatcher.clone();
-                let stream_client_id = ctx.client_id;
-                let stream_key_name = ctx.key_name.clone();
-                let stream_budget_period = ctx.budget_period.clone();
-                let stream_budget_reserved = ctx.budget_reserved_tokens;
-                let stream_request_id = ctx.request_id.clone();
-                let stream_model = alias.clone();
-                let stream_provider = provider_name.clone();
-
+                let finalizer = RequestFinalizer::new(
+                    &state,
+                    &ctx,
+                    model_alias,
+                    provider_name,
+                    model_id,
+                    start,
+                    Surface::Anthropic,
+                );
+                // Meter the OpenAI-format stream before converting it to
+                // Anthropic SSE; the converter drains it before emitting
+                // `message_stop`, so usage is recorded ahead of that frame.
                 let anthropic_stream = openai_stream_to_anthropic_sse(
                     internal_req.model.clone(),
                     msg_id,
-                    metered_stream.boxed(),
+                    finalizer.wrap_stream(stream).boxed(),
                 );
 
-                // Chain a finalizer that records metrics, usage, and budget.
-                let sse_stream = anthropic_stream.chain(futures::stream::once(async move {
-                    let latency = start.elapsed().as_secs_f64();
-                    REQUESTS_TOTAL
-                        .with_label_values(&[
-                            p2.as_str(),
-                            a2.as_str(),
-                            m2.as_str(),
-                            "200",
-                            k2.as_str(),
-                        ])
-                        .inc();
-                    REQUEST_DURATION_SECONDS
-                        .with_label_values(&[p2.as_str(), a2.as_str(), "200"])
-                        .observe(latency);
-                    ACTIVE_STREAMS
-                        .with_label_values(&[p2.as_str(), a2.as_str()])
-                        .dec();
-
-                    // Persist accumulated usage
-                    let prompt = accumulated_prompt.load(std::sync::atomic::Ordering::Relaxed);
-                    let completion =
-                        accumulated_completion.load(std::sync::atomic::Ordering::Relaxed);
-                    let cache_read =
-                        accumulated_cache_read.load(std::sync::atomic::Ordering::Relaxed);
-                    let cache_write =
-                        accumulated_cache_write.load(std::sync::atomic::Ordering::Relaxed);
-                    if prompt > 0 || completion > 0 {
-                        // Push webhook event (before usage_writer moves the strings)
-                        event_dispatcher.dispatch(TokenUsageEvent {
-                            event: "token_usage",
-                            request_id: stream_request_id.clone(),
-                            client_id: stream_client_id,
-                            key_name: stream_key_name,
-                            model: stream_model.clone(),
-                            provider: stream_provider.clone(),
-                            prompt_tokens: prompt,
-                            completion_tokens: completion,
-                            total_tokens: prompt + completion,
-                            cache_read_tokens: (cache_read > 0).then_some(cache_read),
-                            cache_write_tokens: (cache_write > 0).then_some(cache_write),
-                            latency_ms: Some((latency * 1000.0) as u64),
-                            timestamp: chrono::Utc::now(),
-                        });
-
-                        usage_writer.record(UsageEvent {
-                            client_id: stream_client_id,
-                            request_id: stream_request_id,
-                            model: stream_model,
-                            provider: stream_provider,
-                            prompt_tokens: prompt,
-                            completion_tokens: completion,
-                            cache_read_tokens: cache_read,
-                            cache_write_tokens: cache_write,
-                            latency_ms: Some((latency * 1000.0) as u64),
-                        });
-
-                        // Reconcile budget reservation with actual usage
-                        if let (Some(ref cid), Some(ref period)) =
-                            (&stream_client_id, &stream_budget_period)
-                        {
-                            budget_enforcer
-                                .reconcile_tokens(
-                                    &cid.to_string(),
-                                    period,
-                                    stream_budget_reserved,
-                                    prompt + completion,
-                                )
-                                .await;
-                        }
-                    }
-
-                    tracing::info!(
-                        model_alias = %a2,
-                        provider   = %p2,
-                        model_id   = %m2,
-                        streaming  = true,
-                        status     = 200,
-                        latency_ms = (latency * 1000.0) as u64,
-                        prompt_tokens = prompt,
-                        completion_tokens = completion,
-                        // `Option` fields are omitted entirely when `None`, so
-                        // quiet (non-caching) paths stay quiet.
-                        cache_read_tokens = (cache_read > 0).then_some(cache_read),
-                        cache_write_tokens = (cache_write > 0).then_some(cache_write),
-                        "anthropic_request_completed"
-                    );
-                    // Return a silent SSE comment; Anthropic SDK ignores it.
+                // Return a silent SSE comment; Anthropic SDK ignores it.
+                let sse_stream = anthropic_stream.chain(futures::stream::once(async {
                     Ok::<_, ProxyError>(axum::response::sse::Event::default().comment("done"))
                 }));
 
@@ -310,166 +171,30 @@ pub async fn anthropic_messages(
                     .into_response())
             }
             Err(e) => {
-                REQUESTS_TOTAL
-                    .with_label_values(&[
-                        "",
-                        &model_alias,
-                        "",
-                        &http_status_for_error(&e).to_string(),
-                        "",
-                    ])
-                    .inc();
-                ERRORS_TOTAL
-                    .with_label_values(&["", error_type_label(&e)])
-                    .inc();
+                record_error_count(&model_alias, "", &e);
                 Ok(proxy_error_to_anthropic_response(&e))
             }
         }
     } else {
-        let result = dispatch_non_stream(&pool, &internal_req, retry_config).await;
-        let latency = start.elapsed().as_secs_f64();
-
-        match result {
+        match dispatch_non_stream(&pool, &internal_req, retry_config).await {
             Ok((resp, provider_name, model_id)) => {
-                if let Some(usage) = &resp.usage {
-                    let (cache_read, cache_write) = crate::types::cache_tokens(usage);
-                    metrics::record_tokens(
-                        &provider_name,
-                        &model_alias,
-                        &ctx.key_name,
-                        usage.prompt_tokens,
-                        usage.completion_tokens,
-                        cache_read,
-                        cache_write,
-                    );
-
-                    state.usage_writer.record(UsageEvent {
-                        client_id: ctx.client_id,
-                        request_id: ctx.request_id.clone(),
-                        model: model_alias.clone(),
-                        provider: provider_name.clone(),
-                        prompt_tokens: usage.prompt_tokens,
-                        completion_tokens: usage.completion_tokens,
-                        cache_read_tokens: cache_read,
-                        cache_write_tokens: cache_write,
-                        latency_ms: Some((latency * 1000.0) as u64),
-                    });
-
-                    // Reconcile budget reservation with actual usage
-                    if let (Some(ref cid), Some(ref period)) = (&ctx.client_id, &ctx.budget_period)
-                    {
-                        state
-                            .budget_enforcer
-                            .reconcile_tokens(
-                                &cid.to_string(),
-                                period,
-                                ctx.budget_reserved_tokens,
-                                usage.prompt_tokens + usage.completion_tokens,
-                            )
-                            .await;
-                    }
-
-                    // Push webhook event
-                    state.event_dispatcher.dispatch(TokenUsageEvent {
-                        event: "token_usage",
-                        request_id: ctx.request_id.clone(),
-                        client_id: ctx.client_id,
-                        key_name: ctx.key_name.clone(),
-                        model: model_alias.clone(),
-                        provider: provider_name.clone(),
-                        prompt_tokens: usage.prompt_tokens,
-                        completion_tokens: usage.completion_tokens,
-                        total_tokens: usage.prompt_tokens + usage.completion_tokens,
-                        cache_read_tokens: (cache_read > 0).then_some(cache_read),
-                        cache_write_tokens: (cache_write > 0).then_some(cache_write),
-                        latency_ms: Some((latency * 1000.0) as u64),
-                        timestamp: chrono::Utc::now(),
-                    });
-                }
-                REQUESTS_TOTAL
-                    .with_label_values(&[
-                        provider_name.as_str(),
-                        model_alias.as_str(),
-                        model_id.as_str(),
-                        "200",
-                        ctx.key_name.as_str(),
-                    ])
-                    .inc();
-                REQUEST_DURATION_SECONDS
-                    .with_label_values(&[provider_name.as_str(), model_alias.as_str(), "200"])
-                    .observe(latency);
-
-                let (cache_read, cache_write) = resp
-                    .usage
-                    .as_ref()
-                    .map(crate::types::cache_tokens)
-                    .unwrap_or((0, 0));
-                tracing::info!(
-                    request_id = %ctx.request_id,
-                    key_name   = %ctx.key_name,
-                    model_alias = %model_alias,
-                    provider   = %provider_name,
-                    model_id   = %model_id,
-                    streaming  = false,
-                    status     = 200,
-                    latency_ms = (latency * 1000.0) as u64,
-                    prompt_tokens = resp.usage.as_ref().map(|u| u.prompt_tokens).unwrap_or(0),
-                    completion_tokens = resp.usage.as_ref().map(|u| u.completion_tokens).unwrap_or(0),
-                    // `Option` fields are omitted entirely when `None`, so
-                    // non-caching requests log exactly as they did before.
-                    cache_read_tokens = (cache_read > 0).then_some(cache_read),
-                    cache_write_tokens = (cache_write > 0).then_some(cache_write),
-                    "anthropic_request_completed"
-                );
-
+                RequestFinalizer::new(
+                    &state,
+                    &ctx,
+                    model_alias,
+                    provider_name,
+                    model_id,
+                    start,
+                    Surface::Anthropic,
+                )
+                .finish(resp.usage.as_ref())
+                .await;
                 Ok(Json(to_anthropic_response(resp)).into_response())
             }
             Err(e) => {
-                REQUESTS_TOTAL
-                    .with_label_values(&[
-                        "",
-                        &model_alias,
-                        "",
-                        &http_status_for_error(&e).to_string(),
-                        "",
-                    ])
-                    .inc();
-                ERRORS_TOTAL
-                    .with_label_values(&["", error_type_label(&e)])
-                    .inc();
-                REQUEST_DURATION_SECONDS
-                    .with_label_values(&["", &model_alias, &http_status_for_error(&e).to_string()])
-                    .observe(latency);
+                record_error_metrics(&model_alias, "", &e, start);
                 Ok(proxy_error_to_anthropic_response(&e))
             }
         }
-    }
-}
-
-fn http_status_for_error(e: &ProxyError) -> u16 {
-    match e {
-        ProxyError::Unauthorized(_) => 401,
-        ProxyError::Forbidden(_) => 403,
-        ProxyError::ModelNotFound(_) => 404,
-        ProxyError::RateLimited(_) | ProxyError::BudgetExceeded(_) => 429,
-        ProxyError::CircuitOpen(_) | ProxyError::ProviderError { .. } => 502,
-        ProxyError::UpstreamTimeout(_) => 504,
-        _ => 500,
-    }
-}
-
-fn error_type_label(e: &ProxyError) -> &'static str {
-    match e {
-        ProxyError::Unauthorized(_) => "unauthorized",
-        ProxyError::Forbidden(_) => "forbidden",
-        ProxyError::ModelNotFound(_) => "model_not_found",
-        ProxyError::RateLimited(_) | ProxyError::BudgetExceeded(_) => "rate_limited",
-        ProxyError::CircuitOpen(_) => "circuit_open",
-        ProxyError::ProviderError { .. } => "provider_error",
-        ProxyError::UpstreamTimeout(_) => "upstream_timeout",
-        ProxyError::StreamError(_) => "stream_error",
-        ProxyError::HttpClientError(_) => "http_client_error",
-        ProxyError::AwsError(_) => "aws_error",
-        _ => "internal",
     }
 }

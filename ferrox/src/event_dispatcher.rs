@@ -49,6 +49,13 @@ impl EventDispatcher {
                 .inc();
         }
     }
+
+    /// A dispatcher whose events land on the returned receiver, for tests.
+    #[cfg(test)]
+    pub(crate) fn channel(capacity: usize) -> (Self, mpsc::Receiver<TokenUsageEvent>) {
+        let (tx, rx) = mpsc::channel(capacity);
+        (Self { tx }, rx)
+    }
 }
 
 /// Create a no-op dispatcher that silently discards all events.
