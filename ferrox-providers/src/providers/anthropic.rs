@@ -320,9 +320,19 @@ fn tool_turn_without_thinking(req: &ChatCompletionRequest) -> bool {
     {
         return false;
     }
+    // The Responses translation splits "text, then tool calls" into two
+    // assistant messages and tags the thinking block to the first. Anthropic
+    // merges consecutive same-role messages into one turn, so a block on any
+    // message of the trailing assistant run starts that turn.
+    let run_start = req.messages[..index]
+        .iter()
+        .rposition(|m| m.role != "assistant")
+        .map_or(0, |i| i + 1);
     let replayed = match req.extra.get(RESPONSES_ANTHROPIC_THINKING_BLOCKS) {
         Some(Value::Array(blocks)) => blocks.iter().any(|b| {
-            b.get("message_index").and_then(Value::as_u64) == Some(index as u64)
+            b.get("message_index")
+                .and_then(Value::as_u64)
+                .is_some_and(|i| (run_start as u64..=index as u64).contains(&i))
                 && b.get("signature").and_then(Value::as_str).is_some()
         }),
         _ => false,
@@ -1653,6 +1663,32 @@ mod tests {
         // Manual thinking on the tool-loop turn, which is only valid because
         // the assistant turn above starts with its thinking block.
         assert_eq!(body["thinking"]["type"], "enabled");
+    }
+
+    #[test]
+    fn narrated_tool_turn_keeps_manual_thinking() {
+        use crate::responses_types::encode_anthropic_thinking_signature;
+        // Claude usually writes text before a tool call. The translation makes
+        // that two assistant messages with the thinking block on the first;
+        // Anthropic merges them into one turn that starts with the block.
+        let body = responses_to_anthropic_body(
+            serde_json::json!({"model": "m", "reasoning": {"effort": "high"},
+                "tools": [{"type": "function", "name": "f",
+                    "parameters": {"type": "object", "properties": {}}}],
+                "input": [
+                {"role": "user", "content": "hi"},
+                {"type": "reasoning", "id": "rs", "summary": [],
+                 "content": [{"type": "reasoning_text", "text": "plan"}],
+                 "encrypted_content": encode_anthropic_thinking_signature("sig-n")},
+                {"role": "assistant", "content": "Let me check."},
+                {"type": "function_call", "call_id": "c1", "name": "f", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "c1", "output": "42"}
+            ]}),
+            "claude-sonnet-4-5",
+        );
+        assert_eq!(body["thinking"]["type"], "enabled");
+        assert_eq!(body["messages"][1]["content"][0]["type"], "thinking");
+        assert_eq!(body["messages"][2]["content"][0]["type"], "tool_use");
     }
 
     #[test]
