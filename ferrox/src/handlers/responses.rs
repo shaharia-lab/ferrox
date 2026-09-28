@@ -96,17 +96,27 @@ pub async fn responses(
     let pool = state.router.resolve(&req.model)?;
     let plan = Plan::new(&pool, &req, &body)?;
     let retry_config = &state.config.defaults.retry;
-    let response_id = new_response_id();
 
     tracing::info!(
         request_id = %ctx.request_id,
         key_name = %ctx.key_name,
         model_alias = %req.model,
-        response_id = %response_id,
         streaming = req.is_streaming(),
         native_capable = plan.native.is_some(),
         "Dispatching Responses-format request"
     );
+
+    // Only a translated answer carries a gateway id; a native one keeps the
+    // upstream's. Logged when assigned, so it correlates with `request_id`.
+    let assign_response_id = || {
+        let response_id = new_response_id();
+        tracing::info!(
+            request_id = %ctx.request_id,
+            response_id = %response_id,
+            "Responses-format response id assigned"
+        );
+        response_id
+    };
 
     let finalizer = |provider_name, model_id| {
         RequestFinalizer::new(
@@ -167,7 +177,7 @@ pub async fn responses(
             Ok((Served::Translated(stream), provider_name, model_id)) => {
                 // The emitter drains the metered stream before it emits the
                 // terminal event, so usage is recorded ahead of that frame.
-                let emitter = ResponsesEmitter::new(&req, response_id);
+                let emitter = ResponsesEmitter::new(&req, assign_response_id());
                 let sse_stream = responses_stream_to_sse(
                     emitter,
                     finalizer(provider_name, model_id)
@@ -218,7 +228,7 @@ pub async fn responses(
                 finalizer(provider_name, model_id)
                     .finish(resp.usage.as_ref())
                     .await;
-                Ok(Json(to_responses_response(resp, &req, response_id)).into_response())
+                Ok(Json(to_responses_response(resp, &req, assign_response_id())).into_response())
             }
             Err(e) => {
                 record_error_metrics(&req.model, "", &e, start);
