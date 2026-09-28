@@ -31,6 +31,7 @@ pub mod anthropic_types;
 pub mod config;
 pub mod error;
 pub mod providers;
+pub mod responses_emitter;
 pub mod responses_types;
 pub mod sse;
 pub mod types;
