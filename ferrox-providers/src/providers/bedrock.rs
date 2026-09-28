@@ -933,6 +933,7 @@ mod tests {
                         name: "get_weather".into(),
                         description: Some("w".into()),
                         parameters: Some(serde_json::json!({"type": "object"})),
+                        strict: None,
                     },
                 }]
             }),

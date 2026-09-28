@@ -20,6 +20,7 @@ pub fn is_retryable(e: &ProxyError) -> bool {
         // Non-transient — do not retry
         ProxyError::Unauthorized(_) => false,
         ProxyError::Forbidden(_) => false,
+        ProxyError::InvalidRequest { .. } => false,
         ProxyError::ModelNotFound(_) => false,
         ProxyError::RateLimited(_) => false,
         ProxyError::ConfigError(_) => false,
@@ -267,6 +268,10 @@ mod tests {
         // The gateway's own auth rejection (bad virtual key) must fail closed,
         // never burn the fallback provider's quota.
         assert!(!should_failover(&ProxyError::Forbidden("bad key".into())));
+        assert!(!should_failover(&ProxyError::InvalidRequest {
+            message: "bad param".into(),
+            param: Some("tools[0].type".into()),
+        }));
     }
 
     #[test]
@@ -308,6 +313,10 @@ mod tests {
     #[test]
     fn forbidden_not_retryable() {
         assert!(!is_retryable(&ProxyError::Forbidden("f".into())));
+        assert!(!is_retryable(&ProxyError::InvalidRequest {
+            message: "i".into(),
+            param: None,
+        }));
     }
 
     #[test]

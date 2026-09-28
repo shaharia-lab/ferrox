@@ -2,9 +2,9 @@
 //!
 //! Everything needed to speak OpenAI's chat-completions shape to Anthropic,
 //! OpenAI, Google Gemini and AWS Bedrock — the request/response types, the
-//! Anthropic Messages translation, and the adapters themselves — with none of
-//! the gateway around them (no routing, load balancing, circuit breaking, rate
-//! limiting or auth).
+//! Anthropic Messages and OpenAI Responses translations, and the adapters
+//! themselves — with none of the gateway around them (no routing, load
+//! balancing, circuit breaking, rate limiting or auth).
 //!
 //! # Features
 //!
@@ -31,5 +31,6 @@ pub mod anthropic_types;
 pub mod config;
 pub mod error;
 pub mod providers;
+pub mod responses_types;
 pub mod sse;
 pub mod types;

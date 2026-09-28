@@ -408,6 +408,7 @@ pub(crate) fn http_status_for_error(e: &ProxyError) -> u16 {
     match e {
         ProxyError::Unauthorized(_) => 401,
         ProxyError::Forbidden(_) => 403,
+        ProxyError::InvalidRequest { .. } => 400,
         ProxyError::ModelNotFound(_) => 404,
         ProxyError::RateLimited(_) | ProxyError::BudgetExceeded(_) => 429,
         ProxyError::CircuitOpen(_) | ProxyError::ProviderError { .. } => 502,
@@ -420,6 +421,7 @@ pub(crate) fn error_type_label(e: &ProxyError) -> &'static str {
     match e {
         ProxyError::Unauthorized(_) => "unauthorized",
         ProxyError::Forbidden(_) => "forbidden",
+        ProxyError::InvalidRequest { .. } => "invalid_request",
         ProxyError::ModelNotFound(_) => "model_not_found",
         ProxyError::RateLimited(_) => "rate_limited",
         ProxyError::BudgetExceeded(_) => "budget_exceeded",
@@ -741,6 +743,14 @@ mod tests {
         let cases = [
             (ProxyError::Unauthorized("x".into()), 401, "unauthorized"),
             (ProxyError::Forbidden("x".into()), 403, "forbidden"),
+            (
+                ProxyError::InvalidRequest {
+                    message: "x".into(),
+                    param: None,
+                },
+                400,
+                "invalid_request",
+            ),
             (
                 ProxyError::ModelNotFound("x".into()),
                 404,

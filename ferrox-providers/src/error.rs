@@ -16,6 +16,15 @@ pub enum ProxyError {
     #[error("Forbidden: {0}")]
     Forbidden(String),
 
+    /// The client's request is malformed or asks for something the gateway
+    /// does not support. Served as an OpenAI `invalid_request_error` 400;
+    /// `param` names the offending field (e.g. `tools[2].type`).
+    #[error("Invalid request: {message}")]
+    InvalidRequest {
+        message: String,
+        param: Option<String>,
+    },
+
     #[error("Model not found: {0}")]
     ModelNotFound(String),
 
@@ -75,6 +84,9 @@ pub fn openai_error_body(e: &ProxyError) -> (u16, serde_json::Value) {
     let (status, error_type, message) = match e {
         ProxyError::Unauthorized(msg) => (401, "unauthorized", msg.clone()),
         ProxyError::Forbidden(msg) => (403, "forbidden", msg.clone()),
+        ProxyError::InvalidRequest { message, .. } => {
+            (400, "invalid_request_error", message.clone())
+        }
         ProxyError::ModelNotFound(msg) => (404, "model_not_found", msg.clone()),
         ProxyError::RateLimited(msg) => (429, "rate_limited", msg.clone()),
         ProxyError::BudgetExceeded(msg) => (429, "budget_exceeded", msg.clone()),
@@ -100,16 +112,17 @@ pub fn openai_error_body(e: &ProxyError) -> (u16, serde_json::Value) {
         ProxyError::AwsError(msg) => (502, "aws_error", msg.clone()),
     };
 
-    (
-        status,
-        json!({
-            "error": {
-                "message": message,
-                "type": error_type,
-                "code": status
-            }
-        }),
-    )
+    let mut body = json!({
+        "error": {
+            "message": message,
+            "type": error_type,
+            "code": status
+        }
+    });
+    if let ProxyError::InvalidRequest { param, .. } = e {
+        body["error"]["param"] = param.as_deref().into();
+    }
+    (status, body)
 }
 
 /// Maps every variant onto an Anthropic-shaped JSON error body —
@@ -124,6 +137,9 @@ pub fn anthropic_error_body(e: &ProxyError) -> (u16, serde_json::Value) {
     let (status, error_type, message) = match e {
         ProxyError::Unauthorized(msg) => (401, "authentication_error", msg.clone()),
         ProxyError::Forbidden(msg) => (403, "permission_error", msg.clone()),
+        ProxyError::InvalidRequest { message, .. } => {
+            (400, "invalid_request_error", message.clone())
+        }
         ProxyError::ModelNotFound(msg) => (404, "not_found_error", msg.clone()),
         ProxyError::RateLimited(msg) | ProxyError::BudgetExceeded(msg) => {
             (429, "rate_limit_error", msg.clone())
@@ -181,6 +197,13 @@ mod body_tests {
         }
     }
 
+    fn invalid_request() -> ProxyError {
+        ProxyError::InvalidRequest {
+            message: "bad".to_string(),
+            param: Some("tools[0].type".to_string()),
+        }
+    }
+
     fn serde_error() -> ProxyError {
         ProxyError::SerializationError(serde_json::from_str::<i32>("nope").unwrap_err())
     }
@@ -223,7 +246,7 @@ mod body_tests {
 
     /// Every `ProxyError` variant, so the tables below cannot silently fall
     /// behind the enum: add a variant and the length assertions fail.
-    const VARIANT_COUNT: usize = 13;
+    const VARIANT_COUNT: usize = 14;
 
     // ── OpenAI shape ─────────────────────────────────────────────────────────
 
@@ -233,6 +256,7 @@ mod body_tests {
         let cases: Vec<(ProxyError, u16, &str)> = vec![
             (ProxyError::Unauthorized("k".into()), 401, "unauthorized"),
             (ProxyError::Forbidden("k".into()), 403, "forbidden"),
+            (invalid_request(), 400, "invalid_request_error"),
             (
                 ProxyError::ModelNotFound("m".into()),
                 404,
@@ -277,6 +301,20 @@ mod body_tests {
     }
 
     #[test]
+    fn openai_shape_names_the_param_of_an_invalid_request() {
+        let (_, body) = openai_error_body(&invalid_request());
+        assert_eq!(body["error"]["param"], "tools[0].type");
+        let (_, body) = openai_error_body(&ProxyError::InvalidRequest {
+            message: "bad".into(),
+            param: None,
+        });
+        assert!(body["error"]["param"].is_null());
+        // Other variants keep their exact pre-existing shape: no `param`.
+        let (_, body) = openai_error_body(&ProxyError::Forbidden("k".into()));
+        assert!(body["error"].get("param").is_none());
+    }
+
+    #[test]
     fn openai_shape_carries_the_message_verbatim() {
         let (_, body) = openai_error_body(&ProxyError::Forbidden("test msg".into()));
         assert_eq!(body["error"]["message"], "test msg");
@@ -293,6 +331,7 @@ mod body_tests {
                 "authentication_error",
             ),
             (ProxyError::Forbidden("k".into()), 403, "permission_error"),
+            (invalid_request(), 400, "invalid_request_error"),
             (
                 ProxyError::ModelNotFound("m".into()),
                 404,
