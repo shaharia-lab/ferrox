@@ -10,7 +10,7 @@ of the gateway around them. No routing, load balancing, circuit breaking, rate
 limiting, JWKS or auth.
 
 Ferrox itself consumes this crate, so the translation is exercised by Ferrox's
-compat suite (264 tests with `--all-features`) rather than maintained in two
+compat suite (263 tests with `--all-features`) rather than maintained in two
 places.
 
 ## Usage
@@ -142,10 +142,11 @@ let chat = to_chat_completion_request(&req)?; // Err → an OpenAI 400 naming `p
 `custom` tool becomes a function with a single string parameter `input`.
 Responses-only knobs (`include`, `reasoning.summary`, `text.verbosity`,
 `truncation`, the custom-tool names) ride on `_responses_*` keys in `extra`,
-which no adapter forwards upstream.
+which no adapter forwards upstream. `reasoning.effort` becomes `reasoning_effort`
+only; it does not switch on Anthropic extended thinking.
 
 The translation is **stateless**: `previous_response_id`, `conversation`,
-`background: true`, OpenAI-hosted built-in tools (`web_search`, `file_search`,
+stored `prompt` templates, `background: true`, OpenAI-hosted built-in tools (`web_search`, `file_search`,
 `code_interpreter`, `computer`, `mcp`, …) and `input_file` content are rejected
 as `ProxyError::InvalidRequest` — an `invalid_request_error` 400 whose `param`
 names the offending field — rather than silently dropped. `store` is accepted

@@ -10,9 +10,10 @@
 //! [`ChatCompletionRequest`] so every provider adapter can serve it.
 //!
 //! The endpoint is **stateless**: features that need server-side state
-//! (`previous_response_id`, `conversation`, `background`) and OpenAI-hosted
-//! built-in tools are rejected with an OpenAI-shaped 400 naming the offending
-//! `param` ([`ProxyError::InvalidRequest`]) — never silently dropped.
+//! (`previous_response_id`, `conversation`, `prompt`, `background`) and
+//! OpenAI-hosted built-in tools are rejected with an OpenAI-shaped 400 naming
+//! the offending `param` ([`ProxyError::InvalidRequest`]) — never silently
+//! dropped.
 //!
 //! Field inventory: `openai-python` 3.19.2,
 //! `src/openai/types/responses/{response_create_params,response_input_item_param,tool_param,function_tool}.py`.
@@ -57,9 +58,6 @@ pub const RESPONSES_MAX_TOOL_CALLS: &str = "_responses_max_tool_calls";
 /// `message_index` is the index in the translated `messages` of the assistant
 /// message the block precedes.
 pub const RESPONSES_ANTHROPIC_THINKING_BLOCKS: &str = "_responses_anthropic_thinking_blocks";
-/// Extended-thinking config read by the Anthropic adapter; the same key the
-/// `/anthropic/v1/messages` translation sets.
-const ANTHROPIC_THINKING: &str = "_anthropic_thinking";
 
 /// Prefix marking a reasoning item's `encrypted_content` as a Ferrox-encoded
 /// Anthropic thinking signature rather than an opaque OpenAI blob.
@@ -78,12 +76,6 @@ pub fn decode_anthropic_thinking_signature(encrypted_content: &str) -> Option<&s
         .strip_prefix(FERROX_ANTHROPIC_SIGNATURE_PREFIX)
         .filter(|s| !s.is_empty())
 }
-
-/// Anthropic's minimum `thinking.budget_tokens`.
-const ANTHROPIC_MIN_THINKING_BUDGET: u32 = 1024;
-/// The `max_tokens` the Anthropic adapter falls back to when the request sets
-/// none (`providers/anthropic.rs`); the thinking budget must stay below it.
-const ANTHROPIC_DEFAULT_MAX_TOKENS: u32 = 4096;
 
 /// Built-in (OpenAI-hosted) tool types. They need server-side execution this
 /// gateway does not have, so they are recognised only to be rejected.
@@ -928,13 +920,11 @@ pub fn to_chat_completion_request(
 
     if let Some(reasoning) = &req.reasoning {
         if let Some(effort) = &reasoning.effort {
+            // Only the OpenAI-shaped knob. Which Anthropic thinking mode an
+            // effort maps to depends on the target model (manual budgets are
+            // rejected by Claude 4.7+), so that belongs in the Anthropic
+            // adapter, not in this model-blind translation.
             extra.insert("reasoning_effort".to_string(), Value::from(effort.as_str()));
-            if let Some(budget) = thinking_budget(effort, req.max_output_tokens) {
-                extra.insert(
-                    ANTHROPIC_THINKING.to_string(),
-                    serde_json::json!({"type": "enabled", "budget_tokens": budget}),
-                );
-            }
         }
         if let Some(summary) = &reasoning.summary {
             extra.insert(
@@ -1007,6 +997,13 @@ fn reject_stateful_features(req: &ResponsesRequest) -> Result<(), ProxyError> {
             "`conversation` is not supported: this endpoint is stateless — \
              send the full conversation in `input`",
             "conversation",
+        ));
+    }
+    if req.extra.get("prompt").is_some_and(|p| !p.is_null()) {
+        return Err(invalid(
+            "`prompt` templates are not supported: this endpoint is stateless — \
+             send the instructions and input directly",
+            "prompt",
         ));
     }
     if req.background == Some(true) {
@@ -1305,6 +1302,10 @@ fn translate_tool_choice(choice: &Value) -> Result<Value, ProxyError> {
                     "type": "function",
                     "function": {"name": name},
                 })),
+                ("function" | "custom", None) => Err(invalid(
+                    "`tool_choice.name` is required",
+                    "tool_choice.name",
+                )),
                 _ => Err(invalid(
                     format!("tool_choice type `{kind}` is not supported"),
                     "tool_choice",
@@ -1336,26 +1337,6 @@ fn response_format(format: &TextFormat) -> Option<Value> {
             Some(serde_json::json!({"type": "json_schema", "json_schema": js}))
         }
     }
-}
-
-/// The Anthropic `thinking.budget_tokens` for a `reasoning.effort`.
-///
-/// Anthropic counts thinking inside `max_tokens` and requires the budget to be
-/// at least 1024 and below `max_tokens`, so the budget is capped at half the
-/// output limit (the answer is never starved), and no thinking is requested
-/// when even that is under the minimum. `none` and unknown efforts disable it.
-fn thinking_budget(effort: &str, max_output_tokens: Option<u32>) -> Option<u32> {
-    let wanted: u32 = match effort {
-        "minimal" => 1024,
-        "low" => 2048,
-        "medium" => 8192,
-        "high" => 16384,
-        "xhigh" => 32768,
-        _ => return None,
-    };
-    let limit = max_output_tokens.unwrap_or(ANTHROPIC_DEFAULT_MAX_TOKENS);
-    let budget = wanted.min(limit / 2);
-    (budget >= ANTHROPIC_MIN_THINKING_BUDGET).then_some(budget)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -1908,6 +1889,10 @@ mod tests {
             json!({"model": "m", "input": "x", "tool_choice": "sometimes"}),
             "tool_choice",
         );
+        rejected(
+            json!({"model": "m", "input": "x", "tool_choice": {"type": "function"}}),
+            "tool_choice.name",
+        );
     }
 
     // ── sampling / output fields ────────────────────────────────────────────
@@ -1956,31 +1941,13 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_effort_maps_and_sets_an_anthropic_budget() {
-        let req = translate(json!({"model": "m", "input": "x",
-            "max_output_tokens": 32000, "reasoning": {"effort": "high"}}));
-        assert_eq!(req.extra["reasoning_effort"], "high");
-        assert_eq!(
-            req.extra[ANTHROPIC_THINKING],
-            json!({"type": "enabled", "budget_tokens": 16000})
-        );
-    }
-
-    #[test]
-    fn thinking_budget_stays_below_max_tokens() {
-        assert_eq!(thinking_budget("medium", None), Some(2048));
-        assert_eq!(thinking_budget("medium", Some(100_000)), Some(8192));
-        assert_eq!(thinking_budget("minimal", Some(3000)), Some(1024));
-        assert_eq!(thinking_budget("high", Some(2000)), None);
-        assert_eq!(thinking_budget("none", Some(100_000)), None);
-        assert_eq!(thinking_budget("bogus", None), None);
-    }
-
-    #[test]
-    fn effort_none_passes_through_without_thinking() {
-        let req = translate(json!({"model": "m", "input": "x", "reasoning": {"effort": "none"}}));
-        assert_eq!(req.extra["reasoning_effort"], "none");
-        assert!(!req.extra.contains_key(ANTHROPIC_THINKING));
+    fn reasoning_effort_maps_without_inventing_anthropic_thinking() {
+        for effort in ["none", "minimal", "low", "medium", "high", "xhigh"] {
+            let req = translate(json!({"model": "m", "input": "x",
+                "max_output_tokens": 32000, "reasoning": {"effort": effort}}));
+            assert_eq!(req.extra["reasoning_effort"], effort);
+            assert!(!req.extra.contains_key("_anthropic_thinking"));
+        }
     }
 
     #[test]
@@ -2010,6 +1977,15 @@ mod tests {
     }
 
     #[test]
+    fn prompt_template_is_rejected() {
+        rejected(
+            json!({"model": "m", "input": "x", "prompt": {"id": "pmpt_1", "version": "2"}}),
+            "prompt",
+        );
+        translate(json!({"model": "m", "input": "x", "prompt": null}));
+    }
+
+    #[test]
     fn background_true_is_rejected_false_is_fine() {
         rejected(
             json!({"model": "m", "input": "x", "background": true}),
@@ -2019,7 +1995,7 @@ mod tests {
     }
 
     #[test]
-    fn private_keys_never_reach_an_openai_upstream_body() {
+    fn private_keys_use_only_the_responses_prefix() {
         let req = translate(codex_fixture());
         let body = serde_json::to_value(&req).unwrap();
         // `ChatCompletionRequest` itself still carries them; the OpenAI adapter
@@ -2029,7 +2005,7 @@ mod tests {
             .extra
             .keys()
             .filter(|k| k.starts_with('_'))
-            .all(|k| { k.starts_with("_responses_") || k.as_str() == ANTHROPIC_THINKING }));
+            .all(|k| k.starts_with("_responses_")));
     }
 
     // ── response / stream types ─────────────────────────────────────────────
