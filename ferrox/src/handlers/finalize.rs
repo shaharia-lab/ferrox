@@ -222,52 +222,31 @@ impl RequestFinalizer {
         // (non-caching) paths stay quiet.
         let cache_read_log = (cache_read > 0).then_some(cache_read);
         let cache_write_log = (cache_write > 0).then_some(cache_write);
+        // One field list for every surface; only the message differs, so
+        // existing log queries keep matching.
+        macro_rules! completed {
+            ($msg:literal) => {
+                tracing::info!(
+                    request_id = %self.request_id,
+                    key_name = %self.key_name,
+                    model_alias = %alias,
+                    provider = %provider,
+                    model_id = %self.model_id,
+                    streaming,
+                    status = 200,
+                    latency_ms,
+                    prompt_tokens = prompt,
+                    completion_tokens = completion,
+                    cache_read_tokens = cache_read_log,
+                    cache_write_tokens = cache_write_log,
+                    $msg
+                )
+            };
+        }
         match self.surface {
-            Surface::OpenAi => tracing::info!(
-                request_id = %self.request_id,
-                key_name = %self.key_name,
-                model_alias = %alias,
-                provider = %provider,
-                model_id = %self.model_id,
-                streaming,
-                status = 200,
-                latency_ms,
-                prompt_tokens = prompt,
-                completion_tokens = completion,
-                cache_read_tokens = cache_read_log,
-                cache_write_tokens = cache_write_log,
-                "request_completed"
-            ),
-            Surface::Anthropic => tracing::info!(
-                request_id = %self.request_id,
-                key_name = %self.key_name,
-                model_alias = %alias,
-                provider = %provider,
-                model_id = %self.model_id,
-                streaming,
-                status = 200,
-                latency_ms,
-                prompt_tokens = prompt,
-                completion_tokens = completion,
-                cache_read_tokens = cache_read_log,
-                cache_write_tokens = cache_write_log,
-                "anthropic_request_completed"
-            ),
-            Surface::Responses => tracing::info!(
-                request_id = %self.request_id,
-                key_name = %self.key_name,
-                model_alias = %alias,
-                provider = %provider,
-                model_id = %self.model_id,
-                streaming,
-                status = 200,
-                latency_ms,
-                prompt_tokens = prompt,
-                completion_tokens = completion,
-                cache_read_tokens = cache_read_log,
-                cache_write_tokens = cache_write_log,
-                "responses_request_completed"
-            ),
+            Surface::OpenAi => completed!("request_completed"),
+            Surface::Anthropic => completed!("anthropic_request_completed"),
+            Surface::Responses => completed!("responses_request_completed"),
         }
 
         let c = counts?;
