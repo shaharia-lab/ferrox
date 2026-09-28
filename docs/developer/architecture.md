@@ -237,6 +237,8 @@ ferrox/src/
   handlers/
     mod.rs
     chat.rs           chat_completions handler, dispatch_non_stream, dispatch_stream
+    anthropic_messages.rs  /anthropic/v1/messages handler (Anthropic wire encoding only)
+    finalize.rs       shared per-request accounting: RequestFinalizer, FinalizedStream, error metrics
     health.rs         /healthz, /readyz
     models.rs         /v1/models
 
@@ -313,6 +315,14 @@ sequenceDiagram
     end
 ```
 
+After dispatch, every inbound handler hands accounting to
+`handlers/finalize.rs`: `RequestFinalizer::finish` closes a non-streaming
+request, `RequestFinalizer::wrap_stream` closes a streaming one, and
+`record_error_metrics` covers a failed dispatch. Closing a request records the
+request/latency/token metrics, the `usage_log` row, the `token_usage` webhook
+and the budget reconciliation — in one place, so each handler keeps only its
+own wire encoding.
+
 ---
 
 ## Concurrency model
@@ -357,7 +367,7 @@ flowchart LR
 
 ## Streaming
 
-SSE responses are passed through with a `stream!` adapter. Token usage from the final upstream chunk is recorded before the `[DONE]` sentinel is appended.
+SSE responses are passed through `FinalizedStream` (`handlers/finalize.rs`), which records token metrics from each chunk carrying `usage` and finalizes the request exactly once. When the upstream ends it records latency, request metrics, usage, the webhook and the budget reconciliation before it reports its own end, so the handler's chained terminal frame (`[DONE]`, or the Anthropic `message_stop`) always follows the accounting. If the stream is dropped first — client disconnect, or an error part-way — the same accounting runs from `Drop`, with the budget reconciliation spawned onto the runtime. The once-guard is an owned `Option`; nothing on this path takes a lock or allocates per chunk.
 
 ```mermaid
 sequenceDiagram
