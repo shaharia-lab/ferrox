@@ -43,6 +43,28 @@ Because Ferrox exposes an OpenAI-compatible API, requests are forwarded with min
 
 **Required env var:** `OPENAI_API_KEY`
 
+### Native Responses API passthrough
+
+By default, [`POST /v1/responses`](api-reference.md#post-v1responses) is translated to Chat Completions for every provider, and the answer is translated back. That is lossy by nature. An upstream that implements the Responses API itself (OpenAI, Kimi, xAI, OpenRouter, Azure OpenAI) can take the client's request as-is instead:
+
+```yaml
+providers:
+  - name: kimi
+    type: openai
+    api_key: "${KIMI_API_KEY}"
+    base_url: "https://api.moonshot.ai/v1"
+    responses: native        # default: translate
+```
+
+With `responses: native`, a `/v1/responses` request routed to this provider is sent to `{base_url}/responses` with its body unchanged except for `model` (replaced by the target's `model_id`). The upstream's `response` object or SSE event stream is passed through verbatim. Ferrox reads only the token usage, from the body or from the terminal `response.completed` / `response.incomplete` / `response.failed` event, for metrics, `usage_log`, budgets and webhooks.
+
+- **Full fidelity.** Hosted built-in tools, `reasoning.encrypted_content`, file inputs and fields newer than Ferrox reach the upstream. None of them can be translated, so on a mixed alias a request that uses them is served only by the native targets. A translate-only target is skipped without touching its circuit breaker, and the request gets a `400` when no native target can take it.
+- **Mixed routing.** Each attempt is decided by its target, so failover from a native target to a translate-only one (e.g. Kimi → GLM) still returns a valid Responses answer, just a translated one.
+- **Still stateless.** `previous_response_id`, `conversation`, `prompt` and `background: true` are rejected with a `400`, and so is `store: true` on an alias with a native target. When `store` is omitted, the upstream's default applies (OpenAI stores responses by default), so send `store: false` if that matters.
+- **Upstream ids.** The `resp_…` ids and the `model` field come from the upstream, not from Ferrox.
+- **Security.** The body is sent with the provider's `api_key`, so any virtual key allowed on the alias can reach what that upstream account holds: files and vector stores by id (`input_file`, `input_image` by `file_id`, `file_search`), and hosted tools (`web_search`, `code_interpreter`, `mcp`, …) that run and bill there. The translate path rejects all of these. Give each native provider a dedicated upstream key or project rather than one shared with other workloads or tenants.
+- Only `type: openai` providers accept `responses: native`; the Chat Completions surfaces are unaffected by it.
+
 ---
 
 ## Gemini

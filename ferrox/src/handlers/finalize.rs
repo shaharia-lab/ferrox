@@ -8,7 +8,7 @@
 //! once; each handler keeps only its own wire encoding.
 //!
 //! - [`RequestFinalizer::finish`] closes a non-streaming request.
-//! - [`RequestFinalizer::wrap_stream`] meters a [`ProviderStream`] and closes the
+//! - [`RequestFinalizer::wrap_stream`] meters a [`ProviderStream`](crate::providers::ProviderStream) and closes the
 //!   request exactly once — when the upstream stream ends (before the handler
 //!   emits its terminal frame), or when the stream is dropped part-way because
 //!   the client disconnected or the body errored.
@@ -20,19 +20,20 @@ use std::task::{ready, Context, Poll};
 use std::time::Instant;
 
 use futures::future::BoxFuture;
+use futures::stream::BoxStream;
 use futures::{Stream, StreamExt as _};
 use uuid::Uuid;
 
 use crate::budget_enforcer::BudgetEnforcer;
 use crate::error::ProxyError;
 use crate::event_dispatcher::{EventDispatcher, TokenUsageEvent};
-use crate::providers::ProviderStream;
 use crate::state::AppState;
 use crate::telemetry::metrics::{
     self, ACTIVE_STREAMS, ERRORS_TOTAL, REQUESTS_TOTAL, REQUEST_DURATION_SECONDS,
 };
 use crate::types::{ChatCompletionChunk, RequestContext, Usage};
 use crate::usage_writer::{UsageEvent, UsageWriter};
+use ferrox_providers::responses_types::NativeResponsesEvent;
 
 /// Which inbound surface a request arrived on. Only selects the log message,
 /// so existing log queries keep matching.
@@ -163,11 +164,15 @@ impl RequestFinalizer {
         }
     }
 
-    /// Meter a provider stream and close the request exactly once.
+    /// Meter a provider stream — chat chunks, or a native Responses event
+    /// stream — and close the request exactly once.
     ///
     /// Increments `ferrox_active_streams` now; the wrapper decrements it when
     /// it finalizes.
-    pub(crate) fn wrap_stream(self, inner: ProviderStream) -> FinalizedStream {
+    pub(crate) fn wrap_stream<T: Metered>(
+        self,
+        inner: BoxStream<'static, Result<T, ProxyError>>,
+    ) -> FinalizedStream<T> {
         ACTIVE_STREAMS
             .with_label_values(&[self.provider.as_str(), self.model_alias.as_str()])
             .inc();
@@ -176,6 +181,7 @@ impl RequestFinalizer {
             finalizer: Some(self),
             last_usage: None,
             reconcile: None,
+            held: None,
         }
     }
 
@@ -290,22 +296,56 @@ impl RequestFinalizer {
     }
 }
 
-/// A [`ProviderStream`] that records token metrics from each chunk carrying
-/// `usage`, and finalizes the request exactly once: when the upstream ends
+/// A stream item that may carry the request's token usage: a chat chunk, or
+/// the terminal event of a native Responses stream.
+pub(crate) trait Metered {
+    fn usage(&self) -> Option<&Usage>;
+
+    /// Whether this item is the client-visible end of the answer, to be held
+    /// back until the request is settled so the client never sees the answer
+    /// complete before its budget is reconciled. Chat chunks are followed by
+    /// the handler's own terminal frame, so they are never held.
+    fn is_terminal(&self) -> bool {
+        false
+    }
+}
+
+impl Metered for ChatCompletionChunk {
+    fn usage(&self) -> Option<&Usage> {
+        self.usage.as_ref()
+    }
+}
+
+impl Metered for NativeResponsesEvent {
+    fn usage(&self) -> Option<&Usage> {
+        self.usage.as_ref()
+    }
+
+    /// A native stream's terminal event carries the usage and is the last
+    /// frame the client gets.
+    fn is_terminal(&self) -> bool {
+        self.usage.is_some()
+    }
+}
+
+/// A [`ProviderStream`](crate::providers::ProviderStream) (or any other [`Metered`] stream) that records token
+/// metrics from each item carrying `usage`, and finalizes the request exactly once: when the upstream ends
 /// (the budget reconciliation is awaited before this stream reports its end,
-/// so a handler's chained terminal frame always follows the accounting), or
-/// on drop if it never got that far.
+/// so a handler's chained terminal frame — or a held [`Metered::is_terminal`]
+/// item — always follows the accounting), or on drop if it never got that far.
 ///
 /// The once-guard is the `Option` around the finalizer; no locks, and nothing
 /// is allocated per chunk.
-pub(crate) struct FinalizedStream {
-    inner: ProviderStream,
+pub(crate) struct FinalizedStream<T = ChatCompletionChunk> {
+    inner: BoxStream<'static, Result<T, ProxyError>>,
     finalizer: Option<RequestFinalizer>,
     last_usage: Option<TokenCounts>,
     reconcile: Option<BoxFuture<'static, ()>>,
+    /// A terminal item waiting for the request to settle.
+    held: Option<T>,
 }
 
-impl FinalizedStream {
+impl<T> FinalizedStream<T> {
     /// Settle the request if it has not been already. A stream that never saw
     /// non-zero prompt or completion tokens records no usage.
     fn settle(&mut self) -> Option<BoxFuture<'static, ()>> {
@@ -317,8 +357,8 @@ impl FinalizedStream {
     }
 }
 
-impl Stream for FinalizedStream {
-    type Item = Result<ChatCompletionChunk, ProxyError>;
+impl<T: Metered + Unpin> Stream for FinalizedStream<T> {
+    type Item = Result<T, ProxyError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = &mut *self;
@@ -326,31 +366,41 @@ impl Stream for FinalizedStream {
             if let Some(fut) = this.reconcile.as_mut() {
                 ready!(fut.as_mut().poll(cx));
                 this.reconcile = None;
-                return Poll::Ready(None);
+                return Poll::Ready(this.held.take().map(Ok));
             }
             let Some(finalizer) = this.finalizer.as_ref() else {
-                return Poll::Ready(None);
+                return Poll::Ready(this.held.take().map(Ok));
             };
             match ready!(this.inner.poll_next_unpin(cx)) {
                 Some(Ok(chunk)) => {
-                    if let Some(usage) = &chunk.usage {
+                    if let Some(usage) = chunk.usage() {
                         let c = TokenCounts::from_usage(usage);
                         finalizer.record_token_metrics(c);
                         this.last_usage = Some(c);
                     }
-                    return Poll::Ready(Some(Ok(chunk)));
+                    if !chunk.is_terminal() {
+                        return Poll::Ready(Some(Ok(chunk)));
+                    }
+                    // The answer is complete: settle now, release it after,
+                    // and read nothing more from the upstream — a trailing
+                    // frame must not overtake it.
+                    this.held = Some(chunk);
+                    match this.settle() {
+                        Some(fut) => this.reconcile = Some(fut),
+                        None => return Poll::Ready(this.held.take().map(Ok)),
+                    }
                 }
                 Some(Err(e)) => return Poll::Ready(Some(Err(e))),
                 None => match this.settle() {
                     Some(fut) => this.reconcile = Some(fut),
-                    None => return Poll::Ready(None),
+                    None => return Poll::Ready(this.held.take().map(Ok)),
                 },
             }
         }
     }
 }
 
-impl Drop for FinalizedStream {
+impl<T> Drop for FinalizedStream<T> {
     fn drop(&mut self) {
         // Client disconnected, the body errored, or the reconciliation was
         // still in flight: finish the accounting, handing any owed
@@ -644,6 +694,42 @@ mod tests {
         assert_eq!(h.reconciles().len(), 1);
         assert_eq!(requests_total("stream-full"), 1.0);
         assert_eq!(active_streams("stream-full"), 0.0);
+    }
+
+    #[tokio::test]
+    async fn native_terminal_event_is_held_until_the_request_is_settled() {
+        let mut h = Harness::new("fin-native-hold");
+        let event = |name: &str, usage: Option<Usage>| {
+            let mut e = NativeResponsesEvent::new(Some(name.to_string()), "{}".to_string());
+            e.usage = usage;
+            Ok::<_, ProxyError>(e)
+        };
+        let inner = futures::stream::iter(vec![
+            event("response.created", None),
+            event("response.completed", Some(usage(3, 4))),
+            // Anything after the terminal event must not overtake or replace
+            // it: nothing more is read from the upstream.
+            event("response.output_text.delta", None),
+            Err(ProxyError::StreamError("reset".into())),
+        ])
+        .boxed();
+        let budget = h.budget.clone();
+        let mut out = Box::pin(h.take().wrap_stream(inner));
+
+        let first = out.next().await.unwrap().unwrap();
+        assert_eq!(first.event.as_deref(), Some("response.created"));
+        assert!(budget.calls.lock().unwrap().is_empty());
+
+        let last = out.next().await.unwrap().unwrap();
+        assert_eq!(last.event.as_deref(), Some("response.completed"));
+        assert_eq!(
+            h.reconciles().len(),
+            1,
+            "reconciled before the terminal event is released"
+        );
+        assert!(out.next().await.is_none());
+        let row = h.usage_rx.try_recv().expect("usage row");
+        assert_eq!((row.prompt_tokens, row.completion_tokens), (3, 4));
     }
 
     #[tokio::test]

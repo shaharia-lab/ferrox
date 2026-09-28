@@ -154,6 +154,25 @@ pub struct ProviderConfig {
     pub aws: Option<AwsConfig>,
     pub timeouts: Option<TimeoutsConfig>,
     pub circuit_breaker: Option<CircuitBreakerConfig>,
+    /// How `/v1/responses` requests reach this provider. Only `type: openai`
+    /// may set [`ResponsesMode::Native`]; the gateway rejects it elsewhere.
+    #[serde(default)]
+    pub responses: ResponsesMode,
+}
+
+/// How a provider serves the OpenAI **Responses API** (`POST /v1/responses`).
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ResponsesMode {
+    /// Translate the request to Chat Completions and the answer back (works
+    /// for every provider).
+    #[default]
+    Translate,
+    /// Forward the client's Responses body to the provider's own
+    /// `{base_url}/responses` unchanged except for `model`, and pass its
+    /// answer through. For upstreams that implement the Responses API
+    /// themselves (OpenAI, Kimi, xAI, OpenRouter, Azure).
+    Native,
 }
 
 /// AWS configuration for a `bedrock` provider: the region and how to obtain
@@ -250,5 +269,18 @@ circuit_breaker:
         let yaml = "retry:\n  max_attempts: 7\n";
         let cfg: DefaultsConfig = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(cfg.retry.max_attempts, 7);
+    }
+
+    #[test]
+    fn responses_mode_defaults_to_translate_and_parses_native() {
+        let cfg: ProviderConfig = serde_yaml::from_str("name: p\ntype: openai\n").unwrap();
+        assert_eq!(cfg.responses, ResponsesMode::Translate);
+        let cfg: ProviderConfig =
+            serde_yaml::from_str("name: p\ntype: openai\nresponses: native\n").unwrap();
+        assert_eq!(cfg.responses, ResponsesMode::Native);
+        assert!(
+            serde_yaml::from_str::<ProviderConfig>("name: p\ntype: openai\nresponses: x\n")
+                .is_err()
+        );
     }
 }

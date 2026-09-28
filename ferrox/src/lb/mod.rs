@@ -78,10 +78,16 @@ impl RoutePool {
         })
     }
 
-    /// Select the best available primary target.
+    /// Select the best available primary target among those `eligible` for
+    /// this request. Eligibility is checked first: `is_available` claims a
+    /// half-open breaker's probe slot, which only an attempt gives back.
     /// Also records the `routing_target_selected` metric.
-    pub fn select_target(&self) -> Option<&RouteTarget> {
-        let available: Vec<bool> = self.targets.iter().map(|t| t.is_available()).collect();
+    pub fn select_target(&self, eligible: impl Fn(&RouteTarget) -> bool) -> Option<&RouteTarget> {
+        let available: Vec<bool> = self
+            .targets
+            .iter()
+            .map(|t| eligible(t) && t.is_available())
+            .collect();
         let idx = self.strategy.select(&available)?;
         let target = &self.targets[idx];
 

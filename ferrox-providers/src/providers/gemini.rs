@@ -791,6 +791,7 @@ mod tests {
                 aws: None,
                 timeouts: None,
                 circuit_breaker: None,
+                responses: Default::default(),
             },
             &DefaultsConfig::default(),
         )

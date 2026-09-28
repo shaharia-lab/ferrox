@@ -143,7 +143,7 @@ All errors use OpenAI error format:
 
 The OpenAI **Responses API** (`client.responses.create(...)`), used by Codex CLI, the OpenAI Agents SDK and newer OpenAI SDK code. Ferrox translates the request to its internal chat format, routes it exactly like `/v1/chat/completions` (same aliases, retries, failover, circuit breakers, virtual-key auth, rate limits, budgets, `usage_log` rows and `token_usage` webhooks), and encodes the answer back as a Responses object. It therefore works with **every** configured provider, not only OpenAI.
 
-The endpoint is **stateless**: nothing is stored, `store` is accepted and always echoed as `false`, and the client sends the full conversation in `input` on every turn (which is what Codex CLI does).
+The endpoint is **stateless**: nothing is stored, `store` is accepted and always echoed as `false` (except on a [native](#native-passthrough) alias), and the client sends the full conversation in `input` on every turn (which is what Codex CLI does).
 
 ### Request
 
@@ -177,7 +177,7 @@ The endpoint is **stateless**: nothing is stored, `store` is accepted and always
 
 Unknown top-level fields are ignored, so a newer SDK still works.
 
-**Rejected with a 400** (`invalid_request_error`, with `param` naming the field):
+**Rejected with a 400** (`invalid_request_error`, with `param` naming the field; a [native](#native-passthrough) target accepts the last two rows):
 
 | Field | Why |
 |---|---|
@@ -187,6 +187,10 @@ Unknown top-level fields are ignored, so a newer SDK still works.
 | `input_image` with only a `file_id`, `input_file` content | Need the OpenAI Files API |
 
 `GET` / `DELETE /v1/responses/{id}`, `input_items`, `cancel`, `input_tokens`, `compact` and WebSocket mode are not implemented.
+
+### Native passthrough
+
+A `type: openai` provider configured with `responses: native` receives the client's body unchanged except for `model`, at `{base_url}/responses`, and its `response` object or event stream is passed through verbatim (ids and `model` are the upstream's). Accounting is the same as above. On such a target, the hosted tools and Files-API inputs in the table above are **not** rejected; on an alias with a mix of native and translate-only targets, requests using them go only to the native ones (or get the `400` when none can take them). `store: true` is rejected with a `400` on any alias with a native target. See [providers](providers.md#native-responses-api-passthrough).
 
 ### Non-streaming response
 

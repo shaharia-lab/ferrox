@@ -303,10 +303,10 @@
         },
         "responses": {
           "200": {
-            "description": "Response object. JSON body (mirrors the OpenAI Responses API `response` object), or an SSE stream of typed `response.*` events ending in exactly one of `response.completed` / `response.incomplete` / `response.failed` when `stream=true` (no `[DONE]` sentinel)."
+            "description": "Response object. JSON body (mirrors the OpenAI Responses API `response` object), or an SSE stream of typed `response.*` events ending in exactly one of `response.completed` / `response.incomplete` / `response.failed` when `stream=true` (no `[DONE]` sentinel). From a `responses: native` provider, the upstream's own body or events, passed through."
           },
           "400": {
-            "description": "Malformed body, or a stateful / unsupported feature (`previous_response_id`, `conversation`, `prompt`, `background`, hosted built-in tools, `input_file`, `input_image` by `file_id`)",
+            "description": "Malformed body, or a stateful / unsupported feature (`previous_response_id`, `conversation`, `prompt`, `background`; `store: true` on an alias with a native target; hosted built-in tools, `input_file` and `input_image` by `file_id` when no native target can serve the request)",
             "content": {
               "application/json": {
                 "schema": {

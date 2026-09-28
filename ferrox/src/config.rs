@@ -13,7 +13,7 @@ use std::env;
 #[allow(unused_imports)]
 pub use ferrox_providers::config::{
     AwsAssumeRoleConfig, AwsAuthConfig, AwsConfig, CircuitBreakerConfig, DefaultsConfig,
-    ProviderConfig, ProviderType, RetryConfig, TimeoutsConfig,
+    ProviderConfig, ProviderType, ResponsesMode, RetryConfig, TimeoutsConfig,
 };
 
 // ── Sub-configs ──────────────────────────────────────────────────────────────
@@ -510,6 +510,17 @@ pub(crate) fn validate(config: &Config) -> Result<(), anyhow::Error> {
         }
     }
 
+    // Native /responses passthrough needs an upstream that speaks the
+    // Responses API; only a generic OpenAI-protocol provider can.
+    for p in &config.providers {
+        if p.responses == ResponsesMode::Native && p.provider_type != ProviderType::OpenAI {
+            bail!(
+                "Provider '{}': 'responses: native' is only supported for type 'openai'",
+                p.name
+            );
+        }
+    }
+
     // Validate AWS credential configuration for Bedrock providers.
     for p in &config.providers {
         if let Some(auth) = p.aws.as_ref().and_then(|a| a.auth.as_ref()) {
@@ -614,6 +625,7 @@ mod tests {
                 aws: None,
                 timeouts: None,
                 circuit_breaker: None,
+                responses: Default::default(),
             }],
             models: vec![ModelConfig {
                 alias: alias.to_string(),
@@ -653,9 +665,24 @@ mod tests {
             aws: None,
             timeouts: None,
             circuit_breaker: None,
+            responses: Default::default(),
         });
         let err = validate(&config).unwrap_err().to_string();
         assert!(err.contains("Duplicate provider name"));
+    }
+
+    #[test]
+    fn validate_allows_native_responses_only_on_openai_providers() {
+        let mut config = minimal_config("openai", "gpt-4");
+        config.providers[0].responses = ResponsesMode::Native;
+        assert!(validate(&config).is_ok());
+
+        config.providers[0].provider_type = ProviderType::Glm;
+        let err = validate(&config).unwrap_err().to_string();
+        assert!(
+            err.contains("'responses: native' is only supported"),
+            "{err}"
+        );
     }
 
     #[test]

@@ -175,6 +175,17 @@ before any event becomes a bare `error` event. With the `axum` feature,
 thinking signature on `_anthropic_thinking_signature` (message / chunk-choice
 `extra`) gets it back as the reasoning item's `encrypted_content`.
 
+**Native passthrough.** A provider configured with `responses: native`
+(`ResponsesMode::Native`; the OpenAI adapter only) reports
+`supports_native_responses()`, and its `responses` / `responses_stream` take the
+client's body as a JSON object, POST it to `{base_url}/responses` with only
+`model` replaced, and return the upstream's answer untouched: a
+`NativeResponse` (the body bytes) or a stream of `NativeResponsesEvent`s (the
+SSE `event` / `data`). Each carries its `usage` in the internal shape, read only
+from the body or the terminal event. Every other adapter keeps the trait
+defaults: `false`, and an error. `reject_native_stateful_features` is the
+stateless check for that path (the translation's, plus `store: true`).
+
 ## MSRV
 
 **1.88**, upheld for every feature combination *except* `bedrock`: the AWS SDK
