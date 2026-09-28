@@ -62,6 +62,7 @@ With `responses: native`, a `/v1/responses` request routed to this provider is s
 - **Mixed routing.** Each attempt is decided by its target, so failover from a native target to a translate-only one (e.g. Kimi → GLM) still returns a valid Responses answer, just a translated one.
 - **Still stateless.** `previous_response_id`, `conversation`, `prompt` and `background: true` are rejected with a `400`, and so is `store: true` on an alias with a native target. When `store` is omitted, the upstream's default applies (OpenAI stores responses by default), so send `store: false` if that matters.
 - **Upstream ids.** The `resp_…` ids and the `model` field come from the upstream, not from Ferrox.
+- **Security.** The body is sent with the provider's `api_key`, so any virtual key allowed on the alias can reach what that upstream account holds: files and vector stores by id (`input_file`, `input_image` by `file_id`, `file_search`), and hosted tools (`web_search`, `code_interpreter`, `mcp`, …) that run and bill there. The translate path rejects all of these. Give each native provider a dedicated upstream key or project rather than one shared with other workloads or tenants.
 - Only `type: openai` providers accept `responses: native`; the Chat Completions surfaces are unaffected by it.
 
 ---

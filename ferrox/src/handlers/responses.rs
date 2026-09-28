@@ -1090,6 +1090,79 @@ data: {"type":"response.output_text.delta","delta":"Hi"}"#
     }
 
     #[tokio::test]
+    async fn an_unavailable_capable_target_is_a_502_not_the_skip_reason() {
+        // The only target able to serve the request has its breaker open;
+        // the other is skipped. That is a retryable outage, not a 400.
+        let config: Config = serde_json::from_value(json!({
+            "providers": [
+                {"name": "down", "type": "openai",
+                 "circuit_breaker": {"failure_threshold": 1, "recovery_timeout_secs": 3600}},
+                {"name": "ok", "type": "openai"}
+            ],
+            "models": [{"alias": "resp-skip-open", "routing": {
+                "strategy": "failover",
+                "targets": [{"provider": "down", "model_id": "down-v1"}],
+                "fallback": [{"provider": "ok", "model_id": "ok-v1"}]}}]
+        }))
+        .unwrap();
+        let mut registry: ProviderRegistry = HashMap::new();
+        registry.insert("down".to_string(), Arc::new(DownProvider));
+        registry.insert(
+            "ok".to_string(),
+            Arc::new(OkProvider {
+                seen: Mutex::new(None),
+            }),
+        );
+        let router = crate::router::ModelRouter::from_config(&config, &registry).unwrap();
+        let pool = router.resolve("resp-skip-open").unwrap();
+        pool.targets[0].circuit_breaker.record_failure();
+
+        let req: ChatCompletionRequest =
+            serde_json::from_value(json!({"model": "m", "messages": []})).unwrap();
+        let skip_ok = |t: &crate::lb::RouteTarget| {
+            (t.provider.name() == "ok").then(|| ProxyError::InvalidRequest {
+                message: "untranslatable".to_string(),
+                param: None,
+            })
+        };
+        let result = crate::handlers::chat::dispatch(
+            &pool,
+            &config.defaults.retry,
+            false,
+            skip_ok,
+            |provider, model_id| {
+                let req = &req;
+                async move { provider.chat(req, &model_id).await }
+            },
+        )
+        .await;
+        assert!(
+            matches!(result, Err(ProxyError::ProviderError { status: 502, .. })),
+            "{:?}",
+            result.err()
+        );
+
+        // Every target skipped: the skip reason is the answer.
+        let result = crate::handlers::chat::dispatch(
+            &pool,
+            &config.defaults.retry,
+            false,
+            |_| {
+                Some(ProxyError::InvalidRequest {
+                    message: "untranslatable".to_string(),
+                    param: None,
+                })
+            },
+            |provider, model_id| {
+                let req = &req;
+                async move { provider.chat(req, &model_id).await }
+            },
+        )
+        .await;
+        assert!(matches!(result, Err(ProxyError::InvalidRequest { .. })));
+    }
+
+    #[tokio::test]
     async fn native_aliases_still_reject_stateful_fields() {
         let alias = "resp-native-stateful";
         let upstream = mock_upstream(200).await;

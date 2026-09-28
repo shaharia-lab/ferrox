@@ -168,8 +168,9 @@ pub(crate) async fn dispatch_stream(
 /// Responses request using native-only features, on a translate-only
 /// provider). Such a target is never selected as the primary, and is passed
 /// over in the fallback chain, without an attempt and without touching its
-/// circuit breaker (not even claiming a half-open probe); if no target was
-/// attempted, the first such reason is the error.
+/// circuit breaker (not even claiming a half-open probe). When every target
+/// is skipped, the first such reason is the error; otherwise a request no
+/// target served is a 502.
 ///
 /// Returns `(output, provider_name, model_id)` on success.
 pub(crate) async fn dispatch<T, F, Fut>(
@@ -183,8 +184,6 @@ where
     F: Fn(Arc<dyn ProviderAdapter>, String) -> Fut,
     Fut: Future<Output = Result<T, ProxyError>>,
 {
-    let mut attempted = false;
-
     // Try primary targets: the strategy picks among the available ones this
     // request can go to.
     let primary = pool.select_target(|t| skip(t).is_none());
@@ -193,7 +192,6 @@ where
         None => pool.targets.iter().find_map(&skip),
     };
     if let Some(target) = primary {
-        attempted = true;
         let provider_name = target.provider.name().to_string();
         let model_id = target.model_id.clone();
 
@@ -227,7 +225,6 @@ where
         if !fallback.is_available() {
             continue;
         }
-        attempted = true;
         let provider_name = fallback.provider.name().to_string();
         let model_id = fallback.model_id.clone();
 
@@ -252,8 +249,20 @@ where
         }
     }
 
+    // The skip reason is the answer only when no target could ever serve the
+    // request. One that could but is down (breaker open) or failed makes this
+    // a retryable 502, not a client error. Only reached with a reason when
+    // something was skipped, so the chat path never evaluates this.
     match skipped {
-        Some(reason) if !attempted => Err(reason),
+        Some(reason)
+            if pool
+                .targets
+                .iter()
+                .chain(&pool.fallbacks)
+                .all(|t| skip(t).is_some()) =>
+        {
+            Err(reason)
+        }
         _ => Err(ProxyError::ProviderError {
             provider: pool.alias.clone(),
             status: StatusCode::BAD_GATEWAY.as_u16(),
