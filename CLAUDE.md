@@ -91,7 +91,7 @@ Client → [auth middleware] → [rate limiter] → ModelRouter
 
 | Service | Port | Notes |
 |---------|------|-------|
-| Ferrox gateway | 8080 | OpenAI-compatible API |
+| Ferrox gateway | 8080 | `/v1/chat/completions`, `/v1/responses`, `/anthropic/v1/messages` |
 | Control plane | 9090 | Admin UI + JWKS + token endpoint |
 | Grafana | 3000 | admin/admin |
 | OTLP gRPC | 4317 | |
@@ -123,6 +123,7 @@ Project-scoped agents live in `.claude/agents/`. Invoke with `@<name>` in any Cl
 | Full configuration reference | `docs/user/configuration.md` |
 | Provider setup (Anthropic, OpenAI, Gemini, Bedrock) | `docs/user/providers.md` |
 | GLM / Kimi coding plans in Claude Code | `docs/user/coding-plans-in-claude-code.md` |
+| Codex CLI via `/v1/responses` | `docs/user/codex-cli.md` |
 | Routing strategies & failover | `docs/user/routing.md` |
 | Virtual keys & rate limiting | `docs/user/virtual-keys.md` |
 | API endpoint reference | `docs/user/api-reference.md` |

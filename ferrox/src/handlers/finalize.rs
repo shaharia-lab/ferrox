@@ -1,6 +1,7 @@
 //! Per-request accounting shared by the inbound handlers.
 //!
-//! Every inbound surface (`/v1/chat/completions`, `/anthropic/v1/messages`)
+//! Every inbound surface (`/v1/chat/completions`, `/anthropic/v1/messages`,
+//! `/v1/responses`)
 //! dispatches through the same OpenAI-format pipeline and must account for the
 //! request identically: token and latency metrics, the `usage_log` row, the
 //! `token_usage` webhook and the budget reconciliation. That logic lives here,
@@ -39,6 +40,7 @@ use crate::usage_writer::{UsageEvent, UsageWriter};
 pub(crate) enum Surface {
     OpenAi,
     Anthropic,
+    Responses,
 }
 
 /// Plain token counts read once from a [`Usage`].
@@ -250,6 +252,21 @@ impl RequestFinalizer {
                 cache_read_tokens = cache_read_log,
                 cache_write_tokens = cache_write_log,
                 "anthropic_request_completed"
+            ),
+            Surface::Responses => tracing::info!(
+                request_id = %self.request_id,
+                key_name = %self.key_name,
+                model_alias = %alias,
+                provider = %provider,
+                model_id = %self.model_id,
+                streaming,
+                status = 200,
+                latency_ms,
+                prompt_tokens = prompt,
+                completion_tokens = completion,
+                cache_read_tokens = cache_read_log,
+                cache_write_tokens = cache_write_log,
+                "responses_request_completed"
             ),
         }
 

@@ -4,3 +4,4 @@ pub mod chat;
 pub(crate) mod finalize;
 pub mod health;
 pub mod models;
+pub mod responses;

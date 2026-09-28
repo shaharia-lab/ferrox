@@ -6,7 +6,8 @@ Ferrox is a stateless HTTP proxy. Every request is self-contained; no session st
 
 ```mermaid
 flowchart TD
-    OAI[OpenAI SDK / Codex CLI]  -->|POST /v1/chat/completions\nAuthorization: Bearer| Axum
+    OAI[OpenAI SDK]  -->|POST /v1/chat/completions\nAuthorization: Bearer| Axum
+    RSP[OpenAI SDK Responses / Codex CLI]  -->|POST /v1/responses\nAuthorization: Bearer| Axum
     ANT[Anthropic SDK / Claude Code CLI] -->|POST /anthropic/v1/messages\nx-api-key| Axum
 
     subgraph Ferrox["Ferrox (single binary)"]
@@ -238,6 +239,7 @@ ferrox/src/
     mod.rs
     chat.rs           chat_completions handler, dispatch_non_stream, dispatch_stream
     anthropic_messages.rs  /anthropic/v1/messages handler (Anthropic wire encoding only)
+    responses.rs      /v1/responses handler (Responses wire encoding only)
     finalize.rs       shared per-request accounting: RequestFinalizer, FinalizedStream, error metrics
     health.rs         /healthz, /readyz
     models.rs         /v1/models

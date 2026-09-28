@@ -18,6 +18,7 @@ use crate::handlers::{
     chat::chat_completions,
     health::{healthz, readyz},
     models::list_models,
+    responses::responses,
 };
 use crate::state::AppState;
 use crate::telemetry::metrics::gather as gather_metrics;
@@ -28,6 +29,7 @@ pub fn build_router(state: AppState) -> Router {
     // OpenAI-compatible routes (Authorization: Bearer)
     let v1_routes = Router::new()
         .route("/v1/chat/completions", post(chat_completions))
+        .route("/v1/responses", post(responses))
         .route("/v1/models", get(list_models))
         .layer(middleware::from_fn_with_state(
             state.clone(),

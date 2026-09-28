@@ -8,6 +8,7 @@ Ferrox is a stateless, horizontally-scalable LLM API gateway written in Rust. It
 ## Features
 
 - **OpenAI-compatible API** - drop-in replacement; no client-side changes needed
+- **Three client dialects** - `/v1/chat/completions`, `/v1/responses` (Responses API, Codex CLI) and `/anthropic/v1/messages` (Claude Code), each served by every provider
 - **Multi-provider routing** - round-robin, weighted, failover, and random strategies
 - **Fallback chains** - automatic failover to backup providers on failure
 - **Circuit breakers** - lock-free, per-provider; prevents cascading failures
@@ -160,6 +161,7 @@ curl http://localhost:8080/v1/chat/completions \
 | [Configuration](docs/user/configuration.md) | Full config reference |
 | [Providers](docs/user/providers.md) | Anthropic, OpenAI, Gemini, Bedrock setup |
 | [GLM & Kimi in Claude Code](docs/user/coding-plans-in-claude-code.md) | Use Z.AI / Moonshot coding plans from Claude Code |
+| [Codex CLI](docs/user/codex-cli.md) | Run Codex CLI on any provider via `/v1/responses` |
 | [Routing](docs/user/routing.md) | Strategies, failover, circuit breakers |
 | [Virtual Keys](docs/user/virtual-keys.md) | Auth, rate limits, model access |
 | [API Reference](docs/user/api-reference.md) | Endpoints and request/response formats |

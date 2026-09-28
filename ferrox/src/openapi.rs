@@ -5,8 +5,8 @@
 //! from a cold, unauthenticated `/api-schema` (alias `/openapi.json`) route — no
 //! hot-path impact.
 //!
-//! Scope guardrail: the `/v1/chat/completions` and `/anthropic/v1/messages`
-//! bodies mirror the upstream OpenAI / Anthropic wire formats (streaming deltas,
+//! Scope guardrail: the `/v1/chat/completions`, `/v1/responses` and
+//! `/anthropic/v1/messages` bodies mirror the upstream OpenAI / Anthropic wire formats (streaming deltas,
 //! tool-call unions, multimodal content blocks). Reproducing those in full would
 //! be huge and would drift, so only the fields Ferrox itself owns/reads are
 //! modeled here, with a pointer to the upstream spec for the exhaustive tail.
@@ -84,6 +84,38 @@ pub struct AnthropicMessagesRequestCore {
     pub stream: Option<bool>,
 }
 
+/// Core of the OpenAI Responses API request. The request is translated to the
+/// internal chat format and served by any configured provider; only the fields
+/// the gateway reads or owns are modeled. See
+/// <https://platform.openai.com/docs/api-reference/responses/create> for the
+/// exhaustive schema (input item union, tools, `text.format`, `reasoning`).
+///
+/// The endpoint is stateless: `previous_response_id`, `conversation`,
+/// `background: true` and hosted built-in tools are rejected with a 400.
+///
+/// Schema-only (see `ChatCompletionRequestCore`): describes the request body,
+/// not read at runtime.
+#[derive(ToSchema)]
+#[allow(dead_code)]
+pub struct ResponsesRequestCore {
+    /// Model alias to route to — one of the aliases returned by `GET /v1/models`.
+    #[schema(example = "claude-sonnet")]
+    pub model: String,
+    /// A plain string (one user message) or a list of input items (`message`,
+    /// `function_call`, `function_call_output`, `reasoning`, ...). Modeled here
+    /// as opaque; see the upstream spec for the item union.
+    #[schema(value_type = Object)]
+    pub input: serde_json::Value,
+    /// System-level instructions, sent as a leading system message.
+    pub instructions: Option<String>,
+    /// Upper bound on generated tokens.
+    #[schema(example = 1024)]
+    pub max_output_tokens: Option<u32>,
+    /// When `true`, the response is streamed as typed `response.*` SSE events
+    /// (no `[DONE]` sentinel).
+    pub stream: Option<bool>,
+}
+
 /// Adds the two authentication schemes the gateway accepts to the spec's
 /// components so annotated routes can reference them.
 struct SecurityAddon;
@@ -129,12 +161,13 @@ fn metrics_doc() {}
         title = "Ferrox Gateway API",
         description = "Stateless, OpenAI-compatible LLM gateway. Exposes OpenAI-format and \
                        Anthropic-native inference routes plus operational endpoints. The \
-                       chat/messages request and response bodies mirror the upstream OpenAI / \
+                       chat/responses/messages request and response bodies mirror the upstream OpenAI / \
                        Anthropic wire formats — only the fields Ferrox owns are modeled here; \
                        refer to the upstream specs for the exhaustive schema.",
     ),
     paths(
         crate::handlers::chat::chat_completions,
+        crate::handlers::responses::responses,
         crate::handlers::models::list_models,
         crate::handlers::anthropic_messages::anthropic_messages,
         crate::handlers::anthropic_models::list_models_anthropic,
@@ -146,6 +179,7 @@ fn metrics_doc() {}
         ErrorResponse,
         ErrorDetail,
         ChatCompletionRequestCore,
+        ResponsesRequestCore,
         AnthropicMessagesRequestCore,
         crate::types::ModelsResponse,
         crate::types::ModelObject,
@@ -204,6 +238,7 @@ mod tests {
         let paths = &v["paths"];
         for p in [
             "/v1/chat/completions",
+            "/v1/responses",
             "/v1/models",
             "/anthropic/v1/messages",
             "/anthropic/v1/models",
