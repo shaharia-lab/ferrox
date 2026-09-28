@@ -81,6 +81,10 @@ providers:
     type: openai
     api_key: "${OPENAI_API_KEY:-placeholder}"
     base_url: "https://api.openai.com/v1"
+    # How POST /v1/responses reaches this provider: translate (default) or
+    # native (type openai only) — forward the client's Responses body to
+    # {base_url}/responses unchanged except for `model`.
+    responses: translate
 
   - name: gemini-primary
     type: gemini

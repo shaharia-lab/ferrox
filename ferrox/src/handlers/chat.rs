@@ -1,3 +1,5 @@
+use std::future::Future;
+use std::sync::Arc;
 use std::time::Instant;
 
 use axum::response::sse::{Event, KeepAlive};
@@ -13,7 +15,7 @@ use crate::config::RetryConfig;
 use crate::error::ProxyError;
 use crate::handlers::finalize::{record_error_metrics, RequestFinalizer, Surface};
 use crate::lb::{RoutePool, RouteTarget};
-use crate::providers::ProviderStream;
+use crate::providers::{ProviderAdapter, ProviderStream};
 use crate::retry::{execute_with_retry, should_failover};
 use crate::state::AppState;
 use crate::telemetry::metrics::FALLBACK_TOTAL;
@@ -122,7 +124,7 @@ pub async fn chat_completions(
     }
 }
 
-// ── Non-streaming dispatch ────────────────────────────────────────────────────
+// ── Dispatch ──────────────────────────────────────────────────────────────────
 
 /// Returns `(response, provider_name, model_id)` on success.
 pub(crate) async fn dispatch_non_stream(
@@ -130,80 +132,15 @@ pub(crate) async fn dispatch_non_stream(
     req: &ChatCompletionRequest,
     retry_config: &RetryConfig,
 ) -> Result<(ChatCompletionResponse, String, String), ProxyError> {
-    // Try primary targets
-    if let Some(target) = pool.select_target() {
-        let provider_name = target.provider.name().to_string();
-        let model_id = target.model_id.clone();
-
-        match try_non_stream(target, req, retry_config, &pool.alias).await {
-            Ok(resp) => {
-                target.circuit_breaker.record_success();
-                return Ok((resp, provider_name, model_id));
-            }
-            Err(e) if should_failover(&e) => {
-                target.circuit_breaker.record_failure();
-                tracing::warn!(
-                    provider = %provider_name,
-                    model_id = %model_id,
-                    error = %e,
-                    "Primary target failed — trying fallback chain"
-                );
-            }
-            Err(e) => return Err(e),
-        }
-    }
-
-    // Fallback chain
-    for fallback in pool.fallbacks.iter().filter(|t| t.is_available()) {
-        let provider_name = fallback.provider.name().to_string();
-        let model_id = fallback.model_id.clone();
-
-        match try_non_stream(fallback, req, retry_config, &pool.alias).await {
-            Ok(resp) => {
-                fallback.circuit_breaker.record_success();
-                FALLBACK_TOTAL
-                    .with_label_values(&[pool.alias.as_str(), "", provider_name.as_str()])
-                    .inc();
-                tracing::info!(
-                    provider = %provider_name,
-                    model_id = %model_id,
-                    "Request served by fallback"
-                );
-                return Ok((resp, provider_name, model_id));
-            }
-            Err(e) => {
-                fallback.circuit_breaker.record_failure();
-                tracing::warn!(provider = %provider_name, error = %e, "Fallback failed");
-            }
-        }
-    }
-
-    Err(ProxyError::ProviderError {
-        provider: pool.alias.clone(),
-        status: StatusCode::BAD_GATEWAY.as_u16(),
-        message: "All targets and fallbacks failed".to_string(),
-    })
-}
-
-async fn try_non_stream(
-    target: &RouteTarget,
-    req: &ChatCompletionRequest,
-    retry_config: &RetryConfig,
-    model_alias: &str,
-) -> Result<ChatCompletionResponse, ProxyError> {
-    let provider = target.provider.clone();
-    let model_id = target.model_id.clone();
-    let provider_name = provider.name().to_string();
-
-    execute_with_retry(retry_config, &provider_name, model_alias, move || {
-        let provider = provider.clone();
-        let model_id = model_id.clone();
-        async move { provider.chat(req, &model_id).await }
-    })
+    dispatch(
+        pool,
+        retry_config,
+        false,
+        |_| None,
+        |provider, model_id| async move { provider.chat(req, &model_id).await },
+    )
     .await
 }
-
-// ── Streaming dispatch ────────────────────────────────────────────────────────
 
 /// Returns `(stream, provider_name, model_id)` on success.
 pub(crate) async fn dispatch_stream(
@@ -211,72 +148,127 @@ pub(crate) async fn dispatch_stream(
     req: &ChatCompletionRequest,
     retry_config: &RetryConfig,
 ) -> Result<(ProviderStream, String, String), ProxyError> {
+    dispatch(
+        pool,
+        retry_config,
+        true,
+        |_| None,
+        |provider, model_id| async move { provider.chat_stream(req, &model_id).await },
+    )
+    .await
+}
+
+/// Serve one request from `pool`: the selected primary target, then — when
+/// its error warrants failover — each available fallback, every attempt
+/// wrapped in the retry policy and recorded on the target's circuit breaker.
+/// `call` makes one attempt against a provider and upstream model id, so
+/// each surface chooses per target what that attempt is.
+///
+/// `skip` returns why a target cannot serve this request at all (a
+/// Responses request using native-only features, on a translate-only
+/// provider). Such a target is passed over without an attempt and without
+/// touching its circuit breaker; if no target was attempted, the first such
+/// reason is the error.
+///
+/// Returns `(output, provider_name, model_id)` on success.
+pub(crate) async fn dispatch<T, F, Fut>(
+    pool: &RoutePool,
+    retry_config: &RetryConfig,
+    streaming: bool,
+    skip: impl Fn(&RouteTarget) -> Option<ProxyError>,
+    call: F,
+) -> Result<(T, String, String), ProxyError>
+where
+    F: Fn(Arc<dyn ProviderAdapter>, String) -> Fut,
+    Fut: Future<Output = Result<T, ProxyError>>,
+{
+    let mut skipped: Option<ProxyError> = None;
+    let mut attempted = false;
+
     // Try primary targets
     if let Some(target) = pool.select_target() {
-        let provider_name = target.provider.name().to_string();
-        let model_id = target.model_id.clone();
+        if let Some(reason) = skip(target) {
+            skipped = Some(reason);
+        } else {
+            attempted = true;
+            let provider_name = target.provider.name().to_string();
+            let model_id = target.model_id.clone();
 
-        match try_stream(target, req, retry_config, &pool.alias).await {
-            Ok(stream) => {
-                target.circuit_breaker.record_success();
-                return Ok((stream, provider_name, model_id));
+            match attempt(target, retry_config, &pool.alias, &call).await {
+                Ok(out) => {
+                    target.circuit_breaker.record_success();
+                    return Ok((out, provider_name, model_id));
+                }
+                Err(e) if should_failover(&e) => {
+                    target.circuit_breaker.record_failure();
+                    tracing::warn!(
+                        provider = %provider_name,
+                        model_id = %model_id,
+                        streaming,
+                        error = %e,
+                        "Primary target failed — trying fallback chain"
+                    );
+                }
+                Err(e) => return Err(e),
             }
-            Err(e) if should_failover(&e) => {
-                target.circuit_breaker.record_failure();
-                tracing::warn!(
-                    provider = %provider_name,
-                    error = %e,
-                    "Primary streaming target failed — trying fallback"
-                );
-            }
-            Err(e) => return Err(e),
         }
     }
 
+    // Fallback chain
     for fallback in pool.fallbacks.iter().filter(|t| t.is_available()) {
+        if let Some(reason) = skip(fallback) {
+            skipped.get_or_insert(reason);
+            continue;
+        }
+        attempted = true;
         let provider_name = fallback.provider.name().to_string();
         let model_id = fallback.model_id.clone();
 
-        match try_stream(fallback, req, retry_config, &pool.alias).await {
-            Ok(stream) => {
+        match attempt(fallback, retry_config, &pool.alias, &call).await {
+            Ok(out) => {
                 fallback.circuit_breaker.record_success();
                 FALLBACK_TOTAL
                     .with_label_values(&[pool.alias.as_str(), "", provider_name.as_str()])
                     .inc();
                 tracing::info!(
                     provider = %provider_name,
-                    "Streaming request served by fallback"
+                    model_id = %model_id,
+                    streaming,
+                    "Request served by fallback"
                 );
-                return Ok((stream, provider_name, model_id));
+                return Ok((out, provider_name, model_id));
             }
             Err(e) => {
                 fallback.circuit_breaker.record_failure();
-                tracing::warn!(provider = %provider_name, error = %e, "Streaming fallback failed");
+                tracing::warn!(provider = %provider_name, streaming, error = %e, "Fallback failed");
             }
         }
     }
 
-    Err(ProxyError::ProviderError {
-        provider: pool.alias.clone(),
-        status: StatusCode::BAD_GATEWAY.as_u16(),
-        message: "All targets and fallbacks failed".to_string(),
-    })
+    match skipped {
+        Some(reason) if !attempted => Err(reason),
+        _ => Err(ProxyError::ProviderError {
+            provider: pool.alias.clone(),
+            status: StatusCode::BAD_GATEWAY.as_u16(),
+            message: "All targets and fallbacks failed".to_string(),
+        }),
+    }
 }
 
-async fn try_stream(
+async fn attempt<T, F, Fut>(
     target: &RouteTarget,
-    req: &ChatCompletionRequest,
     retry_config: &RetryConfig,
     model_alias: &str,
-) -> Result<ProviderStream, ProxyError> {
-    let provider = target.provider.clone();
-    let model_id = target.model_id.clone();
-    let provider_name = provider.name().to_string();
+    call: &F,
+) -> Result<T, ProxyError>
+where
+    F: Fn(Arc<dyn ProviderAdapter>, String) -> Fut,
+    Fut: Future<Output = Result<T, ProxyError>>,
+{
+    let provider_name = target.provider.name().to_string();
 
-    execute_with_retry(retry_config, &provider_name, model_alias, move || {
-        let provider = provider.clone();
-        let model_id = model_id.clone();
-        async move { provider.chat_stream(req, &model_id).await }
+    execute_with_retry(retry_config, &provider_name, model_alias, || {
+        call(target.provider.clone(), target.model_id.clone())
     })
     .await
 }

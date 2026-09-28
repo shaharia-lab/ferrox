@@ -17,9 +17,11 @@ use async_trait::async_trait;
 use eventsource_stream::Eventsource;
 use futures::stream::{BoxStream, StreamExt};
 use reqwest::Response;
+use serde_json::{Map, Value};
 
 use crate::config::{DefaultsConfig, ProviderConfig, ProviderType};
 use crate::error::ProxyError;
+use crate::responses_types::{NativeResponse, NativeResponsesStream};
 use crate::types::{ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse};
 
 // ── ProviderAdapter trait ────────────────────────────────────────────────────
@@ -41,6 +43,42 @@ pub trait ProviderAdapter: Send + Sync {
         req: &ChatCompletionRequest,
         model_id: &str,
     ) -> Result<ProviderStream, ProxyError>;
+
+    /// Whether this provider takes a Responses API body as-is
+    /// ([`responses`](Self::responses) / [`responses_stream`](Self::responses_stream))
+    /// instead of the Chat Completions translation. Off unless the provider
+    /// is configured with `responses: native`.
+    fn supports_native_responses(&self) -> bool {
+        false
+    }
+
+    /// Forward a Responses API request body (a JSON object) to the provider's
+    /// own `/responses`, overriding only `model` with `model_id`.
+    async fn responses(
+        &self,
+        _body: &Map<String, Value>,
+        _model_id: &str,
+    ) -> Result<NativeResponse, ProxyError> {
+        Err(native_responses_unsupported(self.name()))
+    }
+
+    /// Streaming [`responses`](Self::responses): the upstream's SSE events,
+    /// forwarded verbatim.
+    async fn responses_stream(
+        &self,
+        _body: &Map<String, Value>,
+        _model_id: &str,
+    ) -> Result<NativeResponsesStream, ProxyError> {
+        Err(native_responses_unsupported(self.name()))
+    }
+}
+
+/// Callers check [`ProviderAdapter::supports_native_responses`] first, so
+/// reaching a default `responses*` method is a gateway bug, not a client error.
+fn native_responses_unsupported(provider: &str) -> ProxyError {
+    ProxyError::ConfigError(format!(
+        "provider '{provider}' does not support native /responses"
+    ))
 }
 
 // ── Registry ─────────────────────────────────────────────────────────────────

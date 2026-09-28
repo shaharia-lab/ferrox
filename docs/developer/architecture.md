@@ -237,9 +237,9 @@ ferrox/src/
 
   handlers/
     mod.rs
-    chat.rs           chat_completions handler, dispatch_non_stream, dispatch_stream
+    chat.rs           chat_completions handler; dispatch (generic retry/failover loop) + dispatch_non_stream, dispatch_stream
     anthropic_messages.rs  /anthropic/v1/messages handler (Anthropic wire encoding only)
-    responses.rs      /v1/responses handler (Responses wire encoding only)
+    responses.rs      /v1/responses handler (per-target native passthrough or translation)
     finalize.rs       shared per-request accounting: RequestFinalizer, FinalizedStream, error metrics
     health.rs         /healthz, /readyz
     models.rs         /v1/models

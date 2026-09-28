@@ -3,12 +3,14 @@ use std::time::Duration;
 use async_trait::async_trait;
 use futures::StreamExt;
 use reqwest::Client;
-use serde::Serialize;
-use serde_json::Value;
+use serde::ser::SerializeMap;
+use serde::{Serialize, Serializer};
+use serde_json::{Map, Value};
 
-use crate::config::{DefaultsConfig, ProviderConfig};
+use crate::config::{DefaultsConfig, ProviderConfig, ResponsesMode};
 use crate::error::ProxyError;
 use crate::providers::{parse_sse_stream, ProviderAdapter, ProviderStream};
+use crate::responses_types::{NativeResponse, NativeResponsesEvent, NativeResponsesStream};
 use crate::types::{
     ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, ChatMessage,
     MessageContent, StopSequences,
@@ -34,6 +36,8 @@ pub struct OpenAIAdapter {
     api_key: String,
     base_url: String,
     client: Client,
+    /// `responses: native` — serve `/v1/responses` from `{base_url}/responses`.
+    native_responses: bool,
 }
 
 impl OpenAIAdapter {
@@ -71,6 +75,7 @@ impl OpenAIAdapter {
             api_key,
             base_url,
             client,
+            native_responses: cfg.responses == ResponsesMode::Native,
         })
     }
 
@@ -80,6 +85,47 @@ impl OpenAIAdapter {
     /// The adapter appends only `/chat/completions`.
     pub(crate) fn completions_url(&self) -> String {
         format!("{}/chat/completions", self.base_url)
+    }
+
+    /// Returns the Responses API endpoint URL (`{base_url}/responses`), used
+    /// when the provider is configured with `responses: native`.
+    pub(crate) fn responses_url(&self) -> String {
+        format!("{}/responses", self.base_url)
+    }
+
+    /// POST a JSON body and turn an HTTP error status into a
+    /// [`ProxyError::ProviderError`] carrying the upstream's body.
+    async fn post_json(
+        &self,
+        url: &str,
+        body: &impl Serialize,
+    ) -> Result<reqwest::Response, ProxyError> {
+        let resp = self
+            .client
+            .post(url)
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .header("Content-Type", "application/json")
+            .json(body)
+            .send()
+            .await
+            .map_err(|e| {
+                if e.is_timeout() {
+                    ProxyError::UpstreamTimeout(e.to_string())
+                } else {
+                    ProxyError::HttpClientError(e)
+                }
+            })?;
+
+        let status = resp.status().as_u16();
+        if status >= 400 {
+            let text = resp.text().await.unwrap_or_default();
+            return Err(ProxyError::ProviderError {
+                provider: self.name.clone(),
+                status,
+                message: text,
+            });
+        }
+        Ok(resp)
     }
 }
 
@@ -95,33 +141,7 @@ impl ProviderAdapter for OpenAIAdapter {
         model_id: &str,
     ) -> Result<ChatCompletionResponse, ProxyError> {
         let body = build_request_body(req, model_id, false);
-        let url = self.completions_url();
-
-        let resp = self
-            .client
-            .post(&url)
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .header("Content-Type", "application/json")
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| {
-                if e.is_timeout() {
-                    ProxyError::UpstreamTimeout(e.to_string())
-                } else {
-                    ProxyError::HttpClientError(e)
-                }
-            })?;
-
-        let status = resp.status().as_u16();
-        if status >= 400 {
-            let text = resp.text().await.unwrap_or_default();
-            return Err(ProxyError::ProviderError {
-                provider: self.name.clone(),
-                status,
-                message: text,
-            });
-        }
+        let resp = self.post_json(&self.completions_url(), &body).await?;
 
         let response: ChatCompletionResponse =
             resp.json().await.map_err(ProxyError::HttpClientError)?;
@@ -134,33 +154,7 @@ impl ProviderAdapter for OpenAIAdapter {
         model_id: &str,
     ) -> Result<ProviderStream, ProxyError> {
         let body = build_request_body(req, model_id, true);
-        let url = self.completions_url();
-
-        let resp = self
-            .client
-            .post(&url)
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .header("Content-Type", "application/json")
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| {
-                if e.is_timeout() {
-                    ProxyError::UpstreamTimeout(e.to_string())
-                } else {
-                    ProxyError::HttpClientError(e)
-                }
-            })?;
-
-        let status = resp.status().as_u16();
-        if status >= 400 {
-            let text = resp.text().await.unwrap_or_default();
-            return Err(ProxyError::ProviderError {
-                provider: self.name.clone(),
-                status,
-                message: text,
-            });
-        }
+        let resp = self.post_json(&self.completions_url(), &body).await?;
 
         let provider_name = self.name.clone();
         let sse_stream = parse_sse_stream(resp);
@@ -194,6 +188,53 @@ impl ProviderAdapter for OpenAIAdapter {
         };
 
         Ok(Box::pin(chunk_stream))
+    }
+
+    fn supports_native_responses(&self) -> bool {
+        self.native_responses
+    }
+
+    async fn responses(
+        &self,
+        body: &Map<String, Value>,
+        model_id: &str,
+    ) -> Result<NativeResponse, ProxyError> {
+        let body = WithModel { body, model_id };
+        let resp = self.post_json(&self.responses_url(), &body).await?;
+        let bytes = resp.bytes().await.map_err(ProxyError::HttpClientError)?;
+        Ok(NativeResponse::new(bytes))
+    }
+
+    async fn responses_stream(
+        &self,
+        body: &Map<String, Value>,
+        model_id: &str,
+    ) -> Result<NativeResponsesStream, ProxyError> {
+        let body = WithModel { body, model_id };
+        let resp = self.post_json(&self.responses_url(), &body).await?;
+        let events = parse_sse_stream(resp)
+            .map(|item| item.map(|(event, data)| NativeResponsesEvent::new(event, data)));
+        Ok(Box::pin(events))
+    }
+}
+
+/// A Responses body serialized with `model` replaced by the resolved upstream
+/// model, and every other field exactly as the client sent it — without
+/// cloning the body per attempt.
+struct WithModel<'a> {
+    body: &'a Map<String, Value>,
+    model_id: &'a str,
+}
+
+impl Serialize for WithModel<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let others = self.body.iter().filter(|(k, _)| k.as_str() != "model");
+        let mut map = serializer.serialize_map(Some(others.clone().count() + 1))?;
+        map.serialize_entry("model", self.model_id)?;
+        for (k, v) in others {
+            map.serialize_entry(k, v)?;
+        }
+        map.end()
     }
 }
 
@@ -566,6 +607,7 @@ mod tests {
             aws: None,
             timeouts: None,
             circuit_breaker: None,
+            responses: Default::default(),
         }
     }
 
@@ -759,5 +801,52 @@ mod tests {
         assert!(err
             .to_string()
             .contains("must not end with '/chat/completions'"));
+    }
+
+    #[test]
+    fn responses_url_appends_responses_to_the_versioned_root() {
+        let adapter = OpenAIAdapter::new(
+            &provider_cfg(Some("https://api.moonshot.ai/v1")),
+            &defaults(),
+        )
+        .unwrap();
+        assert_eq!(
+            adapter.responses_url(),
+            "https://api.moonshot.ai/v1/responses"
+        );
+    }
+
+    #[test]
+    fn native_responses_is_opt_in() {
+        let adapter = OpenAIAdapter::new(&provider_cfg(None), &defaults()).unwrap();
+        assert!(!adapter.supports_native_responses());
+        let mut cfg = provider_cfg(None);
+        cfg.responses = ResponsesMode::Native;
+        let adapter = OpenAIAdapter::new(&cfg, &defaults()).unwrap();
+        assert!(adapter.supports_native_responses());
+    }
+
+    #[test]
+    fn with_model_replaces_only_the_model() {
+        let body = serde_json::json!({
+            "model": "alias", "input": "hi", "tools": [{"type": "web_search"}],
+            "x_new": {"a": [1, 2]}
+        });
+        let out = serde_json::to_value(WithModel {
+            body: body.as_object().unwrap(),
+            model_id: "up-v1",
+        })
+        .unwrap();
+        let mut expected = body.clone();
+        expected["model"] = serde_json::json!("up-v1");
+        assert_eq!(out, expected);
+
+        // A body without `model` gains it.
+        let out = serde_json::to_value(WithModel {
+            body: serde_json::json!({"input": "hi"}).as_object().unwrap(),
+            model_id: "up-v1",
+        })
+        .unwrap();
+        assert_eq!(out, serde_json::json!({"model": "up-v1", "input": "hi"}));
     }
 }

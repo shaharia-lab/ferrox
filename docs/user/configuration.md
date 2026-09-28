@@ -132,6 +132,7 @@ static-keys / profile / AssumeRole auth modes.
 | `aws` | no | AWS config (Bedrock only): `region`, optional `endpoint_url`, and `auth` (static keys / `profile` / `assume_role`). |
 | `timeouts` | no | Per-provider timeout overrides |
 | `circuit_breaker` | no | Per-provider circuit breaker overrides |
+| `responses` | no | How [`POST /v1/responses`](api-reference.md#post-v1responses) reaches this provider: `translate` (default, every type) or `native` (`type: openai` only — the client's body is sent to `{base_url}/responses` unchanged except for `model`, and the answer is passed through). See [native Responses passthrough](providers.md#native-responses-api-passthrough). |
 
 ---
 

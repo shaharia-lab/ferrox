@@ -8,7 +8,7 @@
 //! once; each handler keeps only its own wire encoding.
 //!
 //! - [`RequestFinalizer::finish`] closes a non-streaming request.
-//! - [`RequestFinalizer::wrap_stream`] meters a [`ProviderStream`] and closes the
+//! - [`RequestFinalizer::wrap_stream`] meters a [`ProviderStream`](crate::providers::ProviderStream) and closes the
 //!   request exactly once — when the upstream stream ends (before the handler
 //!   emits its terminal frame), or when the stream is dropped part-way because
 //!   the client disconnected or the body errored.
@@ -20,19 +20,20 @@ use std::task::{ready, Context, Poll};
 use std::time::Instant;
 
 use futures::future::BoxFuture;
+use futures::stream::BoxStream;
 use futures::{Stream, StreamExt as _};
 use uuid::Uuid;
 
 use crate::budget_enforcer::BudgetEnforcer;
 use crate::error::ProxyError;
 use crate::event_dispatcher::{EventDispatcher, TokenUsageEvent};
-use crate::providers::ProviderStream;
 use crate::state::AppState;
 use crate::telemetry::metrics::{
     self, ACTIVE_STREAMS, ERRORS_TOTAL, REQUESTS_TOTAL, REQUEST_DURATION_SECONDS,
 };
 use crate::types::{ChatCompletionChunk, RequestContext, Usage};
 use crate::usage_writer::{UsageEvent, UsageWriter};
+use ferrox_providers::responses_types::NativeResponsesEvent;
 
 /// Which inbound surface a request arrived on. Only selects the log message,
 /// so existing log queries keep matching.
@@ -163,11 +164,15 @@ impl RequestFinalizer {
         }
     }
 
-    /// Meter a provider stream and close the request exactly once.
+    /// Meter a provider stream — chat chunks, or a native Responses event
+    /// stream — and close the request exactly once.
     ///
     /// Increments `ferrox_active_streams` now; the wrapper decrements it when
     /// it finalizes.
-    pub(crate) fn wrap_stream(self, inner: ProviderStream) -> FinalizedStream {
+    pub(crate) fn wrap_stream<T: Metered>(
+        self,
+        inner: BoxStream<'static, Result<T, ProxyError>>,
+    ) -> FinalizedStream<T> {
         ACTIVE_STREAMS
             .with_label_values(&[self.provider.as_str(), self.model_alias.as_str()])
             .inc();
@@ -290,22 +295,40 @@ impl RequestFinalizer {
     }
 }
 
-/// A [`ProviderStream`] that records token metrics from each chunk carrying
-/// `usage`, and finalizes the request exactly once: when the upstream ends
+/// A stream item that may carry the request's token usage: a chat chunk, or
+/// the terminal event of a native Responses stream.
+pub(crate) trait Metered {
+    fn usage(&self) -> Option<&Usage>;
+}
+
+impl Metered for ChatCompletionChunk {
+    fn usage(&self) -> Option<&Usage> {
+        self.usage.as_ref()
+    }
+}
+
+impl Metered for NativeResponsesEvent {
+    fn usage(&self) -> Option<&Usage> {
+        self.usage.as_ref()
+    }
+}
+
+/// A [`ProviderStream`](crate::providers::ProviderStream) (or any other [`Metered`] stream) that records token
+/// metrics from each item carrying `usage`, and finalizes the request exactly once: when the upstream ends
 /// (the budget reconciliation is awaited before this stream reports its end,
 /// so a handler's chained terminal frame always follows the accounting), or
 /// on drop if it never got that far.
 ///
 /// The once-guard is the `Option` around the finalizer; no locks, and nothing
 /// is allocated per chunk.
-pub(crate) struct FinalizedStream {
-    inner: ProviderStream,
+pub(crate) struct FinalizedStream<T = ChatCompletionChunk> {
+    inner: BoxStream<'static, Result<T, ProxyError>>,
     finalizer: Option<RequestFinalizer>,
     last_usage: Option<TokenCounts>,
     reconcile: Option<BoxFuture<'static, ()>>,
 }
 
-impl FinalizedStream {
+impl<T> FinalizedStream<T> {
     /// Settle the request if it has not been already. A stream that never saw
     /// non-zero prompt or completion tokens records no usage.
     fn settle(&mut self) -> Option<BoxFuture<'static, ()>> {
@@ -317,8 +340,8 @@ impl FinalizedStream {
     }
 }
 
-impl Stream for FinalizedStream {
-    type Item = Result<ChatCompletionChunk, ProxyError>;
+impl<T: Metered> Stream for FinalizedStream<T> {
+    type Item = Result<T, ProxyError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = &mut *self;
@@ -333,7 +356,7 @@ impl Stream for FinalizedStream {
             };
             match ready!(this.inner.poll_next_unpin(cx)) {
                 Some(Ok(chunk)) => {
-                    if let Some(usage) = &chunk.usage {
+                    if let Some(usage) = chunk.usage() {
                         let c = TokenCounts::from_usage(usage);
                         finalizer.record_token_metrics(c);
                         this.last_usage = Some(c);
@@ -350,7 +373,7 @@ impl Stream for FinalizedStream {
     }
 }
 
-impl Drop for FinalizedStream {
+impl<T> Drop for FinalizedStream<T> {
     fn drop(&mut self) {
         // Client disconnected, the body errored, or the reconciliation was
         // still in flight: finish the accounting, handing any owed

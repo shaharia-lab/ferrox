@@ -27,7 +27,7 @@ use std::fmt;
 use crate::error::ProxyError;
 use crate::types::{
     ChatCompletionRequest, ChatMessage, ContentPart, FunctionCall, ImageUrl, MessageContent, Tool,
-    ToolCall, ToolFunction,
+    ToolCall, ToolFunction, Usage, PROMPT_TOKENS_DETAILS,
 };
 
 // ── Private `extra` keys ─────────────────────────────────────────────────────
@@ -1011,7 +1011,11 @@ pub fn to_chat_completion_request(
     })
 }
 
-fn reject_stateful_features(req: &ResponsesRequest) -> Result<(), ProxyError> {
+/// Reject the fields that need server-side state (`previous_response_id`,
+/// `conversation`, `prompt`, `background: true`). Run by
+/// [`to_chat_completion_request`], and on its own ahead of a native
+/// passthrough, which skips the translation.
+pub fn reject_stateful_features(req: &ResponsesRequest) -> Result<(), ProxyError> {
     if req.previous_response_id.is_some() {
         return Err(invalid(
             "`previous_response_id` is not supported: this endpoint is stateless — \
@@ -1373,6 +1377,153 @@ fn response_format(format: &TextFormat) -> Option<Value> {
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
+
+// ── Native passthrough ───────────────────────────────────────────────────────
+//
+// A provider that implements the Responses API itself (`responses: native`)
+// is sent the client's body unchanged except for `model`, and its answer is
+// forwarded verbatim. The gateway only reads the token usage out of it, for
+// accounting — from the `response` object, or from the stream's terminal
+// event; every other event is passed through without being deserialized.
+
+/// The stream events that end a Responses stream and carry the final
+/// `response` object, including its `usage`.
+const TERMINAL_EVENTS: [&str; 3] = [
+    "response.completed",
+    "response.incomplete",
+    "response.failed",
+];
+
+/// Everything a native passthrough must reject on top of
+/// [`reject_stateful_features`]: `store: true`, which would keep the response
+/// at the upstream for a `previous_response_id` this gateway cannot route
+/// back to it. (The translation ignores `store`, since nothing is kept there.)
+pub fn reject_native_stateful_features(req: &ResponsesRequest) -> Result<(), ProxyError> {
+    reject_stateful_features(req)?;
+    if req.store == Some(true) {
+        return Err(invalid(
+            "`store: true` is not supported: this endpoint is stateless — \
+             send `store: false` or omit it",
+            "store",
+        ));
+    }
+    Ok(())
+}
+
+/// A non-streaming Responses answer from a native provider.
+#[derive(Debug, Clone)]
+pub struct NativeResponse {
+    /// The upstream `response` object, byte for byte.
+    pub body: bytes::Bytes,
+    /// Its `usage`, in the internal shape the accounting reads.
+    pub usage: Option<Usage>,
+}
+
+impl NativeResponse {
+    /// Wrap an upstream body, reading its `usage`.
+    pub fn new(body: bytes::Bytes) -> Self {
+        let usage = serde_json::from_slice::<UsageHolder>(&body)
+            .ok()
+            .and_then(|r| r.usage)
+            .map(NativeUsage::into_usage);
+        Self { body, usage }
+    }
+}
+
+/// One SSE event of a native Responses stream, forwarded verbatim.
+#[derive(Debug, Clone)]
+pub struct NativeResponsesEvent {
+    /// The SSE `event:` name, when the upstream sent one.
+    pub event: Option<String>,
+    /// The SSE `data:` payload, unparsed.
+    pub data: String,
+    /// The response's `usage`, set on the terminal event only.
+    pub usage: Option<Usage>,
+}
+
+impl NativeResponsesEvent {
+    /// Wrap an upstream SSE event, reading `usage` if it is the terminal one.
+    ///
+    /// Only a terminal event is parsed. With an `event:` name that is decided
+    /// by the name alone; without one, by a substring check first, so a delta
+    /// is never deserialized.
+    pub fn new(event: Option<String>, data: String) -> Self {
+        let terminal = match event.as_deref() {
+            Some(name) => TERMINAL_EVENTS.contains(&name),
+            None => TERMINAL_EVENTS.iter().any(|t| data.contains(t)),
+        };
+        let usage = if terminal {
+            serde_json::from_str::<TerminalEvent>(&data)
+                .ok()
+                .filter(|e| {
+                    event.is_some()
+                        || e.kind
+                            .as_deref()
+                            .is_some_and(|k| TERMINAL_EVENTS.contains(&k))
+                })
+                .and_then(|e| e.response)
+                .and_then(|r| r.usage)
+                .map(NativeUsage::into_usage)
+        } else {
+            None
+        };
+        Self { event, data, usage }
+    }
+}
+
+/// A native Responses event stream.
+pub type NativeResponsesStream =
+    futures::stream::BoxStream<'static, Result<NativeResponsesEvent, ProxyError>>;
+
+#[derive(Deserialize)]
+struct TerminalEvent {
+    #[serde(rename = "type", default)]
+    kind: Option<String>,
+    #[serde(default)]
+    response: Option<UsageHolder>,
+}
+
+#[derive(Deserialize)]
+struct UsageHolder {
+    #[serde(default)]
+    usage: Option<NativeUsage>,
+}
+
+/// A Responses `usage` object, read leniently: an OpenAI-compatible upstream
+/// may omit the totals or the details.
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct NativeUsage {
+    input_tokens: u32,
+    output_tokens: u32,
+    total_tokens: Option<u32>,
+    input_tokens_details: Option<Map<String, Value>>,
+    output_tokens_details: Option<Map<String, Value>>,
+}
+
+impl NativeUsage {
+    /// The internal [`Usage`]. The details keep their keys: Responses'
+    /// `cached_tokens` / `cache_write_tokens` and `reasoning_tokens` are the
+    /// same names Chat Completions uses under `prompt_tokens_details` /
+    /// `completion_tokens_details`, where the accounting reads them.
+    fn into_usage(self) -> Usage {
+        let mut extra = HashMap::new();
+        if let Some(d) = self.input_tokens_details {
+            extra.insert(PROMPT_TOKENS_DETAILS.to_string(), Value::Object(d));
+        }
+        if let Some(d) = self.output_tokens_details {
+            extra.insert("completion_tokens_details".to_string(), Value::Object(d));
+        }
+        Usage {
+            prompt_tokens: self.input_tokens,
+            completion_tokens: self.output_tokens,
+            total_tokens: self
+                .total_tokens
+                .unwrap_or(self.input_tokens + self.output_tokens),
+            extra,
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -2219,5 +2370,91 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(e.event_type(), "response.output_item.added");
+    }
+
+    // ── native passthrough ──────────────────────────────────────────────────
+
+    const USAGE: &str = r#"{"input_tokens":13,"input_tokens_details":{"cached_tokens":4,"cache_write_tokens":1},"output_tokens":5,"output_tokens_details":{"reasoning_tokens":2},"total_tokens":18}"#;
+
+    fn assert_accounted(usage: &Usage) {
+        assert_eq!(
+            (
+                usage.prompt_tokens,
+                usage.completion_tokens,
+                usage.total_tokens
+            ),
+            (13, 5, 18)
+        );
+        assert_eq!(crate::types::cache_tokens(usage), (4, 1));
+        assert_eq!(
+            usage.extra["completion_tokens_details"]["reasoning_tokens"],
+            2
+        );
+    }
+
+    #[test]
+    fn native_response_reads_usage_and_keeps_the_body() {
+        let body = format!(r#"{{"id":"resp_1","object":"response","usage":{USAGE}}}"#);
+        let resp = NativeResponse::new(bytes::Bytes::from(body.clone()));
+        assert_eq!(resp.body, body.as_bytes());
+        assert_accounted(resp.usage.as_ref().unwrap());
+
+        assert!(NativeResponse::new(bytes::Bytes::from_static(b"{}"))
+            .usage
+            .is_none());
+    }
+
+    #[test]
+    fn native_usage_tolerates_missing_totals_and_details() {
+        let resp = NativeResponse::new(bytes::Bytes::from_static(
+            br#"{"usage":{"input_tokens":3,"output_tokens":4}}"#,
+        ));
+        let usage = resp.usage.unwrap();
+        assert_eq!(usage.total_tokens, 7);
+        assert!(usage.extra.is_empty());
+    }
+
+    #[test]
+    fn only_terminal_events_carry_usage() {
+        for name in TERMINAL_EVENTS {
+            let data = format!(r#"{{"type":"{name}","response":{{"usage":{USAGE}}}}}"#);
+            let named = NativeResponsesEvent::new(Some(name.to_string()), data.clone());
+            assert_accounted(named.usage.as_ref().unwrap());
+            assert_eq!(named.data, data, "data is forwarded untouched");
+            // Without an `event:` line, the payload's `type` decides.
+            let unnamed = NativeResponsesEvent::new(None, data);
+            assert_accounted(unnamed.usage.as_ref().unwrap());
+        }
+
+        let delta = r#"{"type":"response.output_text.delta","delta":"response.completed"}"#;
+        assert!(NativeResponsesEvent::new(None, delta.to_string())
+            .usage
+            .is_none());
+        assert!(NativeResponsesEvent::new(
+            Some("response.output_text.delta".to_string()),
+            delta.to_string()
+        )
+        .usage
+        .is_none());
+    }
+
+    #[test]
+    fn native_rejects_store_true_on_top_of_the_stateless_fields() {
+        let req = |v: Value| serde_json::from_value::<ResponsesRequest>(v).unwrap();
+        let err = reject_native_stateful_features(&req(
+            json!({"model": "m", "input": "x", "store": true}),
+        ))
+        .unwrap_err();
+        assert!(
+            matches!(err, ProxyError::InvalidRequest { param: Some(ref p), .. } if p == "store")
+        );
+        assert!(reject_native_stateful_features(&req(
+            json!({"model": "m", "input": "x", "store": false})
+        ))
+        .is_ok());
+        assert!(reject_native_stateful_features(&req(
+            json!({"model": "m", "input": "x", "previous_response_id": "resp_1"})
+        ))
+        .is_err());
     }
 }

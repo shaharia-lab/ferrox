@@ -162,7 +162,20 @@
         },
         "aws": { "$ref": "#/definitions/AwsConfig" },
         "timeouts": { "$ref": "#/definitions/TimeoutsConfig" },
-        "circuit_breaker": { "$ref": "#/definitions/CircuitBreakerConfig" }
+        "circuit_breaker": { "$ref": "#/definitions/CircuitBreakerConfig" },
+        "responses": {
+          "type": "string",
+          "enum": ["translate", "native"],
+          "default": "translate",
+          "description": "How POST /v1/responses reaches this provider. 'translate' (default, any provider type): translated to Chat Completions and back. 'native' (type 'openai' only): the client's Responses body is sent to {base_url}/responses with only 'model' replaced, and the upstream's answer is passed through. For upstreams that implement the Responses API (OpenAI, Kimi, xAI, OpenRouter, Azure)."
+        }
+      },
+      "if": {
+        "properties": { "responses": { "const": "native" } },
+        "required": ["responses"]
+      },
+      "then": {
+        "properties": { "type": { "const": "openai" } }
       }
     },
     "AwsConfig": {

@@ -106,6 +106,7 @@ mod tests {
                 aws: None,
                 timeouts: None,
                 circuit_breaker: None,
+                responses: Default::default(),
             }],
             models: aliases
                 .iter()
@@ -181,6 +182,7 @@ mod tests {
             aws: None,
             timeouts: None,
             circuit_breaker: None,
+            responses: Default::default(),
         });
 
         let reg = mock_registry(); // registry only has "mock"
