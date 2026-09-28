@@ -1376,8 +1376,6 @@ fn response_format(format: &TextFormat) -> Option<Value> {
     }
 }
 
-// ── Tests ─────────────────────────────────────────────────────────────────────
-
 // ── Native passthrough ───────────────────────────────────────────────────────
 //
 // A provider that implements the Responses API itself (`responses: native`)
@@ -1524,6 +1522,8 @@ impl NativeUsage {
         }
     }
 }
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {

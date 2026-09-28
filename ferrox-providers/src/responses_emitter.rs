@@ -41,9 +41,9 @@ use serde_json::Value;
 use crate::error::ProxyError;
 use crate::providers::ProviderStream;
 use crate::responses_types::{
-    encode_anthropic_thinking_signature, IncompleteDetails, InputTokensDetails, OutputContent,
-    OutputItem, OutputTokensDetails, ReasoningText, Response, ResponseError, ResponseUsage,
-    ResponsesRequest, ResponsesTool,
+    encode_anthropic_thinking_signature, IncompleteDetails, InputTokensDetails,
+    NativeResponsesEvent, OutputContent, OutputItem, OutputTokensDetails, ReasoningText, Response,
+    ResponseError, ResponseStreamEvent, ResponseUsage, ResponsesRequest, ResponsesTool,
 };
 use crate::sse::SseFrame;
 use crate::types::{
@@ -237,6 +237,21 @@ fn error_code(e: &ProxyError) -> &'static str {
         ProxyError::InvalidRequest { .. } => "invalid_prompt",
         _ => "server_error",
     }
+}
+
+/// The `code` and `param` of a bare `error` event: the OpenAI error `type`,
+/// and the offending field of an invalid request.
+fn error_event_fields(e: &ProxyError) -> (String, Option<&str>) {
+    let (_, body) = crate::error::openai_error_body(e);
+    let code = body["error"]["type"]
+        .as_str()
+        .unwrap_or("server_error")
+        .to_string();
+    let param = match e {
+        ProxyError::InvalidRequest { param, .. } => param.as_deref(),
+        _ => None,
+    };
+    (code, param)
 }
 
 fn error_message(e: &ProxyError) -> String {
@@ -948,18 +963,13 @@ impl ResponsesEmitter {
         if !self.started {
             // No response exists for the client yet: a bare `error` event.
             self.finished = true;
-            let (_, body) = crate::error::openai_error_body(e);
-            let code = body["error"]["type"].as_str().unwrap_or("server_error");
-            let param = match e {
-                ProxyError::InvalidRequest { param, .. } => param.as_deref(),
-                _ => None,
-            };
+            let (code, param) = error_event_fields(e);
             push(
                 &mut self.frames,
                 &mut self.seq,
                 Event {
                     kind: "error",
-                    code: Some(code),
+                    code: Some(&code),
                     message: Some(&message),
                     param,
                     ..Event::default()
@@ -1096,6 +1106,56 @@ pub fn responses_stream_to_sse(
 ) -> impl futures::Stream<Item = Result<axum::response::sse::Event, ProxyError>> + Send {
     use futures::StreamExt as _;
     responses_stream_to_frames(emitter, stream).map(|res| res.map(Into::into))
+}
+
+// ── Native passthrough ───────────────────────────────────────────────────────
+
+/// Forward a native Responses stream (`responses: native`), ending it
+/// properly on failure: an error part-way — the upstream connection dropping,
+/// a malformed frame — becomes one final `error` event, numbered after the
+/// events already forwarded, instead of a cut connection. The translated
+/// stream does the same through [`ResponsesEmitter`].
+pub fn native_stream_with_terminal_error<S>(
+    stream: S,
+) -> impl futures::Stream<Item = NativeResponsesEvent> + Send
+where
+    S: futures::Stream<Item = Result<NativeResponsesEvent, ProxyError>> + Send,
+{
+    use futures::StreamExt as _;
+
+    stream.scan((0u64, false), |(forwarded, failed), item| {
+        let event = if *failed {
+            None
+        } else {
+            Some(match item {
+                Ok(event) => {
+                    *forwarded += 1;
+                    event
+                }
+                Err(e) => {
+                    *failed = true;
+                    native_error_event(&e, *forwarded)
+                }
+            })
+        };
+        futures::future::ready(event)
+    })
+}
+
+/// A bare Responses `error` event for `e`.
+fn native_error_event(e: &ProxyError, sequence_number: u64) -> NativeResponsesEvent {
+    let (code, param) = error_event_fields(e);
+    let event = ResponseStreamEvent::Error {
+        code: Some(code),
+        message: error_message(e),
+        param: param.map(str::to_string),
+        sequence_number,
+    };
+    NativeResponsesEvent {
+        event: Some(event.event_type().to_string()),
+        data: serde_json::to_string(&event).unwrap_or_default(),
+        usage: None,
+    }
 }
 
 #[cfg(test)]
@@ -1766,5 +1826,41 @@ mod tests {
         let want: Value =
             serde_json::from_str(std::fs::read_to_string(&path).unwrap().trim()).unwrap();
         assert_eq!(got, want);
+    }
+
+    #[tokio::test]
+    async fn native_stream_ends_with_an_error_event_when_the_upstream_fails() {
+        use futures::StreamExt as _;
+
+        let ok = |n: u64| {
+            Ok(NativeResponsesEvent::new(
+                Some("response.output_text.delta".to_string()),
+                format!(r#"{{"type":"response.output_text.delta","sequence_number":{n}}}"#),
+            ))
+        };
+        let upstream = futures::stream::iter(vec![
+            ok(0),
+            ok(1),
+            Err(ProxyError::StreamError("connection reset".to_string())),
+            ok(2),
+        ]);
+        let events: Vec<NativeResponsesEvent> =
+            native_stream_with_terminal_error(upstream).collect().await;
+
+        assert_eq!(events.len(), 3, "nothing is forwarded after the error");
+        assert_eq!(
+            events[1].data,
+            r#"{"type":"response.output_text.delta","sequence_number":1}"#
+        );
+        let last = &events[2];
+        assert_eq!(last.event.as_deref(), Some("error"));
+        let data: Value = serde_json::from_str(&last.data).unwrap();
+        assert_eq!(data["type"], "error");
+        assert_eq!(data["sequence_number"], 2);
+        assert_eq!(data["code"], "stream_error");
+        assert!(data["message"]
+            .as_str()
+            .unwrap()
+            .contains("connection reset"));
     }
 }

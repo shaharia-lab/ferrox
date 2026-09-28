@@ -37,7 +37,8 @@ use axum::{
     Json,
 };
 use ferrox_providers::responses_emitter::{
-    new_response_id, responses_stream_to_sse, to_responses_response, ResponsesEmitter,
+    native_stream_with_terminal_error, new_response_id, responses_stream_to_sse,
+    to_responses_response, ResponsesEmitter,
 };
 use ferrox_providers::responses_types::{
     reject_native_stateful_features, to_chat_completion_request, ResponsesRequest,
@@ -147,19 +148,18 @@ pub async fn responses(
         match served {
             Ok((Served::Native(events), provider_name, model_id)) => {
                 // Verbatim pass-through; the finalizer reads usage from the
-                // terminal event before the stream ends.
-                let sse_stream =
-                    finalizer(provider_name, model_id)
-                        .wrap_stream(events)
-                        .map(|event| {
-                            event.map(|e| {
-                                let frame = Event::default().data(e.data);
-                                match e.event {
-                                    Some(name) => frame.event(name),
-                                    None => frame,
-                                }
-                            })
-                        });
+                // terminal event before the stream ends, and an upstream
+                // failure part-way ends it with an `error` event.
+                let sse_stream = native_stream_with_terminal_error(
+                    finalizer(provider_name, model_id).wrap_stream(events),
+                )
+                .map(|e| {
+                    let frame = Event::default().data(e.data);
+                    Ok::<_, ProxyError>(match e.event {
+                        Some(name) => frame.event(name),
+                        None => frame,
+                    })
+                });
                 Ok(Sse::new(sse_stream)
                     .keep_alive(KeepAlive::default())
                     .into_response())
@@ -966,6 +966,71 @@ data: {"type":"response.output_text.delta","delta":"Hi"}"#
         let (status, _, _) = post(&h.app, Some(KEY), &native_body(alias, false).to_string()).await;
         assert_eq!(status, StatusCode::BAD_GATEWAY);
         assert!(h.ok.seen.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn untranslatable_requests_select_a_native_primary() {
+        // The strategy picks among the targets that can take the request, so
+        // a hosted tool never lands on the translate-only primary.
+        for (alias, strategy) in [
+            ("resp-native-rr", "round_robin"),
+            ("resp-native-fo", "failover"),
+        ] {
+            let upstream = mock_upstream(200).await;
+            let routing = json!({"strategy": strategy,
+                                 "targets": [{"provider": "ok", "model_id": "ok-v1"},
+                                             {"provider": "native", "model_id": "up-v1"}]});
+            let h = native_harness(alias, routing, &upstream).await;
+            for _ in 0..4 {
+                let (status, _, resp) =
+                    post(&h.app, Some(KEY), &native_body(alias, false).to_string()).await;
+                assert_eq!(status, StatusCode::OK, "{strategy}: {resp}");
+            }
+            assert_eq!(upstream.seen.lock().unwrap().len(), 4, "{strategy}");
+            assert!(h.ok.seen.lock().unwrap().is_none(), "{strategy}");
+        }
+    }
+
+    /// A mock upstream that starts a Responses stream and then drops the
+    /// connection part-way: raw HTTP/1.1, one chunk of a chunked body, and a
+    /// close without the terminating chunk.
+    async fn dropping_upstream() -> MockUpstream {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 8192];
+            let _ = socket.read(&mut buf).await;
+            let event = "event: response.created\ndata: {\"type\":\"response.created\",\"sequence_number\":0}\n\n";
+            let head = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\
+                        transfer-encoding: chunked\r\n\r\n";
+            let chunk = format!("{head}{:x}\r\n{event}\r\n", event.len());
+            socket.write_all(chunk.as_bytes()).await.unwrap();
+            socket.flush().await.unwrap();
+        });
+        MockUpstream {
+            base_url: format!("http://{addr}/v1"),
+            seen: Arc::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_native_stream_cut_part_way_ends_with_an_error_event() {
+        let alias = "resp-native-cut";
+        let upstream = dropping_upstream().await;
+        let h = native_harness(alias, native_only(), &upstream).await;
+
+        let (status, _, body) =
+            post(&h.app, Some(KEY), &native_body(alias, true).to_string()).await;
+
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let events = sse_events(&body);
+        let names: Vec<&str> = events.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, ["response.created", "error"], "{body}");
+        assert_eq!(events[1].1["type"], "error");
+        assert_eq!(events[1].1["sequence_number"], 1);
     }
 
     #[tokio::test]

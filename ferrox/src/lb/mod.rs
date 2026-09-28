@@ -78,10 +78,15 @@ impl RoutePool {
         })
     }
 
-    /// Select the best available primary target.
+    /// Select the best available primary target among those `eligible` for
+    /// this request.
     /// Also records the `routing_target_selected` metric.
-    pub fn select_target(&self) -> Option<&RouteTarget> {
-        let available: Vec<bool> = self.targets.iter().map(|t| t.is_available()).collect();
+    pub fn select_target(&self, eligible: impl Fn(&RouteTarget) -> bool) -> Option<&RouteTarget> {
+        let available: Vec<bool> = self
+            .targets
+            .iter()
+            .map(|t| t.is_available() && eligible(t))
+            .collect();
         let idx = self.strategy.select(&available)?;
         let target = &self.targets[idx];
 

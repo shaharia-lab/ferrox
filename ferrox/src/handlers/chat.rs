@@ -166,9 +166,10 @@ pub(crate) async fn dispatch_stream(
 ///
 /// `skip` returns why a target cannot serve this request at all (a
 /// Responses request using native-only features, on a translate-only
-/// provider). Such a target is passed over without an attempt and without
-/// touching its circuit breaker; if no target was attempted, the first such
-/// reason is the error.
+/// provider). Such a target is never selected as the primary, and is passed
+/// over in the fallback chain, without an attempt and without touching its
+/// circuit breaker; if no target was attempted, the first such reason is the
+/// error.
 ///
 /// Returns `(output, provider_name, model_id)` on success.
 pub(crate) async fn dispatch<T, F, Fut>(
@@ -182,35 +183,40 @@ where
     F: Fn(Arc<dyn ProviderAdapter>, String) -> Fut,
     Fut: Future<Output = Result<T, ProxyError>>,
 {
-    let mut skipped: Option<ProxyError> = None;
     let mut attempted = false;
 
-    // Try primary targets
-    if let Some(target) = pool.select_target() {
-        if let Some(reason) = skip(target) {
-            skipped = Some(reason);
-        } else {
-            attempted = true;
-            let provider_name = target.provider.name().to_string();
-            let model_id = target.model_id.clone();
+    // Try primary targets: the strategy picks among the available ones this
+    // request can go to.
+    let primary = pool.select_target(|t| skip(t).is_none());
+    let mut skipped = match primary {
+        Some(_) => None,
+        None => pool
+            .targets
+            .iter()
+            .filter(|t| t.is_available())
+            .find_map(&skip),
+    };
+    if let Some(target) = primary {
+        attempted = true;
+        let provider_name = target.provider.name().to_string();
+        let model_id = target.model_id.clone();
 
-            match attempt(target, retry_config, &pool.alias, &call).await {
-                Ok(out) => {
-                    target.circuit_breaker.record_success();
-                    return Ok((out, provider_name, model_id));
-                }
-                Err(e) if should_failover(&e) => {
-                    target.circuit_breaker.record_failure();
-                    tracing::warn!(
-                        provider = %provider_name,
-                        model_id = %model_id,
-                        streaming,
-                        error = %e,
-                        "Primary target failed — trying fallback chain"
-                    );
-                }
-                Err(e) => return Err(e),
+        match attempt(target, retry_config, &pool.alias, &call).await {
+            Ok(out) => {
+                target.circuit_breaker.record_success();
+                return Ok((out, provider_name, model_id));
             }
+            Err(e) if should_failover(&e) => {
+                target.circuit_breaker.record_failure();
+                tracing::warn!(
+                    provider = %provider_name,
+                    model_id = %model_id,
+                    streaming,
+                    error = %e,
+                    "Primary target failed — trying fallback chain"
+                );
+            }
+            Err(e) => return Err(e),
         }
     }
 
