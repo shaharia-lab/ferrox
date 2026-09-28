@@ -128,7 +128,7 @@ pub async fn responses(
             |t| plan.skip(t),
             |provider, model_id| {
                 let native = plan.native_for(provider.as_ref());
-                let translated = plan.translated.as_ref().ok();
+                let translated = plan.translated();
                 async move {
                     match (native, translated) {
                         (Some(body), _) => provider
@@ -191,7 +191,7 @@ pub async fn responses(
             |t| plan.skip(t),
             |provider, model_id| {
                 let native = plan.native_for(provider.as_ref());
-                let translated = plan.translated.as_ref().ok();
+                let translated = plan.translated();
                 async move {
                     match (native, translated) {
                         (Some(body), _) => provider
@@ -241,36 +241,45 @@ struct Plan {
     native: Option<Map<String, Value>>,
     /// The chat translation, or — when the pool has a native target — why
     /// the request cannot be translated (`message`, `param`), so that only
-    /// the native targets are tried.
-    translated: Result<crate::types::ChatCompletionRequest, (String, Option<String>)>,
+    /// the native targets are tried. `None` when every target is native: the
+    /// translation would never be used, so it is not paid for.
+    translated: Option<Result<crate::types::ChatCompletionRequest, (String, Option<String>)>>,
 }
 
 impl Plan {
     fn new(pool: &RoutePool, req: &ResponsesRequest, body: &Bytes) -> Result<Self, ProxyError> {
-        let native_capable = pool
-            .targets
-            .iter()
-            .chain(&pool.fallbacks)
+        let mut targets = pool.targets.iter().chain(&pool.fallbacks);
+        let native_capable = targets
+            .clone()
             .any(|t| t.provider.supports_native_responses());
         if !native_capable {
             // Translate-only pool: exactly the pre-native behaviour.
             return Ok(Self {
                 native: None,
-                translated: Ok(to_chat_completion_request(req)?),
+                translated: Some(Ok(to_chat_completion_request(req)?)),
             });
         }
 
         reject_native_stateful_features(req)?;
         let native = serde_json::from_slice::<Map<String, Value>>(body)?;
-        let translated = match to_chat_completion_request(req) {
-            Ok(r) => Ok(r),
-            Err(ProxyError::InvalidRequest { message, param }) => Err((message, param)),
-            Err(e) => return Err(e),
+        let translated = if targets.any(|t| !t.provider.supports_native_responses()) {
+            Some(match to_chat_completion_request(req) {
+                Ok(r) => Ok(r),
+                Err(ProxyError::InvalidRequest { message, param }) => Err((message, param)),
+                Err(e) => return Err(e),
+            })
+        } else {
+            None
         };
         Ok(Self {
             native: Some(native),
             translated,
         })
+    }
+
+    /// The chat translation, when there is one to send.
+    fn translated(&self) -> Option<&crate::types::ChatCompletionRequest> {
+        self.translated.as_ref().and_then(|t| t.as_ref().ok())
     }
 
     /// The body to send natively, when `provider` takes it.
@@ -287,7 +296,7 @@ impl Plan {
     /// request does not translate.
     fn skip(&self, target: &RouteTarget) -> Option<ProxyError> {
         match &self.translated {
-            Err((message, param)) if !target.provider.supports_native_responses() => {
+            Some(Err((message, param))) if !target.provider.supports_native_responses() => {
                 Some(ProxyError::InvalidRequest {
                     message: message.clone(),
                     param: param.clone(),
@@ -317,6 +326,7 @@ mod tests {
     use tokio::sync::mpsc;
     use tower::ServiceExt as _;
 
+    use super::Plan;
     use crate::config::Config;
     use crate::error::ProxyError;
     use crate::event_dispatcher::{EventDispatcher, TokenUsageEvent};
@@ -324,6 +334,8 @@ mod tests {
     use crate::state::AppState;
     use crate::types::{ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse};
     use crate::usage_writer::{UsageEvent, UsageWriter};
+    use axum::body::Bytes;
+    use ferrox_providers::responses_types::ResponsesRequest;
 
     const KEY: &str = "sk-responses-test";
 
@@ -1160,6 +1172,48 @@ data: {"type":"response.output_text.delta","delta":"Hi"}"#
         )
         .await;
         assert!(matches!(result, Err(ProxyError::InvalidRequest { .. })));
+    }
+
+    #[tokio::test]
+    async fn an_all_native_pool_skips_the_translation() {
+        let config: Config = serde_json::from_value(json!({
+            "providers": [
+                {"name": "native", "type": "openai", "api_key": "sk-up",
+                 "base_url": "http://127.0.0.1:1/v1", "responses": "native"},
+                {"name": "ok", "type": "openai"}
+            ],
+            "models": [
+                {"alias": "all-native", "routing": {"strategy": "round_robin",
+                    "targets": [{"provider": "native", "model_id": "up-v1"}]}},
+                {"alias": "mixed", "routing": {"strategy": "failover",
+                    "targets": [{"provider": "native", "model_id": "up-v1"}],
+                    "fallback": [{"provider": "ok", "model_id": "ok-v1"}]}}
+            ]
+        }))
+        .unwrap();
+        let mut registry =
+            crate::providers::build_registry(&config.providers[..1], &config.defaults)
+                .await
+                .unwrap();
+        registry.insert(
+            "ok".to_string(),
+            Arc::new(OkProvider {
+                seen: Mutex::new(None),
+            }),
+        );
+        let router = crate::router::ModelRouter::from_config(&config, &registry).unwrap();
+        let body = Bytes::from(json!({"model": "m", "input": "Hi"}).to_string());
+        let req: ResponsesRequest = serde_json::from_slice(&body).unwrap();
+
+        let plan = Plan::new(&router.resolve("all-native").unwrap(), &req, &body).unwrap();
+        assert!(plan.native.is_some());
+        assert!(
+            plan.translated.is_none(),
+            "nothing could use the translation"
+        );
+
+        let plan = Plan::new(&router.resolve("mixed").unwrap(), &req, &body).unwrap();
+        assert!(plan.translated().is_some());
     }
 
     #[tokio::test]

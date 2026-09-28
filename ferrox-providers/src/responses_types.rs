@@ -1012,10 +1012,9 @@ pub fn to_chat_completion_request(
 }
 
 /// Reject the fields that need server-side state (`previous_response_id`,
-/// `conversation`, `prompt`, `background: true`). Run by
-/// [`to_chat_completion_request`], and on its own ahead of a native
-/// passthrough, which skips the translation.
-pub fn reject_stateful_features(req: &ResponsesRequest) -> Result<(), ProxyError> {
+/// `conversation`, `prompt`, `background: true`). Called by
+/// [`to_chat_completion_request`] and [`reject_native_stateful_features`].
+fn reject_stateful_features(req: &ResponsesRequest) -> Result<(), ProxyError> {
     if req.previous_response_id.is_some() {
         return Err(invalid(
             "`previous_response_id` is not supported: this endpoint is stateless — \
