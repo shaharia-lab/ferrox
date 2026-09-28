@@ -1158,6 +1158,39 @@ fn native_error_event(e: &ProxyError, sequence_number: u64) -> NativeResponsesEv
     }
 }
 
+// ── Chat Completions surface ─────────────────────────────────────────────────
+
+/// Remove the [`RESPONSES_THINKING_SIGNATURE`] an adapter left on the message
+/// for the Responses encoder, before serving the response as a Chat
+/// Completion: that format has no field for it, and `extra` is flattened into
+/// the output.
+pub fn strip_thinking_signature(resp: &mut ChatCompletionResponse) {
+    for choice in &mut resp.choices {
+        choice.message.extra.remove(RESPONSES_THINKING_SIGNATURE);
+    }
+}
+
+/// Streaming counterpart of [`strip_thinking_signature`]. A chunk that only
+/// carried the signature is dropped (`None`) instead of sent empty.
+pub fn strip_thinking_signature_chunk(
+    mut chunk: ChatCompletionChunk,
+) -> Option<ChatCompletionChunk> {
+    let mut stripped = false;
+    for choice in &mut chunk.choices {
+        stripped |= choice.extra.remove(RESPONSES_THINKING_SIGNATURE).is_some();
+    }
+    let empty = chunk.usage.is_none()
+        && chunk.choices.iter().all(|c| {
+            c.extra.is_empty()
+                && c.finish_reason.is_none()
+                && c.delta.role.is_none()
+                && c.delta.content.is_none()
+                && c.delta.tool_calls.is_none()
+                && c.delta.reasoning_content.is_none()
+        });
+    (!(stripped && empty)).then_some(chunk)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1862,5 +1895,64 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("connection reset"));
+    }
+
+    fn chunk_with(delta: serde_json::Value, extra: serde_json::Value) -> ChatCompletionChunk {
+        let mut choice = serde_json::json!({"index": 0, "delta": delta, "finish_reason": null});
+        for (k, v) in extra.as_object().unwrap() {
+            choice[k] = v.clone();
+        }
+        serde_json::from_value(
+            serde_json::json!({"id": "c", "object": "chat.completion.chunk",
+            "created": 0, "model": "m", "choices": [choice]}),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn signature_only_chunk_is_dropped_from_the_chat_stream() {
+        let chunk = chunk_with(
+            serde_json::json!({}),
+            serde_json::json!({RESPONSES_THINKING_SIGNATURE: "sig"}),
+        );
+        assert!(strip_thinking_signature_chunk(chunk).is_none());
+    }
+
+    #[test]
+    fn other_chunks_pass_without_the_signature() {
+        let chunk = chunk_with(
+            serde_json::json!({"reasoning_content": "t"}),
+            serde_json::json!({RESPONSES_THINKING_SIGNATURE: "sig", "logprobs": null}),
+        );
+        let out = strip_thinking_signature_chunk(chunk).expect("kept");
+        let json = serde_json::to_value(&out).unwrap();
+        assert!(json["choices"][0]
+            .get(RESPONSES_THINKING_SIGNATURE)
+            .is_none());
+        assert_eq!(json["choices"][0]["delta"]["reasoning_content"], "t");
+
+        // A chunk that never had a signature is untouched, even when empty.
+        let empty = chunk_with(serde_json::json!({}), serde_json::json!({}));
+        assert!(strip_thinking_signature_chunk(empty).is_some());
+    }
+
+    #[test]
+    fn signature_is_removed_from_the_chat_response() {
+        let mut resp: ChatCompletionResponse = serde_json::from_value(serde_json::json!({
+            "id": "c", "object": "chat.completion", "created": 0, "model": "m",
+            "choices": [{"index": 0, "finish_reason": "stop", "message": {
+                "role": "assistant", "content": "hi", "reasoning_content": "t",
+                RESPONSES_THINKING_SIGNATURE: "sig"}}]}))
+        .unwrap();
+        assert!(resp.choices[0]
+            .message
+            .extra
+            .contains_key(RESPONSES_THINKING_SIGNATURE));
+        strip_thinking_signature(&mut resp);
+        let json = serde_json::to_value(&resp).unwrap();
+        assert!(json["choices"][0]["message"]
+            .get(RESPONSES_THINKING_SIGNATURE)
+            .is_none());
+        assert_eq!(json["choices"][0]["message"]["content"], "hi");
     }
 }

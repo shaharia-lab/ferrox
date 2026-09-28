@@ -75,9 +75,12 @@ Unknown fields are forwarded to the provider as-is.
 **`reasoning_effort` on Anthropic targets.** Claude 4.6+ gets adaptive thinking with
 `output_config.effort` (`minimal` becomes `low`, `xhigh` becomes `high` on 4.6, `max` passes
 through; thinking summaries are requested on 4.7+). Claude 3.7–4.5 gets `thinking.type:
-"enabled"` with a `budget_tokens` of 1024 / 4096 / 16384 for low / medium / high (and above), below `max_tokens` (the budget shrinks to half of a small
-client limit; with no limit, room for it is added to the default). Older Claude, GLM, Kimi and
-unrecognised model ids are left unchanged, as is `none`. While thinking is on, `temperature`
+"enabled"` with a `budget_tokens` of 1024 / 4096 / 16384 for low / medium / high (and above), below `max_tokens` (a
+client limit is kept and the budget shrinks to half of it; a limit too small for the 1024
+minimum is raised by 1024; with no limit, room for the budget is added to the default). Older
+Claude, GLM, Kimi and unrecognised model ids are left unchanged. `none` sends no thinking
+config, so models that think by default (Claude Opus 5, Opus 5.5, Sonnet 5, Fable 5.x) still
+think. While thinking is on, `temperature`
 and a `top_p` below 0.95 (any `top_p` on 4.7+) are dropped and a forced `tool_choice` becomes
 `auto`, since Anthropic rejects them together. Claude 3.7–4.5 gets no thinking on a turn whose
 last assistant message made tool calls: that turn would have to start with a thinking block,
@@ -185,7 +188,7 @@ The endpoint is **stateless**: nothing is stored, `store` is accepted and always
 | `tools` | `function` and `custom` (free-form text input) tools |
 | `tool_choice`, `parallel_tool_calls`, `max_tool_calls` | |
 | `text.format` | `text`, `json_object`, `json_schema` (mapped to the chat `response_format`; schema adherence depends on the upstream model) |
-| `reasoning.effort` | Forwarded as `reasoning_effort`. On an Anthropic target it turns on extended thinking for the model (adaptive + `output_config.effort` on Claude 4.6+, a `budget_tokens` below `max_tokens` on Claude 3.7–4.5; nothing on other models) and drops `temperature` and a `top_p` below 0.95 (any `top_p` on 4.7+) and downgrades a forced `tool_choice` to `auto`; `none` leaves thinking off |
+| `reasoning.effort` | Forwarded as `reasoning_effort`. On an Anthropic target it turns on extended thinking for the model (adaptive + `output_config.effort` on Claude 4.6+, a `budget_tokens` below `max_tokens` on Claude 3.7–4.5; nothing on other models) and drops `temperature` and a `top_p` below 0.95 (any `top_p` on 4.7+) and downgrades a forced `tool_choice` to `auto`; `none` sends no thinking config (models that think by default still do) |
 | `reasoning.summary`, `text.verbosity`, `include`, `truncation` | Forwarded as hints |
 | `metadata`, `prompt_cache_key`, `safety_identifier`, `user`, `service_tier` | Passed through |
 

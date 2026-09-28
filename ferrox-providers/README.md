@@ -151,7 +151,8 @@ which the Anthropic adapter maps to thinking per model:
   `max_tokens`. Room is added to `max_tokens` only when the client set none, or
   one too small for the 1024 minimum. A tool-call turn with no thinking block to
   replay gets no thinking, since manual mode requires one.
-- **Older Claude, GLM, Kimi, unparsed ids, `none`:** unchanged.
+- **Older Claude, GLM, Kimi, unparsed ids, `none`:** no thinking config is
+  sent (models that think by default, like Claude Opus 5, still do).
 - **While thinking:** `temperature` and a `top_p` below 0.95 (any `top_p` on
   4.7+) are dropped, and a forced `tool_choice` becomes `auto`.
 - An explicit `_anthropic_thinking` wins. A `reasoning` item whose
@@ -190,6 +191,8 @@ thinking signature on `_anthropic_thinking_signature` (message / chunk-choice
 adapter sets it from each streamed `signature_delta`, and from a non-streaming
 response with exactly one signed thinking block. Several blocks are joined into
 one reasoning text that no single signature verifies, so they carry none.
+Serving Chat Completions from this crate? `strip_thinking_signature` /
+`strip_thinking_signature_chunk` remove that private key first.
 
 **Native passthrough.** A provider configured with `responses: native`
 (`ResponsesMode::Native`; the OpenAI adapter only) reports
