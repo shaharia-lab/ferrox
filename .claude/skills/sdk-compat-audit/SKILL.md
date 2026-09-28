@@ -1,7 +1,7 @@
 ---
 name: sdk-compat-audit
 description: >-
-  Audit Ferrox's OpenAI ⇄ Anthropic translation layer against the official
+  Audit Ferrox's OpenAI ⇄ Responses ⇄ Anthropic translation layer against the official
   provider SDKs (freshly cloned into a temp dir), find where the proxy diverges
   from the real wire contracts, and file deduplicated GitHub issues for the gaps.
   Use to (re-)run the translation-fidelity / incompatibility check — e.g. after a
@@ -14,7 +14,8 @@ description: >-
 
 Ferrox normalises every provider to an internal **OpenAI-shaped** type
 (`ChatCompletionRequest`/`Response`/`Chunk`) and re-exposes it in **both** an
-OpenAI dialect (`/v1/chat/completions`) and an Anthropic dialect
+OpenAI Chat dialect (`/v1/chat/completions`), an OpenAI **Responses** dialect
+(`/v1/responses`, used by Codex CLI) and an Anthropic dialect
 (`/anthropic/v1/messages`). Every translation point is a place the proxy can
 drift from what the official SDKs actually send and expect. This skill
 cross-references those points against the SDKs' own accumulation / request /
@@ -22,7 +23,7 @@ response code — the authoritative contract — and turns real divergences into
 GitHub issues.
 
 The goal is **evidence-backed findings**, not vibes: every issue must cite a
-concrete `ferrox/src/...:line` AND the SDK file that proves the correct
+concrete `ferrox-providers/src/...:line` (or `ferrox/src/...:line`) AND the SDK file that proves the correct
 behaviour. If you can't cite both, drop the finding.
 
 ---
@@ -77,6 +78,9 @@ Highest-signal files (the authoritative contracts):
 | OpenAI streaming tool-call accumulation (merge by `index`, `id`/`name` first, `arguments` concatenated, clamp `-1`) | `openai-go/streamaccumulator.go`; `openai-python/src/openai/lib/streaming/_deltas.py`; `openai-node/src/lib/ChatCompletionStream.ts` |
 | OpenAI request params (what a transparent proxy must forward) | `openai-python/src/openai/types/chat/completion_create_params.py` |
 | OpenAI usage details (`prompt_tokens_details`/`completion_tokens_details`) | `openai-python .../types/completion_usage.py` |
+| OpenAI Responses request params (input item union, flat tools, `text.format`, `reasoning`) | `openai-python/src/openai/types/responses/{response_create_params,response_input_item_param,tool_param}.py` |
+| OpenAI Responses output + stream events (`Response`, output item union, `ResponseUsage`, closed `ResponseError.code` enum, every `response.*` event) | `openai-python/src/openai/types/responses/{response,response_usage,response_error,response_stream_event}.py` |
+| OpenAI Responses stream accumulation (items by `output_index`, deltas by `item_id`, final `response` from the terminal event) | `openai-python/src/openai/lib/streaming/responses/_responses.py`; `openai-node/src/lib/responses/ResponseStream.ts`; `openai-go/responses/response_accumulator.go` |
 | Anthropic streaming accumulation (one content block per `index`; `thinking`/`input_json_delta` concatenated; `input_tokens` from `message_start`, updated in `message_delta`) | `anthropic-sdk-python/src/anthropic/lib/streaming/_messages.py`; `anthropic-sdk-typescript/src/lib/*MessageStream.ts`; `anthropic-sdk-go/messageutil.go` |
 | Anthropic content blocks / deltas (text, image sources base64 vs url, tool_use, tool_result incl. image, thinking/redacted_thinking, `thinking_delta`/`signature_delta`) | `anthropic-sdk-python/src/anthropic/types/*` |
 | Anthropic stop reasons (`end_turn|max_tokens|stop_sequence|tool_use|pause_turn|refusal`) | `anthropic-sdk-python/src/anthropic/types/message.py` |
@@ -89,19 +93,22 @@ tree, not memory):
 
 | Surface | File | Key items |
 |---|---|---|
-| Anthropic ⇄ internal (ingress + egress) | `ferrox/src/anthropic_types.rs` | `to_chat_completion_request`, `convert_blocks`, `to_anthropic_response`, `openai_stream_to_anthropic_sse`, `finish_reason_to_anthropic`, the SSE event constructors |
-| Internal types | `ferrox/src/types.rs` | `ChatMessage`, `ChunkDelta`, `StreamToolCall`, `Usage`, `Choice`, response/chunk structs (+ any `#[serde(flatten)] extra`) |
-| OpenAI/Kimi/GLM adapter | `ferrox/src/providers/openai.rs` | `OpenAIRequest` (forwarded fields + `extra`), streaming chunk parse |
-| Native Anthropic adapter | `ferrox/src/providers/anthropic.rs` + `anthropic_events.rs` | request build, `AnthropicResponseContent`, `AnthropicEventProcessor`, `map_stop_reason`, incremental tool/thinking emission |
-| Gemini adapter | `ferrox/src/providers/gemini.rs` | `functionCall`/`functionResponse`, `tool_config`, `finishReason` map, image inlining |
-| Bedrock adapter | `ferrox/src/providers/bedrock.rs` | tools/`tool_choice`, tool_use blocks, content-block array |
+| Anthropic ⇄ internal (ingress + egress) | `ferrox-providers/src/anthropic_types.rs` | `to_chat_completion_request`, `convert_blocks`, `to_anthropic_response`, `openai_stream_to_anthropic_sse`, `finish_reason_to_anthropic`, the SSE event constructors |
+| Responses → internal (ingress) | `ferrox-providers/src/responses_types.rs` | `ResponsesRequest`, `InputItem`, `ResponsesTool`, `to_chat_completion_request`, `reject_stateful_features`, the built-in tool reject list |
+| internal → Responses (egress) | `ferrox-providers/src/responses_emitter.rs` | `to_responses_response`, `ResponsesEmitter` (SSE state machine), `responses_usage`, `terminal_status`; golden fixtures + `validate_sdk.py` under `ferrox-providers/tests/fixtures/responses/` |
+| Inbound handlers | `ferrox/src/handlers/{chat,responses,anthropic_messages}.rs` | body parsing, error shape per dialect, streaming framing (`[DONE]` only on chat) |
+| Internal types | `ferrox-providers/src/types.rs` | `ChatMessage`, `ChunkDelta`, `StreamToolCall`, `Usage`, `Choice`, response/chunk structs (+ any `#[serde(flatten)] extra`) |
+| OpenAI/Kimi/GLM adapter | `ferrox-providers/src/providers/openai.rs` | `OpenAIRequest` (forwarded fields + `extra`), streaming chunk parse |
+| Native Anthropic adapter | `ferrox-providers/src/providers/anthropic.rs` + `anthropic_events.rs` | request build, `AnthropicResponseContent`, `AnthropicEventProcessor`, `map_stop_reason`, incremental tool/thinking emission |
+| Gemini adapter | `ferrox-providers/src/providers/gemini.rs` | `functionCall`/`functionResponse`, `tool_config`, `finishReason` map, image inlining |
+| Bedrock adapter | `ferrox-providers/src/providers/bedrock.rs` | tools/`tool_choice`, tool_use blocks, content-block array |
 
 ## Phase 3 — Audit dimensions (Ferrox vs SDK contract)
 
 For **each** dimension below, compare the Ferrox code to the SDK contract and
 record any divergence. Fan out one **read-only** sub-agent per surface (or group)
 so the audit runs in parallel — give each the exact scope, the Ferrox files, and
-the `$SDKDIR` paths, and require every finding to cite `ferrox/src/...:line` +
+the `$SDKDIR` paths, and require every finding to cite `ferrox-providers/src/...:line` (or `ferrox/src/...:line`) +
 the SDK file. Consolidate their structured findings.
 
 Cover at least:
@@ -133,6 +140,16 @@ Cover at least:
 8. **Errors & protocol** — mid-stream upstream errors emit an Anthropic `error`
    SSE event (not a bare close); no empty `text:""` block; system-block join with
    `\n`; unsupported/`document` blocks warn rather than drop silently.
+9. **Responses dialect** — does every input item / content part / tool type the
+   SDKs can send either translate or fail with a 400 naming its `param` (never a
+   silent drop)? Do non-streaming output and every stream event validate against
+   the SDK models (required fields such as `input_tokens_details.cache_write_tokens`,
+   closed enums such as `ResponseError.code`)? Is `sequence_number` monotonic, is
+   the SSE `event:` equal to `type`, does exactly one terminal event
+   (`completed`/`incomplete`/`failed`) close the stream with no `[DONE]`, and does
+   an interleaved parallel tool-call stream land each fragment in the right item?
+   Does a Codex CLI request (capture one — it sends `namespace` and hosted
+   `web_search` tools by default) get a clear error or a working session?
 
 Also **re-derive from the SDKs**, don't just check the list above — a provider may
 have shipped a new field/reason/block type since this skill was written. The SDK
@@ -141,7 +158,7 @@ source is the source of truth.
 ## Phase 4 — Consolidate + self-check
 
 Merge the sub-agents' findings, dedup across surfaces, and **kill any finding
-that can't cite both** a `ferrox/src/...:line` and an SDK file proving the
+that can't cite both** a `ferrox-providers/src/...:line` (or `ferrox/src/...:line`) and an SDK file proving the
 expected behaviour. Prefer a short list of hard, evidence-backed gaps over a long
 list of maybes. Note explicitly what you verified as **already correct** (so a
 future run doesn't re-flag it).
@@ -162,7 +179,7 @@ reference it in the report instead. Otherwise file it:
   (reasoning, usage, multimodal, tool-calling, transparency) plus a tracking
   **epic** that links them — mirror the structure the repo already uses
   (see the closed epic #76 and its children #70–#75 for the house style).
-- Body **must** contain: the concrete `ferrox/src/...:line`, the SDK file that
+- Body **must** contain: the concrete `ferrox-providers/src/...:line` (or `ferrox/src/...:line`), the SDK file that
   proves the correct behaviour, the user-visible consequence, and a one-line fix
   direction. Label `bug`.
 - **Never invent a finding to have something to file.** A clean audit → file

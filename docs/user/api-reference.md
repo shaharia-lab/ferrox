@@ -139,6 +139,128 @@ All errors use OpenAI error format:
 
 ---
 
+## POST /v1/responses
+
+The OpenAI **Responses API** (`client.responses.create(...)`), used by Codex CLI, the OpenAI Agents SDK and newer OpenAI SDK code. Ferrox translates the request to its internal chat format, routes it exactly like `/v1/chat/completions` (same aliases, retries, failover, circuit breakers, virtual-key auth, rate limits, budgets, `usage_log` rows and `token_usage` webhooks), and encodes the answer back as a Responses object. It therefore works with **every** configured provider, not only OpenAI.
+
+The endpoint is **stateless**: nothing is stored, `store` is accepted and always echoed as `false`, and the client sends the full conversation in `input` on every turn (which is what Codex CLI does).
+
+### Request
+
+```json
+{
+  "model": "claude-sonnet",
+  "instructions": "You are a helpful assistant.",
+  "input": [
+    {"role": "user", "content": "What's the weather in Paris?"}
+  ],
+  "tools": [
+    {"type": "function", "name": "get_weather",
+     "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}
+  ],
+  "max_output_tokens": 1024,
+  "stream": false
+}
+```
+
+**Supported:**
+
+| Field | Notes |
+|---|---|
+| `model`, `instructions`, `max_output_tokens`, `temperature`, `top_p`, `stream` | `instructions` becomes a leading system message |
+| `input` | A string, or a list of `message` (roles `user` / `assistant` / `system` / `developer`), `function_call`, `function_call_output`, `custom_tool_call`, `custom_tool_call_output` and `reasoning` items. Content parts: `input_text`, `output_text`, `refusal`, `input_image` (with `image_url`) |
+| `tools` | `function` and `custom` (free-form text input) tools |
+| `tool_choice`, `parallel_tool_calls`, `max_tool_calls` | |
+| `text.format` | `text`, `json_object`, `json_schema` (mapped to the chat `response_format`; schema adherence depends on the upstream model) |
+| `reasoning.effort`, `reasoning.summary`, `text.verbosity`, `include`, `truncation` | Forwarded as hints |
+| `metadata`, `prompt_cache_key`, `safety_identifier`, `user`, `service_tier` | Passed through |
+
+Unknown top-level fields are ignored, so a newer SDK still works.
+
+**Rejected with a 400** (`invalid_request_error`, with `param` naming the field):
+
+| Field | Why |
+|---|---|
+| `previous_response_id`, `conversation`, `prompt` | Need server-side state — send the full conversation in `input` instead |
+| `background: true` | Needs a server-side job store |
+| Hosted built-in tools (`web_search*`, `file_search`, `code_interpreter`, `computer*`, `mcp`, `image_generation`, `shell`, `local_shell`, `apply_patch`, `tool_search`, `namespace`) | Need server-side execution; declare them as `function` tools instead |
+| `input_image` with only a `file_id`, `input_file` content | Need the OpenAI Files API |
+
+`GET` / `DELETE /v1/responses/{id}`, `input_items`, `cancel`, `input_tokens`, `compact` and WebSocket mode are not implemented.
+
+### Non-streaming response
+
+```json
+{
+  "id": "resp_2f4c9e0b7a1d4e53b8c6f1a0d2e3b4c5",
+  "object": "response",
+  "created_at": 1735000000,
+  "status": "completed",
+  "model": "claude-sonnet",
+  "output": [
+    {
+      "type": "message",
+      "id": "msg_2f4c9e0b7a1d4e53b8c6f1a0d2e3b4c5_0",
+      "role": "assistant",
+      "status": "completed",
+      "content": [{"type": "output_text", "text": "Hello!", "annotations": [], "logprobs": []}]
+    }
+  ],
+  "usage": {
+    "input_tokens": 15,
+    "input_tokens_details": {"cached_tokens": 0, "cache_write_tokens": 0},
+    "output_tokens": 2,
+    "output_tokens_details": {"reasoning_tokens": 0},
+    "total_tokens": 17
+  },
+  "store": false
+}
+```
+
+The request parameters (`instructions`, `tools`, `tool_choice`, `temperature`, `max_output_tokens`, …) are echoed back as the OpenAI API does. `output` holds a `reasoning` item when the model returned reasoning, a `message` item for text, and one `function_call` (or `custom_tool_call`) item per tool call. A `length` stop becomes `status: "incomplete"` with `incomplete_details.reason: "max_output_tokens"`.
+
+### Streaming response
+
+When `stream: true`, the response is an SSE stream of typed events. Each frame's `event:` name equals its `type`, every event carries a monotonic `sequence_number`, and there is **no** `[DONE]` sentinel:
+
+```
+event: response.created
+data: {"type":"response.created","sequence_number":0,"response":{"id":"resp_…","object":"response","status":"in_progress",…}}
+
+event: response.in_progress
+data: {"type":"response.in_progress","sequence_number":1,"response":{…}}
+
+event: response.output_item.added
+data: {"type":"response.output_item.added","sequence_number":2,"output_index":0,"item":{"type":"message",…}}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","sequence_number":4,"item_id":"msg_…_0","output_index":0,"content_index":0,"delta":"Hello"}
+
+…
+
+event: response.completed
+data: {"type":"response.completed","sequence_number":9,"response":{"id":"resp_…","status":"completed","output":[…],"usage":{"input_tokens":15,"output_tokens":2,…}}}
+```
+
+The stream ends with exactly one of `response.completed`, `response.incomplete` or `response.failed`; usage is reported only in that terminal event. An upstream error after the stream started arrives in-band as `response.failed`.
+
+### Error responses
+
+Errors that happen before the response starts use the same OpenAI error format and status codes as [`/v1/chat/completions`](#error-responses). Translation failures are `400 invalid_request_error` with a `param`:
+
+```json
+{
+  "error": {
+    "message": "`previous_response_id` is not supported: this endpoint is stateless — send the full conversation in `input`",
+    "type": "invalid_request_error",
+    "code": 400,
+    "param": "previous_response_id"
+  }
+}
+```
+
+---
+
 ## GET /v1/models
 
 List all configured model aliases.
@@ -462,6 +584,33 @@ const response = await client.chat.completions.create({
   messages: [{ role: "user", content: "Hello" }],
 });
 ```
+
+**Responses API** (`POST /v1/responses`) — the same clients, any configured alias:
+
+```python
+response = client.responses.create(model="claude-sonnet", input="Hello")
+print(response.output_text, response.usage.input_tokens, response.usage.output_tokens)
+
+# Streaming: typed events, ending in response.completed
+for event in client.responses.create(model="claude-sonnet", input="Hello", stream=True):
+    if event.type == "response.output_text.delta":
+        print(event.delta, end="")
+```
+
+```javascript
+const response = await client.responses.create({ model: "claude-sonnet", input: "Hello" });
+console.log(response.output_text);
+```
+
+```go
+client := openai.NewClient(option.WithBaseURL("http://localhost:8080/v1/"), option.WithAPIKey("sk-proxy-key"))
+resp, err := client.Responses.New(ctx, responses.ResponseNewParams{
+	Model: "claude-sonnet",
+	Input: responses.ResponseNewParamsInputUnion{OfString: openai.String("Hello")},
+})
+```
+
+For Codex CLI, see [Codex CLI](codex-cli.md).
 
 ---
 

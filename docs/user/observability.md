@@ -38,8 +38,8 @@ Every completed request emits a structured log line at `info` level:
 **omitted entirely** when the provider reported no cache usage, so requests
 against non-caching providers log exactly as before. Both counters are logged on
 every completed request — streaming and non-streaming, on `request_completed`
-(`/v1/chat/completions`) and `anthropic_request_completed`
-(`/anthropic/v1/messages`) alike.
+(`/v1/chat/completions`), `responses_request_completed` (`/v1/responses`) and
+`anthropic_request_completed` (`/anthropic/v1/messages`) alike.
 
 The same two counters, with the same omit-when-zero rule, are included in the
 `token_usage` webhook payload — see
