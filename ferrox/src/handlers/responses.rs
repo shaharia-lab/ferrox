@@ -1034,6 +1034,62 @@ data: {"type":"response.output_text.delta","delta":"Hi"}"#
     }
 
     #[tokio::test]
+    async fn skipping_a_half_open_target_leaves_its_probe_slot_free() {
+        let config: Config = serde_json::from_value(json!({
+            "defaults": {"retry": {"max_attempts": 1, "initial_backoff_ms": 1,
+                                   "max_backoff_ms": 1, "jitter": false}},
+            "providers": [
+                {"name": "down", "type": "openai"},
+                {"name": "ok", "type": "openai",
+                 "circuit_breaker": {"failure_threshold": 1, "recovery_timeout_secs": 0}}
+            ],
+            "models": [{"alias": "resp-skip-probe", "routing": {
+                "strategy": "failover",
+                "targets": [{"provider": "down", "model_id": "down-v1"}],
+                "fallback": [{"provider": "ok", "model_id": "ok-v1"}]}}]
+        }))
+        .unwrap();
+        let mut registry: ProviderRegistry = HashMap::new();
+        registry.insert("down".to_string(), Arc::new(DownProvider));
+        registry.insert(
+            "ok".to_string(),
+            Arc::new(OkProvider {
+                seen: Mutex::new(None),
+            }),
+        );
+        let router = crate::router::ModelRouter::from_config(&config, &registry).unwrap();
+        let pool = router.resolve("resp-skip-probe").unwrap();
+        // Open the fallback's breaker; with no recovery timeout, its next
+        // availability check moves it to half-open and claims the probe.
+        pool.fallbacks[0].circuit_breaker.record_failure();
+
+        let req: ChatCompletionRequest =
+            serde_json::from_value(json!({"model": "m", "messages": []})).unwrap();
+        let result = crate::handlers::chat::dispatch(
+            &pool,
+            &config.defaults.retry,
+            false,
+            |t| {
+                (t.provider.name() == "ok").then(|| ProxyError::InvalidRequest {
+                    message: "untranslatable".to_string(),
+                    param: None,
+                })
+            },
+            |provider, model_id| {
+                let req = &req;
+                async move { provider.chat(req, &model_id).await }
+            },
+        )
+        .await;
+        assert!(result.is_err());
+
+        assert!(
+            pool.fallbacks[0].is_available(),
+            "the skipped target's probe slot must still be free"
+        );
+    }
+
+    #[tokio::test]
     async fn native_aliases_still_reject_stateful_fields() {
         let alias = "resp-native-stateful";
         let upstream = mock_upstream(200).await;

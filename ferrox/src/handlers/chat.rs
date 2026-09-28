@@ -168,8 +168,8 @@ pub(crate) async fn dispatch_stream(
 /// Responses request using native-only features, on a translate-only
 /// provider). Such a target is never selected as the primary, and is passed
 /// over in the fallback chain, without an attempt and without touching its
-/// circuit breaker; if no target was attempted, the first such reason is the
-/// error.
+/// circuit breaker (not even claiming a half-open probe); if no target was
+/// attempted, the first such reason is the error.
 ///
 /// Returns `(output, provider_name, model_id)` on success.
 pub(crate) async fn dispatch<T, F, Fut>(
@@ -190,11 +190,7 @@ where
     let primary = pool.select_target(|t| skip(t).is_none());
     let mut skipped = match primary {
         Some(_) => None,
-        None => pool
-            .targets
-            .iter()
-            .filter(|t| t.is_available())
-            .find_map(&skip),
+        None => pool.targets.iter().find_map(&skip),
     };
     if let Some(target) = primary {
         attempted = true;
@@ -221,9 +217,14 @@ where
     }
 
     // Fallback chain
-    for fallback in pool.fallbacks.iter().filter(|t| t.is_available()) {
+    for fallback in &pool.fallbacks {
+        // `skip` before `is_available`: the latter claims a half-open
+        // breaker's probe slot, which only an attempt gives back.
         if let Some(reason) = skip(fallback) {
             skipped.get_or_insert(reason);
+            continue;
+        }
+        if !fallback.is_available() {
             continue;
         }
         attempted = true;
