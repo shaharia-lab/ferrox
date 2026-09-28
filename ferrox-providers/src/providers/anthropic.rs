@@ -421,6 +421,8 @@ fn thinking_for_effort(
     };
     match style {
         ThinkingStyle::Adaptive { since_4_7 } => {
+            // Anthropic's levels are low/medium/high/max (4.6+) plus xhigh
+            // (4.7+); `minimal` has no counterpart.
             let level = match effort {
                 "minimal" | "low" => "low",
                 "xhigh" if !since_4_7 => "high",
@@ -1450,6 +1452,11 @@ mod tests {
         assert_eq!(
             effort_body("claude-opus-4-6", "medium")["output_config"]["effort"],
             "medium"
+        );
+        // `max` is an Anthropic level on 4.6+ and passes through.
+        assert_eq!(
+            effort_body("claude-opus-4-6", "max")["output_config"]["effort"],
+            "max"
         );
     }
 

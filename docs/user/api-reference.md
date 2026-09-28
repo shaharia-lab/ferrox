@@ -68,14 +68,14 @@ Send a chat completion request. Ferrox routes it to the configured provider base
 | `stop` | string or array | no | Stop sequences |
 | `tools` | array | no | Tool definitions |
 | `tool_choice` | string or object | no | Tool selection mode |
-| `reasoning_effort` | string | no | `none` / `minimal` / `low` / `medium` / `high` / `xhigh`. Forwarded as-is to OpenAI-protocol providers. On an Anthropic target it turns on extended thinking for Claude models (see below) |
+| `reasoning_effort` | string | no | `none` / `minimal` / `low` / `medium` / `high` / `xhigh` (and Anthropic's `max`). Forwarded as-is to OpenAI-protocol providers. On an Anthropic target it turns on extended thinking for Claude models (see below) |
 
 Unknown fields are forwarded to the provider as-is.
 
 **`reasoning_effort` on Anthropic targets.** Claude 4.6+ gets adaptive thinking with
-`output_config.effort` (`xhigh` becomes `high` on 4.6; thinking summaries are requested on
-4.7+). Claude 3.7–4.5 gets `thinking.type: "enabled"` with a `budget_tokens` of 1024 / 4096 /
-16384 for low / medium / high, below `max_tokens` (the budget shrinks to half of a small
+`output_config.effort` (`minimal` becomes `low`, `xhigh` becomes `high` on 4.6, `max` passes
+through; thinking summaries are requested on 4.7+). Claude 3.7–4.5 gets `thinking.type:
+"enabled"` with a `budget_tokens` of 1024 / 4096 / 16384 for low / medium / high (and above), below `max_tokens` (the budget shrinks to half of a small
 client limit; with no limit, room for it is added to the default). Older Claude, GLM, Kimi and
 unrecognised model ids are left unchanged, as is `none`. While thinking is on, `temperature`
 and a `top_p` below 0.95 (any `top_p` on 4.7+) are dropped and a forced `tool_choice` becomes
