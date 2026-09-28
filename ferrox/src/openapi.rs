@@ -91,7 +91,8 @@ pub struct AnthropicMessagesRequestCore {
 /// exhaustive schema (input item union, tools, `text.format`, `reasoning`).
 ///
 /// The endpoint is stateless: `previous_response_id`, `conversation`,
-/// `background: true` and hosted built-in tools are rejected with a 400.
+/// `prompt`, `background: true`, hosted built-in tools and Files-API inputs
+/// (`input_file`, `input_image` by `file_id`) are rejected with a 400.
 ///
 /// Schema-only (see `ChatCompletionRequestCore`): describes the request body,
 /// not read at runtime.

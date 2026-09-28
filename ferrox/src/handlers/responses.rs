@@ -8,8 +8,9 @@
 //! [`RequestFinalizer`]. All wire logic lives in `ferrox-providers`.
 //!
 //! The endpoint is stateless: nothing is stored, so `previous_response_id`,
-//! `conversation`, `background` and hosted built-in tools are rejected with an
-//! OpenAI-shaped 400 by the translation.
+//! `conversation`, `prompt`, `background`, hosted built-in tools and
+//! Files-API inputs (`input_file`, `input_image` by `file_id`) are rejected
+//! with an OpenAI-shaped 400 by the translation.
 
 use std::time::Instant;
 
@@ -43,7 +44,8 @@ use crate::types::RequestContext;
             exactly one of `response.completed` / `response.incomplete` / `response.failed` \
             when `stream=true` (no `[DONE]` sentinel)."),
         (status = 400, description = "Malformed body, or a stateful / unsupported feature \
-            (`previous_response_id`, `conversation`, `background`, hosted built-in tools)",
+            (`previous_response_id`, `conversation`, `prompt`, `background`, hosted built-in \
+            tools, `input_file`, `input_image` by `file_id`)",
             body = ErrorResponse),
         (status = 401, description = "Missing or invalid credentials", body = ErrorResponse),
         (status = 403, description = "Model not permitted for this key", body = ErrorResponse),
