@@ -704,6 +704,36 @@ mod tests {
         }
     }
 
+    /// A Responses request carries `instructions` plus `developer` items, which
+    /// both become system messages; every one must reach Anthropic's `system`.
+    #[test]
+    fn every_responses_system_message_reaches_the_anthropic_system_prompt() {
+        let responses: crate::responses_types::ResponsesRequest =
+            serde_json::from_value(serde_json::json!({
+                "model": "m",
+                "instructions": "You are Codex.",
+                "input": [
+                    {"type": "message", "role": "developer",
+                     "content": [{"type": "input_text", "text": "<permissions>ro</permissions>"}]},
+                    {"type": "message", "role": "user", "content": "hi"}
+                ]
+            }))
+            .unwrap();
+        let req = crate::responses_types::to_chat_completion_request(&responses).unwrap();
+        let body = serde_json::to_value(build_request_body(
+            &req,
+            "claude-sonnet",
+            false,
+            &AnthropicExtras { thinking: None },
+        ))
+        .unwrap();
+        assert_eq!(
+            body["system"],
+            "You are Codex.\n\n<permissions>ro</permissions>"
+        );
+        assert_eq!(body["messages"].as_array().unwrap().len(), 1);
+    }
+
     #[test]
     fn cache_control_reaches_the_anthropic_body() {
         let ephemeral = serde_json::json!({"type": "ephemeral"});

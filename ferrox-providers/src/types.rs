@@ -38,16 +38,22 @@ impl ChatCompletionRequest {
         self.stream.unwrap_or(false)
     }
 
-    /// Return the system prompt from the `system` field or the first message
-    /// with `role == "system"`.
+    /// Return the system prompt from the `system` field, or else the text of
+    /// **every** message with `role == "system"`, joined by a blank line.
+    ///
+    /// Adapters whose API takes a single system prompt (Anthropic, Gemini) drop
+    /// system messages from the conversation, so taking only the first one
+    /// would silently lose the rest — e.g. a Responses request's `instructions`
+    /// followed by `developer` items. Bedrock keeps each as its own block.
     pub fn system_message(&self) -> Option<String> {
         if let Some(s) = &self.system {
             return Some(s.clone());
         }
-        self.messages
+        let texts: Vec<String> = self
+            .messages
             .iter()
-            .find(|m| m.role == "system")
-            .and_then(|m| {
+            .filter(|m| m.role == "system")
+            .filter_map(|m| {
                 m.content.as_ref().map(|c| match c {
                     MessageContent::Text(t) => t.clone(),
                     MessageContent::Parts(parts) => parts
@@ -60,6 +66,13 @@ impl ChatCompletionRequest {
                         .join(""),
                 })
             })
+            .filter(|t| !t.is_empty())
+            .collect();
+        match texts.len() {
+            0 => None,
+            1 => texts.into_iter().next(),
+            _ => Some(texts.join("\n\n")),
+        }
     }
 }
 
@@ -528,6 +541,18 @@ mod tests {
         r.messages.push(msg("system", "Be concise."));
         r.messages.push(msg("user", "Hello"));
         assert_eq!(r.system_message(), Some("Be concise.".to_string()));
+    }
+
+    #[test]
+    fn system_message_joins_every_system_role_message() {
+        let mut r = minimal_req(None);
+        r.messages.push(msg("system", "instructions"));
+        r.messages.push(msg("user", "Hello"));
+        r.messages.push(msg("system", "developer context"));
+        assert_eq!(
+            r.system_message(),
+            Some("instructions\n\ndeveloper context".to_string())
+        );
     }
 
     #[test]

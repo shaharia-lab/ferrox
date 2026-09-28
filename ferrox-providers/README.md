@@ -10,7 +10,7 @@ of the gateway around them. No routing, load balancing, circuit breaking, rate
 limiting, JWKS or auth.
 
 Ferrox itself consumes this crate, so the translation is exercised by Ferrox's
-compat suite (263 tests with `--all-features`) rather than maintained in two
+compat suite (266 tests with `--all-features`) rather than maintained in two
 places.
 
 ## Usage

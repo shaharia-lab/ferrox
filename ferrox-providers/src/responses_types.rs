@@ -1188,10 +1188,16 @@ fn translate_content(content: &InputContent, param: &str) -> Result<MessageConte
                     extra: HashMap::new(),
                 },
                 None => {
+                    // Name the field the client actually sent (or should have).
+                    let field = if img.file_id.is_some() {
+                        "file_id"
+                    } else {
+                        "image_url"
+                    };
                     return Err(invalid(
                         "`input_image` needs an `image_url`; `file_id` is not supported",
-                        format!("{param}[{j}].file_id"),
-                    ))
+                        format!("{param}[{j}].{field}"),
+                    ));
                 }
             },
             InputContentPart::InputFile => {
@@ -1615,6 +1621,16 @@ mod tests {
                 {"type": "input_image", "file_id": "file-123", "detail": "auto"}
             ]}]}),
             "input[0].content[0].file_id",
+        );
+    }
+
+    #[test]
+    fn input_image_without_a_source_names_image_url() {
+        rejected(
+            json!({"model": "m", "input": [{"role": "user", "content": [
+                {"type": "input_image", "detail": "auto"}
+            ]}]}),
+            "input[0].content[0].image_url",
         );
     }
 
