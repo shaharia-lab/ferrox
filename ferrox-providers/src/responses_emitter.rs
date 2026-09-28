@@ -81,6 +81,22 @@ fn item_id(prefix: &str, suffix: &str, output_index: u32) -> String {
     format!("{prefix}_{suffix}_{output_index}")
 }
 
+/// `(id, call_id)` of a tool-call item: `fc_…` for a function call, `ctc_…` for
+/// a custom tool call, and a generated `call_id` when the upstream sent none —
+/// the client needs one to send the tool's output back.
+fn tool_ids(
+    suffix: &str,
+    output_index: u32,
+    call_id: Option<String>,
+    custom: bool,
+) -> (String, String) {
+    let id = item_id(if custom { "ctc" } else { "fc" }, suffix, output_index);
+    let call_id = call_id
+        .filter(|c| !c.is_empty())
+        .unwrap_or_else(|| item_id("call", suffix, output_index));
+    (id, call_id)
+}
+
 /// The part of a response id after `resp_`, reused as the item-id suffix.
 fn id_suffix(response_id: &str) -> String {
     response_id
@@ -300,8 +316,15 @@ fn tool_item(
 /// `function_call` (or `custom_tool_call`, for a tool declared `custom`) item
 /// per tool call. `status` / `incomplete_details` follow `finish_reason`, the
 /// request parameters are echoed back, and `store` is always `false`.
-pub fn to_responses_response(resp: ChatCompletionResponse, req: &ResponsesRequest) -> Response {
-    let id = new_response_id();
+///
+/// `response_id` is the caller's (see [`new_response_id`]), so it can be
+/// logged before encoding, exactly as for [`ResponsesEmitter::new`].
+pub fn to_responses_response(
+    resp: ChatCompletionResponse,
+    req: &ResponsesRequest,
+    response_id: impl Into<String>,
+) -> Response {
+    let id = response_id.into();
     let suffix = id_suffix(&id);
     let mut response = skeleton(req, id, resp.created);
     let custom = custom_tool_names(req);
@@ -353,9 +376,10 @@ pub fn to_responses_response(resp: ChatCompletionResponse, req: &ResponsesReques
 
         for tc in tool_calls {
             let is_custom = custom.contains(&tc.function.name);
+            let (id, call_id) = tool_ids(&suffix, next, Some(tc.id), is_custom);
             output.push(tool_item(
-                item_id("fc", &suffix, next),
-                tc.id,
+                id,
+                call_id,
                 tc.function.name,
                 tc.function.arguments,
                 is_custom,
@@ -510,7 +534,7 @@ impl ResponsesEmitter {
             frames: VecDeque::with_capacity(8),
             output: Vec::with_capacity(4),
             open_text: None,
-            tools: Vec::new(),
+            tools: Vec::with_capacity(2),
             finish_reason: None,
             usage: None,
             signature: None,
@@ -780,11 +804,8 @@ impl ResponsesEmitter {
     fn open_tool(&mut self, chat_index: u32, call_id: Option<String>, name: String) -> usize {
         self.close_text("completed");
         let output_index = self.next_output_index();
-        let id = item_id("fc", &self.suffix, output_index);
-        let call_id = call_id
-            .filter(|c| !c.is_empty())
-            .unwrap_or_else(|| item_id("call", &self.suffix, output_index));
         let custom = self.custom_tools.contains(&name);
+        let (id, call_id) = tool_ids(&self.suffix, output_index, call_id, custom);
         let item = if custom {
             OutputItem::CustomToolCall {
                 id: id.clone(),
@@ -818,7 +839,7 @@ impl ResponsesEmitter {
             id,
             call_id,
             name,
-            args: String::new(),
+            args: String::with_capacity(128),
             custom,
         });
         self.tools.len() - 1
@@ -905,20 +926,10 @@ impl ResponsesEmitter {
         } else {
             "incomplete"
         };
-        // Close in output order: at most one text item is open, and it was
-        // opened after every tool item still open only if text followed tools.
-        let text_first = self
-            .open_text
-            .as_ref()
-            .zip(self.tools.first())
-            .is_none_or(|(text, tool)| text.output_index < tool.output_index);
-        if text_first {
-            self.close_text(item_status);
-            self.close_tools(item_status);
-        } else {
-            self.close_tools(item_status);
-            self.close_text(item_status);
-        }
+        // Close in output order: opening a tool closes the open text item, so
+        // a text item still open was opened after every open tool.
+        self.close_tools(item_status);
+        self.close_text(item_status);
         self.response.status = status.to_string();
         self.response.incomplete_details = incomplete_details;
         let kind = if status == "completed" {
@@ -1635,8 +1646,9 @@ mod tests {
                 "tool_calls",
             ),
             &request(),
+            RESPONSE_ID,
         );
-        assert!(resp.id.starts_with("resp_"));
+        assert_eq!(resp.id, RESPONSE_ID);
         assert_eq!(resp.status, "completed");
         assert_eq!(resp.created_at, 1_700_000_000);
         assert_eq!(resp.store, Some(false));
@@ -1653,6 +1665,7 @@ mod tests {
         assert!(out[2]["id"].as_str().unwrap().starts_with("fc_"));
         assert_eq!(out[2]["arguments"], "{\"city\":\"Paris\"}");
         assert_eq!(out[3]["type"], "custom_tool_call");
+        assert!(out[3]["id"].as_str().unwrap().starts_with("ctc_"));
         assert_eq!(out[3]["input"], "diff");
         assert_eq!(v["usage"]["input_tokens_details"]["cached_tokens"], 12);
         assert_eq!(v["usage"]["input_tokens_details"]["cache_write_tokens"], 3);
@@ -1662,10 +1675,40 @@ mod tests {
     }
 
     #[test]
+    fn non_streaming_tool_call_without_id_gets_a_call_id() {
+        let resp = to_responses_response(
+            chat_response(
+                json!({"role": "assistant", "content": null, "tool_calls": [
+                    {"id": "", "type": "function",
+                     "function": {"name": "get_weather", "arguments": "{}"}}
+                ]}),
+                "tool_calls",
+            ),
+            &request(),
+            RESPONSE_ID,
+        );
+        let v = serde_json::to_value(&resp).unwrap();
+        assert_eq!(v["output"][0]["call_id"], "call_test_0");
+    }
+
+    #[test]
+    fn streaming_tool_call_without_id_gets_a_call_id() {
+        let frames = run(chunks(vec![
+            tool(0, Some(("", "get_weather")), "{}"),
+            finish("tool_calls"),
+        ]));
+        assert_eq!(
+            terminal(&frames)["response"]["output"][0]["call_id"],
+            "call_test_0"
+        );
+    }
+
+    #[test]
     fn non_streaming_length_is_incomplete_with_max_output_tokens() {
         let resp = to_responses_response(
             chat_response(json!({"role": "assistant", "content": "It is"}), "length"),
             &request(),
+            RESPONSE_ID,
         );
         assert_eq!(resp.status, "incomplete");
         assert_eq!(resp.incomplete_details.unwrap().reason, "max_output_tokens");
@@ -1679,6 +1722,7 @@ mod tests {
                 "content_filter",
             ),
             &request(),
+            RESPONSE_ID,
         );
         assert_eq!(resp.status, "incomplete");
         assert_eq!(resp.incomplete_details.unwrap().reason, "content_filter");
@@ -1694,6 +1738,7 @@ mod tests {
                 "stop",
             ),
             &request(),
+            RESPONSE_ID,
         );
         let v = serde_json::to_value(&resp).unwrap();
         assert_eq!(
@@ -1710,15 +1755,10 @@ mod tests {
                 "stop",
             ),
             &request(),
+            RESPONSE_ID,
         );
-        // Pin the random id so the fixture is stable; item ids derive from it.
-        let suffix = id_suffix(&resp.id);
-        let got: Value = serde_json::from_str(
-            &serde_json::to_string(&resp)
-                .unwrap()
-                .replace(&suffix, "test"),
-        )
-        .unwrap();
+        // Through the wire string: `to_value` would widen `f32` fields.
+        let got: Value = serde_json::from_str(&serde_json::to_string(&resp).unwrap()).unwrap();
         let path = fixture_path("non_streaming");
         if std::env::var_os("FERROX_BLESS").is_some() {
             std::fs::write(&path, format!("{got}\n")).unwrap();
