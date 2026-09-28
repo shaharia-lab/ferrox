@@ -101,11 +101,7 @@ pub struct ResponsesRequestCore {
     /// Model alias to route to — one of the aliases returned by `GET /v1/models`.
     #[schema(example = "claude-sonnet")]
     pub model: String,
-    /// A plain string (one user message) or a list of input items (`message`,
-    /// `function_call`, `function_call_output`, `reasoning`, ...). Modeled here
-    /// as opaque; see the upstream spec for the item union.
-    #[schema(value_type = Object)]
-    pub input: serde_json::Value,
+    pub input: ResponsesInputCore,
     /// System-level instructions, sent as a leading system message.
     pub instructions: Option<String>,
     /// Upper bound on generated tokens.
@@ -114,6 +110,21 @@ pub struct ResponsesRequestCore {
     /// When `true`, the response is streamed as typed `response.*` SSE events
     /// (no `[DONE]` sentinel).
     pub stream: Option<bool>,
+}
+
+/// `input` of a Responses request: a plain string (one user message) or a list
+/// of input items (`message`, `function_call`, `function_call_output`,
+/// `reasoning`, ...). Items are modeled as opaque objects; see the upstream
+/// spec for the item union.
+///
+/// Schema-only (see `ChatCompletionRequestCore`).
+#[derive(Serialize, ToSchema)]
+#[serde(untagged)]
+#[allow(dead_code)]
+pub enum ResponsesInputCore {
+    Text(String),
+    #[schema(value_type = Vec<Object>)]
+    Items(Vec<serde_json::Value>),
 }
 
 /// Adds the two authentication schemes the gateway accepts to the spec's
@@ -180,6 +191,7 @@ fn metrics_doc() {}
         ErrorDetail,
         ChatCompletionRequestCore,
         ResponsesRequestCore,
+        ResponsesInputCore,
         AnthropicMessagesRequestCore,
         crate::types::ModelsResponse,
         crate::types::ModelObject,
