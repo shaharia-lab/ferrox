@@ -744,6 +744,14 @@ mod tests {
             (ProxyError::Unauthorized("x".into()), 401, "unauthorized"),
             (ProxyError::Forbidden("x".into()), 403, "forbidden"),
             (
+                ProxyError::InvalidRequest {
+                    message: "x".into(),
+                    param: None,
+                },
+                400,
+                "invalid_request",
+            ),
+            (
                 ProxyError::ModelNotFound("x".into()),
                 404,
                 "model_not_found",
