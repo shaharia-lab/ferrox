@@ -48,6 +48,7 @@ use ferrox_providers::responses_types::{
 use futures::StreamExt as _;
 use serde_json::{Map, Value};
 
+use crate::budget_enforcer::BudgetReservation;
 use crate::error::ProxyError;
 use crate::handlers::chat::{dispatch, is_model_allowed};
 use crate::handlers::finalize::{record_error_metrics, RequestFinalizer, Surface};
@@ -82,6 +83,7 @@ use crate::types::RequestContext;
 pub async fn responses(
     State(state): State<AppState>,
     Extension(ctx): Extension<RequestContext>,
+    reservation: Option<Extension<BudgetReservation>>,
     body: Bytes,
 ) -> Result<Response, ProxyError> {
     let start = Instant::now();
@@ -120,10 +122,14 @@ pub async fn responses(
         response_id
     };
 
+    // Only one of the paths below builds a finalizer; the clone is a
+    // refcount bump, and the reservation's claim settles it once.
+    let reservation = reservation.map(|Extension(r)| r);
     let finalizer = |provider_name, model_id| {
         RequestFinalizer::new(
             &state,
             &ctx,
+            reservation.clone(),
             req.model.clone(),
             provider_name,
             model_id,

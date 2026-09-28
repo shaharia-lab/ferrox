@@ -14,6 +14,7 @@ use crate::anthropic_types::{
     openai_stream_to_anthropic_sse, to_anthropic_response, to_chat_completion_request,
     AnthropicMessagesRequest,
 };
+use crate::budget_enforcer::BudgetReservation;
 use crate::error::ProxyError;
 use crate::handlers::chat::{dispatch_non_stream, dispatch_stream, is_model_allowed};
 use crate::handlers::finalize::{
@@ -54,6 +55,7 @@ fn proxy_error_to_anthropic_response(e: &ProxyError) -> Response {
 pub async fn anthropic_messages(
     State(state): State<AppState>,
     Extension(ctx): Extension<RequestContext>,
+    reservation: Option<Extension<BudgetReservation>>,
     headers: axum::http::HeaderMap,
     body: Bytes,
 ) -> Result<Response, ProxyError> {
@@ -146,6 +148,7 @@ pub async fn anthropic_messages(
                 let finalizer = RequestFinalizer::new(
                     &state,
                     &ctx,
+                    reservation.map(|Extension(r)| r),
                     model_alias,
                     provider_name,
                     model_id,
@@ -181,6 +184,7 @@ pub async fn anthropic_messages(
                 RequestFinalizer::new(
                     &state,
                     &ctx,
+                    reservation.map(|Extension(r)| r),
                     model_alias,
                     provider_name,
                     model_id,

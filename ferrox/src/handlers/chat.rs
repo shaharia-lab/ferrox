@@ -11,6 +11,7 @@ use axum::{
 };
 use futures::StreamExt;
 
+use crate::budget_enforcer::BudgetReservation;
 use crate::config::RetryConfig;
 use crate::error::ProxyError;
 use crate::handlers::finalize::{record_error_metrics, RequestFinalizer, Surface};
@@ -41,6 +42,7 @@ use crate::types::{ChatCompletionRequest, ChatCompletionResponse, RequestContext
 pub async fn chat_completions(
     State(state): State<AppState>,
     Extension(ctx): Extension<RequestContext>,
+    reservation: Option<Extension<BudgetReservation>>,
     Json(req): Json<ChatCompletionRequest>,
 ) -> Result<Response, ProxyError> {
     let start = Instant::now();
@@ -71,6 +73,7 @@ pub async fn chat_completions(
                 let finalizer = RequestFinalizer::new(
                     &state,
                     &ctx,
+                    reservation.map(|Extension(r)| r),
                     req.model.clone(),
                     provider_name,
                     model_id,
@@ -106,6 +109,7 @@ pub async fn chat_completions(
                 RequestFinalizer::new(
                     &state,
                     &ctx,
+                    reservation.map(|Extension(r)| r),
                     req.model.clone(),
                     provider_name,
                     model_id,

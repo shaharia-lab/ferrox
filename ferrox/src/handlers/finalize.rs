@@ -24,7 +24,7 @@ use futures::stream::BoxStream;
 use futures::{Stream, StreamExt as _};
 use uuid::Uuid;
 
-use crate::budget_enforcer::BudgetEnforcer;
+use crate::budget_enforcer::{BudgetEnforcer, BudgetReservation, ClaimedReservation};
 use crate::error::ProxyError;
 use crate::event_dispatcher::{EventDispatcher, TokenUsageEvent};
 use crate::state::AppState;
@@ -68,13 +68,12 @@ impl TokenCounts {
 /// Everything needed to account for one successfully dispatched request.
 pub(crate) struct RequestFinalizer {
     usage_writer: UsageWriter,
-    budget_enforcer: Arc<dyn BudgetEnforcer>,
     event_dispatcher: EventDispatcher,
     request_id: String,
     key_name: String,
     client_id: Option<Uuid>,
-    budget_period: Option<String>,
-    budget_reserved_tokens: u32,
+    /// The pre-request budget reservation, claimed when the request settles.
+    budget_reservation: Option<BudgetReservation>,
     model_alias: String,
     provider: String,
     model_id: String,
@@ -92,6 +91,16 @@ struct Reconcile {
 }
 
 impl Reconcile {
+    fn new(claimed: ClaimedReservation, actual: u32) -> Self {
+        Self {
+            enforcer: claimed.enforcer,
+            client_id: claimed.client_id,
+            period: claimed.period,
+            reserved: claimed.reserved,
+            actual,
+        }
+    }
+
     async fn run(self) {
         self.enforcer
             .reconcile_tokens(&self.client_id, &self.period, self.reserved, self.actual)
@@ -100,9 +109,11 @@ impl Reconcile {
 }
 
 impl RequestFinalizer {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         state: &AppState,
         ctx: &RequestContext,
+        budget_reservation: Option<BudgetReservation>,
         model_alias: String,
         provider: String,
         model_id: String,
@@ -111,9 +122,9 @@ impl RequestFinalizer {
     ) -> Self {
         Self::from_parts(
             state.usage_writer.clone(),
-            state.budget_enforcer.clone(),
             state.event_dispatcher.clone(),
             ctx,
+            budget_reservation,
             model_alias,
             provider,
             model_id,
@@ -125,9 +136,9 @@ impl RequestFinalizer {
     #[allow(clippy::too_many_arguments)]
     fn from_parts(
         usage_writer: UsageWriter,
-        budget_enforcer: Arc<dyn BudgetEnforcer>,
         event_dispatcher: EventDispatcher,
         ctx: &RequestContext,
+        budget_reservation: Option<BudgetReservation>,
         model_alias: String,
         provider: String,
         model_id: String,
@@ -136,13 +147,11 @@ impl RequestFinalizer {
     ) -> Self {
         Self {
             usage_writer,
-            budget_enforcer,
             event_dispatcher,
             request_id: ctx.request_id.clone(),
             key_name: ctx.key_name.clone(),
             client_id: ctx.client_id,
-            budget_period: ctx.budget_period.clone(),
-            budget_reserved_tokens: ctx.budget_reserved_tokens,
+            budget_reservation,
             model_alias,
             provider,
             model_id,
@@ -255,6 +264,14 @@ impl RequestFinalizer {
             Surface::Responses => completed!("responses_request_completed"),
         }
 
+        // Claim the reservation whatever the outcome, so it is not also
+        // refunded on drop. Without usage the reserved estimate stays charged,
+        // as it always has: the upstream served the request and may have
+        // consumed tokens that were never reported.
+        let claimed = self
+            .budget_reservation
+            .as_ref()
+            .and_then(BudgetReservation::claim);
         let c = counts?;
         self.event_dispatcher.dispatch(TokenUsageEvent {
             event: "token_usage",
@@ -283,16 +300,7 @@ impl RequestFinalizer {
             latency_ms: Some(latency_ms),
         });
 
-        match (self.client_id, self.budget_period) {
-            (Some(cid), Some(period)) => Some(Reconcile {
-                enforcer: self.budget_enforcer,
-                client_id: cid.to_string(),
-                period,
-                reserved: self.budget_reserved_tokens,
-                actual: c.prompt + c.completion,
-            }),
-            _ => None,
-        }
+        claimed.map(|claimed| Reconcile::new(claimed, c.prompt + c.completion))
     }
 }
 
@@ -483,43 +491,15 @@ pub(crate) fn error_type_label(e: &ProxyError) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
-
-    use async_trait::async_trait;
     use tokio::sync::mpsc;
 
     use super::*;
-
-    #[derive(Default)]
-    struct FakeBudget {
-        calls: Mutex<Vec<(String, String, u32, u32)>>,
-    }
-
-    #[async_trait]
-    impl BudgetEnforcer for FakeBudget {
-        async fn reserve_tokens(&self, _: &str, _: &str, _: i64, _: u32) -> Result<(), ()> {
-            Ok(())
-        }
-        async fn reconcile_tokens(
-            &self,
-            client_id: &str,
-            period: &str,
-            reserved: u32,
-            actual: u32,
-        ) {
-            self.calls.lock().unwrap().push((
-                client_id.to_string(),
-                period.to_string(),
-                reserved,
-                actual,
-            ));
-        }
-    }
+    use crate::budget_enforcer::RecordingBudget;
 
     struct Harness {
         usage_rx: mpsc::Receiver<UsageEvent>,
         event_rx: mpsc::Receiver<TokenUsageEvent>,
-        budget: Arc<FakeBudget>,
+        budget: Arc<RecordingBudget>,
         client_id: Uuid,
         finalizer: Option<RequestFinalizer>,
     }
@@ -530,7 +510,7 @@ mod tests {
         fn new(alias: &str) -> Self {
             let (usage_writer, usage_rx) = UsageWriter::channel(8);
             let (event_dispatcher, event_rx) = EventDispatcher::channel(8);
-            let budget = Arc::new(FakeBudget::default());
+            let budget = Arc::new(RecordingBudget::default());
             let client_id = Uuid::new_v4();
             let ctx = RequestContext {
                 request_id: "req-1".into(),
@@ -541,11 +521,13 @@ mod tests {
                 budget_period: Some("daily".into()),
                 budget_reserved_tokens: 64,
             };
+            let reservation =
+                BudgetReservation::new(budget.clone(), client_id.to_string(), "daily".into(), 64);
             let finalizer = RequestFinalizer::from_parts(
                 usage_writer,
-                budget.clone(),
                 event_dispatcher,
                 &ctx,
+                Some(reservation),
                 alias.into(),
                 "prov".into(),
                 "model-x".into(),
@@ -566,7 +548,7 @@ mod tests {
         }
 
         fn reconciles(&self) -> Vec<(String, String, u32, u32)> {
-            self.budget.calls.lock().unwrap().clone()
+            self.budget.reconciles()
         }
     }
 
@@ -643,6 +625,8 @@ mod tests {
     async fn finish_without_usage_records_only_request_metrics() {
         let mut h = Harness::new("fin-none");
         h.take().finish(None).await;
+        // The finalizer claimed the reservation, so its drop refunds nothing.
+        tokio::task::yield_now().await;
 
         assert!(h.usage_rx.try_recv().is_err());
         assert!(h.event_rx.try_recv().is_err());
@@ -780,6 +764,7 @@ mod tests {
         let upstream = futures::stream::iter(vec![chunk(Some(usage(0, 0)))]).boxed();
         let collected: Vec<_> = h.take().wrap_stream(upstream).collect().await;
         assert_eq!(collected.len(), 1);
+        tokio::task::yield_now().await;
 
         assert!(h.usage_rx.try_recv().is_err());
         assert!(h.event_rx.try_recv().is_err());
