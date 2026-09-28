@@ -9,6 +9,9 @@ use axum::{
     response::{IntoResponse, Response, Sse},
     Json,
 };
+use ferrox_providers::responses_emitter::{
+    strip_thinking_signature, strip_thinking_signature_chunk,
+};
 use futures::StreamExt;
 
 use crate::budget_enforcer::BudgetReservation;
@@ -84,11 +87,15 @@ pub async fn chat_completions(
                 // chained `[DONE]` always follows the recorded usage.
                 let sse_stream = finalizer
                     .wrap_stream(stream)
-                    .map(|chunk_result| {
-                        chunk_result.map(|chunk| {
-                            let data = serde_json::to_string(&chunk).unwrap_or_default();
-                            Event::default().data(data)
-                        })
+                    .filter_map(|chunk_result| {
+                        let event = match chunk_result {
+                            Ok(chunk) => strip_thinking_signature_chunk(chunk).map(|chunk| {
+                                let data = serde_json::to_string(&chunk).unwrap_or_default();
+                                Ok(Event::default().data(data))
+                            }),
+                            Err(e) => Some(Err(e)),
+                        };
+                        std::future::ready(event)
                     })
                     .chain(futures::stream::once(async {
                         Ok::<Event, ProxyError>(Event::default().data("[DONE]"))
@@ -105,7 +112,8 @@ pub async fn chat_completions(
         }
     } else {
         match dispatch_non_stream(&pool, &req, retry_config).await {
-            Ok((resp, provider_name, model_id)) => {
+            Ok((mut resp, provider_name, model_id)) => {
+                strip_thinking_signature(&mut resp);
                 RequestFinalizer::new(
                     &state,
                     &ctx,

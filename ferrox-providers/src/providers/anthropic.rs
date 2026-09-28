@@ -11,6 +11,8 @@ use crate::config::{DefaultsConfig, ProviderConfig};
 use crate::error::ProxyError;
 use crate::providers::anthropic_events::AnthropicEventProcessor;
 use crate::providers::{parse_sse_stream, ProviderAdapter, ProviderStream};
+use crate::responses_emitter::RESPONSES_THINKING_SIGNATURE;
+use crate::responses_types::RESPONSES_ANTHROPIC_THINKING_BLOCKS;
 use crate::types::{
     ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, ChatMessage, Choice,
     ContentPart, FunctionCall, MessageContent, StopSequences, Usage,
@@ -66,7 +68,7 @@ impl ProviderAdapter for AnthropicAdapter {
         req: &ChatCompletionRequest,
         model_id: &str,
     ) -> Result<ChatCompletionResponse, ProxyError> {
-        let extras = extract_anthropic_extras(req);
+        let extras = extract_anthropic_extras(req, model_id);
         let body = prepare_body(req, model_id, false, &extras);
         let url = format!("{}/v1/messages", self.base_url);
 
@@ -107,7 +109,7 @@ impl ProviderAdapter for AnthropicAdapter {
         req: &ChatCompletionRequest,
         model_id: &str,
     ) -> Result<ProviderStream, ProxyError> {
-        let extras = extract_anthropic_extras(req);
+        let extras = extract_anthropic_extras(req, model_id);
         let body = prepare_body(req, model_id, true, &extras);
         let url = format!("{}/v1/messages", self.base_url);
 
@@ -172,15 +174,34 @@ struct AnthropicRequest {
     tools: Option<Vec<AnthropicTool>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_choice: Option<Value>,
-    /// Extended thinking configuration (Anthropic-native only).
+    /// Extended thinking configuration: the client's own `_anthropic_thinking`,
+    /// or one derived from `reasoning_effort` (see [`thinking_for_effort`]).
     #[serde(skip_serializing_if = "Option::is_none")]
     thinking: Option<Value>,
+    /// `{"effort": …}` for adaptive thinking, derived from `reasoning_effort`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_config: Option<Value>,
 }
 
 /// Anthropic-specific extras extracted from `ChatCompletionRequest`.
+#[derive(Default)]
 struct AnthropicExtras {
-    /// Extended thinking config from `_anthropic_thinking` extra key.
+    /// Extended thinking config from `_anthropic_thinking`, else derived from
+    /// `reasoning_effort` for the target model.
     thinking: Option<Value>,
+    /// `output_config` carrying the effort of derived adaptive thinking.
+    output_config: Option<Value>,
+    /// `max_tokens` to send when derived manual thinking needs room for its
+    /// budget (the budget must be below `max_tokens`).
+    max_tokens: Option<u32>,
+    /// Thinking was derived from `reasoning_effort`, so the request fields
+    /// Anthropic rejects alongside thinking (`temperature`, a forced
+    /// `tool_choice`) are dropped. A client-supplied `_anthropic_thinking` is
+    /// forwarded with the request as the client wrote it.
+    derived_thinking: bool,
+    /// Drop `top_p` whatever its value (Claude 4.7+). Otherwise derived
+    /// thinking only drops a `top_p` below 0.95.
+    drop_top_p: bool,
 }
 
 #[derive(Serialize, Clone)]
@@ -220,6 +241,9 @@ enum AnthropicPart {
         tool_use_id: String,
         content: String,
     },
+    /// A thinking block replayed from a Responses `reasoning` item, so a
+    /// manual-thinking tool loop's assistant turn still starts with one.
+    Thinking { thinking: String, signature: String },
 }
 
 #[derive(Serialize, Clone)]
@@ -258,10 +282,245 @@ struct AnthropicTool {
 }
 
 /// Extract Anthropic-specific extras that were injected into `ChatCompletionRequest`
-/// by the Anthropic-native handler.
-fn extract_anthropic_extras(req: &ChatCompletionRequest) -> AnthropicExtras {
-    let thinking = req.extra.get("_anthropic_thinking").cloned();
-    AnthropicExtras { thinking }
+/// by the Anthropic-native handler, or derive thinking from an OpenAI-style
+/// `reasoning_effort` for `model_id` when the client set no thinking itself.
+fn extract_anthropic_extras(req: &ChatCompletionRequest, model_id: &str) -> AnthropicExtras {
+    if let Some(thinking) = req.extra.get("_anthropic_thinking") {
+        return AnthropicExtras {
+            thinking: Some(thinking.clone()),
+            ..AnthropicExtras::default()
+        };
+    }
+    req.extra
+        .get("reasoning_effort")
+        .and_then(Value::as_str)
+        .map(|effort| thinking_for_effort(effort, model_id, req))
+        .unwrap_or_default()
+}
+
+/// Whether the last assistant turn made tool calls with no thinking block to
+/// replay in front of it. Manual thinking requires that turn to start with
+/// one, so it cannot be switched on for such a request — a Chat Completions
+/// tool loop never has one, and a Responses one only when a signature came
+/// back for it.
+fn tool_turn_without_thinking(req: &ChatCompletionRequest) -> bool {
+    let Some((index, last)) = req
+        .messages
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, m)| m.role == "assistant")
+    else {
+        return false;
+    };
+    if last
+        .tool_calls
+        .as_ref()
+        .is_none_or(|calls| calls.is_empty())
+    {
+        return false;
+    }
+    // The Responses translation splits "text, then tool calls" into two
+    // assistant messages and tags the thinking block to the first. Anthropic
+    // merges consecutive same-role messages into one turn, so a block on any
+    // message of the trailing assistant run starts that turn.
+    let run_start = req.messages[..index]
+        .iter()
+        .rposition(|m| m.role != "assistant")
+        .map_or(0, |i| i + 1);
+    let replayed = match req.extra.get(RESPONSES_ANTHROPIC_THINKING_BLOCKS) {
+        Some(Value::Array(blocks)) => blocks.iter().any(|b| {
+            b.get("message_index")
+                .and_then(Value::as_u64)
+                .is_some_and(|i| (run_start as u64..=index as u64).contains(&i))
+                && b.get("signature").and_then(Value::as_str).is_some()
+        }),
+        _ => false,
+    };
+    !replayed
+}
+
+/// How a model takes extended thinking.
+#[derive(Debug, PartialEq, Eq)]
+enum ThinkingStyle {
+    /// `{"type":"adaptive"}` + `output_config.effort` (Claude 4.6+). Manual
+    /// budgets are rejected with a 400 on 4.7+.
+    Adaptive {
+        /// Claude 4.7+: accepts `xhigh`, and defaults `thinking.display` to
+        /// `"omitted"`, which would leave nothing to surface as reasoning —
+        /// so `"summarized"` is asked for explicitly.
+        since_4_7: bool,
+    },
+    /// `{"type":"enabled","budget_tokens":N}` with `N < max_tokens`
+    /// (Claude 3.7 up to 4.5).
+    Manual,
+}
+
+/// Classify a model id by the thinking style it accepts, or `None` when it
+/// takes no derived thinking.
+///
+/// Understands first-party (`claude-opus-4-7`, `claude-3-7-sonnet-20250219`),
+/// Bedrock (`us.anthropic.claude-sonnet-4-6-v1:0`) and Vertex
+/// (`claude-opus-4-5@20251101`) ids. The version is the first one- or
+/// two-digit number and the one right after it, so a date suffix is never
+/// read as a minor version. Families newer than Opus (`fable`, `mythos`) and
+/// any Claude 4.7+ are adaptive. Claude before 3.7 has no extended thinking,
+/// and non-Claude models behind this adapter (Z.AI GLM, Kimi) or ids that do
+/// not parse get `None`: never inventing thinking is the one choice that
+/// cannot turn a working request into a 400.
+fn thinking_style(model_id: &str) -> Option<ThinkingStyle> {
+    let lower = model_id.to_ascii_lowercase();
+    let (_, rest) = lower.split_once("claude-")?;
+    let mut tokens = rest.split(['-', '@', ':', '.']).peekable();
+    let mut version: Option<(u32, u32)> = None;
+    let mut modern_family = false;
+    while let Some(tok) = tokens.next() {
+        if tok == "fable" || tok == "mythos" {
+            modern_family = true;
+        }
+        if version.is_none() && (1..=2).contains(&tok.len()) {
+            if let Ok(major) = tok.parse::<u32>() {
+                let minor = tokens
+                    .peek()
+                    .filter(|t| (1..=2).contains(&t.len()))
+                    .and_then(|t| t.parse::<u32>().ok())
+                    .unwrap_or(0);
+                version = Some((major, minor));
+            }
+        }
+    }
+    let adaptive = |since_4_7| ThinkingStyle::Adaptive { since_4_7 };
+    match version {
+        _ if modern_family => Some(adaptive(true)),
+        Some(v) if v >= (4, 7) => Some(adaptive(true)),
+        Some(v) if v >= (4, 6) => Some(adaptive(false)),
+        Some(v) if v >= (3, 7) => Some(ThinkingStyle::Manual),
+        _ => None,
+    }
+}
+
+/// Smallest manual thinking budget the API accepts.
+const MIN_THINKING_BUDGET: u32 = 1024;
+
+/// Thinking tokens per effort: the manual budget, and the headroom given to
+/// adaptive thinking when the client set no `max_tokens`. `None` for `none`
+/// and unknown values, which leave thinking off.
+fn thinking_budget(effort: &str) -> Option<u32> {
+    match effort {
+        "minimal" | "low" => Some(MIN_THINKING_BUDGET),
+        "medium" => Some(4096),
+        "high" | "xhigh" | "max" => Some(16384),
+        _ => None,
+    }
+}
+
+/// Map an OpenAI-style `reasoning_effort` to Anthropic thinking for
+/// `model_id`. `none`, unknown values and models without derived thinking
+/// leave the request as it was.
+fn thinking_for_effort(
+    effort: &str,
+    model_id: &str,
+    req: &ChatCompletionRequest,
+) -> AnthropicExtras {
+    let max_tokens = req.max_tokens;
+    let Some(style) = thinking_style(model_id) else {
+        return AnthropicExtras::default();
+    };
+    let Some(budget) = thinking_budget(effort) else {
+        return AnthropicExtras::default();
+    };
+    match style {
+        ThinkingStyle::Adaptive { since_4_7 } => {
+            // Anthropic's levels are low/medium/high/max (4.6+) plus xhigh
+            // (4.7+); `minimal` has no counterpart.
+            let level = match effort {
+                "minimal" | "low" => "low",
+                "xhigh" if !since_4_7 => "high",
+                other => other,
+            };
+            let thinking = if since_4_7 {
+                serde_json::json!({"type": "adaptive", "display": "summarized"})
+            } else {
+                serde_json::json!({"type": "adaptive"})
+            };
+            AnthropicExtras {
+                thinking: Some(thinking),
+                output_config: Some(serde_json::json!({ "effort": level })),
+                // Thinking counts toward `max_tokens`; without a client limit,
+                // leave the default answer room on top of what this effort
+                // is likely to think.
+                max_tokens: max_tokens.is_none().then_some(DEFAULT_MAX_TOKENS + budget),
+                derived_thinking: true,
+                // 4.7+ rejects `top_p` outright; 4.6 accepts 0.95–1 while thinking.
+                drop_top_p: since_4_7,
+            }
+        }
+        ThinkingStyle::Manual if tool_turn_without_thinking(req) => AnthropicExtras::default(),
+        ThinkingStyle::Manual => {
+            // `max_tokens` covers thinking and answer together, and the budget
+            // must stay below it. Without a client limit the default answer
+            // room goes on top of the budget. A client limit is never raised
+            // past what is needed: the budget shrinks to half of it, and only
+            // a limit too small for the 1024 minimum grows by that minimum.
+            let (budget, max_tokens) = match max_tokens {
+                None => (budget, DEFAULT_MAX_TOKENS + budget),
+                Some(max) if budget <= max / 2 => (budget, max),
+                Some(max) if max / 2 >= MIN_THINKING_BUDGET => (max / 2, max),
+                Some(max) => (MIN_THINKING_BUDGET, max + MIN_THINKING_BUDGET),
+            };
+            AnthropicExtras {
+                thinking: Some(serde_json::json!({"type": "enabled", "budget_tokens": budget})),
+                output_config: None,
+                max_tokens: Some(max_tokens),
+                derived_thinking: true,
+                drop_top_p: false,
+            }
+        }
+    }
+}
+
+/// Thinking blocks to replay, from the Responses translation's
+/// `_responses_anthropic_thinking_blocks`, keyed by the index in
+/// `req.messages` of the assistant message each one precedes.
+fn replayed_thinking(req: &ChatCompletionRequest) -> Vec<(usize, Option<AnthropicPart>)> {
+    let Some(Value::Array(blocks)) = req.extra.get(RESPONSES_ANTHROPIC_THINKING_BLOCKS) else {
+        return Vec::new();
+    };
+    blocks
+        .iter()
+        .filter_map(|b| {
+            let index = b.get("message_index")?.as_u64()? as usize;
+            let signature = b.get("signature")?.as_str()?.to_string();
+            let thinking = b
+                .get("thinking")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            Some((
+                index,
+                Some(AnthropicPart::Thinking {
+                    thinking,
+                    signature,
+                }),
+            ))
+        })
+        .collect()
+}
+
+/// Put `leading` blocks in front of a converted message's content.
+fn prepend_parts(content: AnthropicContent, mut leading: Vec<AnthropicPart>) -> AnthropicContent {
+    match content {
+        AnthropicContent::Text(text) => {
+            if !text.is_empty() {
+                leading.push(AnthropicPart::Text {
+                    text,
+                    cache_control: None,
+                });
+            }
+        }
+        AnthropicContent::Parts(parts) => leading.extend(parts),
+    }
+    AnthropicContent::Parts(leading)
 }
 
 /// Return the body to send to the Anthropic API.
@@ -321,12 +580,29 @@ fn build_request_body(
         }
     });
 
-    // Filter out system messages; Anthropic does not allow them in the messages array
+    // Filter out system messages; Anthropic does not allow them in the messages
+    // array. Replayed thinking blocks are indexed against the unfiltered list,
+    // so they are attached before filtering.
+    let mut thinking = replayed_thinking(req);
     let messages: Vec<AnthropicMessage> = req
         .messages
         .iter()
-        .filter(|m| m.role != "system")
-        .map(convert_message)
+        .enumerate()
+        .filter(|(_, m)| m.role != "system")
+        .map(|(i, m)| {
+            let mut converted = convert_message(m);
+            if m.role == "assistant" {
+                let leading: Vec<AnthropicPart> = thinking
+                    .iter_mut()
+                    .filter(|(at, _)| *at == i)
+                    .filter_map(|(_, part)| part.take())
+                    .collect();
+                if !leading.is_empty() {
+                    converted.content = prepend_parts(converted.content, leading);
+                }
+            }
+            converted
+        })
         .collect();
 
     let stop_sequences = req.stop.as_ref().map(|s| match s {
@@ -349,21 +625,41 @@ fn build_request_body(
             .collect()
     });
 
+    let mut tool_choice = req
+        .tool_choice
+        .as_ref()
+        .map(openai_tool_choice_to_anthropic);
+    if extras.derived_thinking {
+        // Anthropic rejects a forced tool choice while thinking; downgrade it
+        // to `auto`, keeping any other setting (`disable_parallel_tool_use`).
+        if let Some(Value::Object(tc)) = tool_choice.as_mut() {
+            if matches!(tc.get("type").and_then(Value::as_str), Some("any" | "tool")) {
+                tc.insert("type".to_string(), Value::from("auto"));
+                tc.remove("name");
+            }
+        }
+    }
+
     AnthropicRequest {
         model: model_id.to_string(),
         messages,
         system,
-        max_tokens: req.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS),
+        max_tokens: extras
+            .max_tokens
+            .or(req.max_tokens)
+            .unwrap_or(DEFAULT_MAX_TOKENS),
         stream: if stream { Some(true) } else { None },
-        temperature: req.temperature,
-        top_p: req.top_p,
+        // While thinking, `temperature` must be left at its default and
+        // `top_p` must be at least 0.95 (and absent on 4.7+).
+        temperature: req.temperature.filter(|_| !extras.derived_thinking),
+        top_p: req
+            .top_p
+            .filter(|p| !extras.drop_top_p && (!extras.derived_thinking || *p >= 0.95)),
         stop_sequences,
         tools,
-        tool_choice: req
-            .tool_choice
-            .as_ref()
-            .map(openai_tool_choice_to_anthropic),
+        tool_choice,
         thinking: extras.thinking.clone(),
+        output_config: extras.output_config.clone(),
     }
 }
 
@@ -524,6 +820,9 @@ enum AnthropicResponseContent {
     Thinking {
         #[serde(default)]
         thinking: String,
+        /// Needed to send the block back on a later turn.
+        #[serde(default)]
+        signature: Option<String>,
     },
     /// Any other block type (e.g. redacted_thinking) — ignored, not fatal.
     #[serde(other)]
@@ -545,6 +844,7 @@ struct AnthropicUsage {
 fn anthropic_to_openai_response(resp: AnthropicResponse, model_id: &str) -> ChatCompletionResponse {
     let mut text_content = String::new();
     let mut reasoning = String::new();
+    let mut signatures: Vec<String> = Vec::new();
     let mut tool_calls = Vec::new();
 
     for content in resp.content {
@@ -552,8 +852,12 @@ fn anthropic_to_openai_response(resp: AnthropicResponse, model_id: &str) -> Chat
             AnthropicResponseContent::Text { text } => {
                 text_content.push_str(&text);
             }
-            AnthropicResponseContent::Thinking { thinking } => {
+            AnthropicResponseContent::Thinking {
+                thinking,
+                signature,
+            } => {
                 reasoning.push_str(&thinking);
+                signatures.extend(signature.filter(|s| !s.is_empty()));
             }
             AnthropicResponseContent::ToolUse { id, name, input } => {
                 tool_calls.push(crate::types::ToolCall {
@@ -588,7 +892,7 @@ fn anthropic_to_openai_response(resp: AnthropicResponse, model_id: &str) -> Chat
         } else {
             Some(reasoning)
         },
-        extra: Default::default(),
+        extra: thinking_signature_extra(signatures),
     };
 
     let finish_reason = resp.stop_reason.map(|r| match r.as_str() {
@@ -625,6 +929,25 @@ fn anthropic_to_openai_response(resp: AnthropicResponse, model_id: &str) -> Chat
         system_fingerprint: None,
         extra: Default::default(),
     }
+}
+
+/// `extra` carrying the thinking signature for the Responses encoder.
+///
+/// The response's thinking text is joined into one `reasoning_content`, and a
+/// signature only verifies the exact block it was issued for, so it is kept
+/// only when the response had exactly one signed thinking block. Replaying
+/// joined text under one block's signature would be rejected upstream.
+fn thinking_signature_extra(
+    mut signatures: Vec<String>,
+) -> std::collections::HashMap<String, Value> {
+    let mut extra = std::collections::HashMap::new();
+    if signatures.len() == 1 {
+        extra.insert(
+            RESPONSES_THINKING_SIGNATURE.to_string(),
+            Value::String(signatures.remove(0)),
+        );
+    }
+    extra
 }
 
 // ── Streaming transform ───────────────────────────────────────────────────────
@@ -724,7 +1047,7 @@ mod tests {
             &req,
             "claude-sonnet",
             false,
-            &AnthropicExtras { thinking: None },
+            &AnthropicExtras::default(),
         ))
         .unwrap();
         assert_eq!(
@@ -755,7 +1078,7 @@ mod tests {
             &req,
             "claude-sonnet",
             false,
-            &AnthropicExtras { thinking: None },
+            &AnthropicExtras::default(),
         ))
         .unwrap();
 
@@ -782,7 +1105,7 @@ mod tests {
             &req,
             "claude-sonnet",
             false,
-            &AnthropicExtras { thinking: None },
+            &AnthropicExtras::default(),
         ))
         .unwrap();
 
@@ -806,7 +1129,7 @@ mod tests {
             &req,
             "claude-sonnet",
             false,
-            &AnthropicExtras { thinking: None },
+            &AnthropicExtras::default(),
         ))
         .unwrap();
 
@@ -826,7 +1149,7 @@ mod tests {
             &req,
             "claude-sonnet",
             false,
-            &AnthropicExtras { thinking: None },
+            &AnthropicExtras::default(),
         ))
         .unwrap();
 
@@ -929,7 +1252,7 @@ mod tests {
             &req,
             "glm-4.6",
             false,
-            &extract_anthropic_extras(&req),
+            &extract_anthropic_extras(&req, "glm-4.6"),
         ))
         .unwrap()
     }
@@ -993,7 +1316,12 @@ mod tests {
         raw["service_tier"] = serde_json::json!("auto");
         req.raw_anthropic_body = Some(raw.clone());
 
-        let body = prepare_body(&req, "glm-4.6", false, &extract_anthropic_extras(&req));
+        let body = prepare_body(
+            &req,
+            "glm-4.6",
+            false,
+            &extract_anthropic_extras(&req, "glm-4.6"),
+        );
         assert_eq!(
             body["service_tier"], "auto",
             "verbatim branch must be taken"
@@ -1006,7 +1334,12 @@ mod tests {
         let (req, raw) = anthropic_native_image_request();
         assert!(req.raw_anthropic_body.is_none());
 
-        let body = prepare_body(&req, "glm-4.6", false, &extract_anthropic_extras(&req));
+        let body = prepare_body(
+            &req,
+            "glm-4.6",
+            false,
+            &extract_anthropic_extras(&req, "glm-4.6"),
+        );
         let content = &body["messages"][0]["content"];
         for i in [1, 2] {
             assert_eq!(
@@ -1014,5 +1347,514 @@ mod tests {
                 "image block {i} must rebuild byte-identically"
             );
         }
+    }
+
+    // ── Responses reasoning round-trip + reasoning_effort mapping (#183) ─────
+
+    fn body_for(json: Value, model_id: &str) -> Value {
+        let req: ChatCompletionRequest = serde_json::from_value(json).unwrap();
+        let extras = extract_anthropic_extras(&req, model_id);
+        serde_json::to_value(build_request_body(&req, model_id, false, &extras)).unwrap()
+    }
+
+    fn effort_body(model_id: &str, effort: &str) -> Value {
+        body_for(
+            serde_json::json!({"model": "a", "reasoning_effort": effort,
+                "messages": [{"role": "user", "content": "hi"}]}),
+            model_id,
+        )
+    }
+
+    #[test]
+    fn thinking_style_per_model_family() {
+        let adaptive_new = Some(ThinkingStyle::Adaptive { since_4_7: true });
+        let adaptive_46 = Some(ThinkingStyle::Adaptive { since_4_7: false });
+        let manual = Some(ThinkingStyle::Manual);
+        let cases = [
+            ("claude-opus-4-7", &adaptive_new),
+            ("claude-opus-4-8", &adaptive_new),
+            ("claude-opus-5", &adaptive_new),
+            ("claude-opus-5-5", &adaptive_new),
+            ("claude-sonnet-5", &adaptive_new),
+            ("claude-fable-5-1", &adaptive_new),
+            ("claude-mythos-5-1", &adaptive_new),
+            ("us.anthropic.claude-opus-4-7-v1:0", &adaptive_new),
+            ("claude-opus-4-6", &adaptive_46),
+            ("claude-sonnet-4-6", &adaptive_46),
+            ("eu.anthropic.claude-sonnet-4-6", &adaptive_46),
+            ("claude-sonnet-4-5", &manual),
+            ("claude-haiku-4-5-20251001", &manual),
+            ("claude-opus-4-5@20251101", &manual),
+            // A date suffix is not a minor version.
+            ("claude-opus-4-20250514", &manual),
+            ("claude-3-7-sonnet-20250219", &manual),
+            // Before 3.7 there is no extended thinking.
+            ("claude-3-5-haiku-20241022", &None),
+            ("claude-3-haiku-20240307", &None),
+            // Non-Claude upstreams and ids that do not parse.
+            ("glm-4.6", &None),
+            ("glm-5.1", &None),
+            ("kimi-k2", &None),
+            ("kimi-for-coding", &None),
+            ("claude-latest", &None),
+        ];
+        for (model, want) in cases {
+            assert_eq!(&thinking_style(model), want, "{model}");
+        }
+    }
+
+    #[test]
+    fn effort_on_non_claude_models_changes_nothing() {
+        let tools = serde_json::json!([{"type": "function", "function": {"name": "f",
+            "parameters": {"type": "object", "properties": {}}}}]);
+        for model in ["glm-4.6", "kimi-k2", "claude-3-5-haiku-20241022"] {
+            let body = body_for(
+                serde_json::json!({"model": "a", "reasoning_effort": "high",
+                    "temperature": 0.2, "top_p": 0.5, "tools": tools,
+                    "tool_choice": "required",
+                    "messages": [{"role": "user", "content": "hi"}]}),
+                model,
+            );
+            assert!(body.get("thinking").is_none(), "{model}");
+            assert!(body.get("output_config").is_none(), "{model}");
+            assert_eq!(body["max_tokens"], DEFAULT_MAX_TOKENS, "{model}");
+            assert!(body.get("temperature").is_some(), "{model}");
+            assert_eq!(body["top_p"], 0.5, "{model}");
+            assert_eq!(body["tool_choice"], serde_json::json!({"type": "any"}));
+        }
+    }
+
+    #[test]
+    fn effort_on_claude_4_7_plus_is_adaptive_with_output_config_effort() {
+        for model in ["claude-opus-4-7", "claude-opus-5", "claude-fable-5-1"] {
+            let body = effort_body(model, "xhigh");
+            assert_eq!(
+                body["thinking"],
+                serde_json::json!({"type": "adaptive", "display": "summarized"}),
+                "{model}"
+            );
+            assert_eq!(
+                body["output_config"],
+                serde_json::json!({"effort": "xhigh"})
+            );
+            // Room for thinking on top of the default answer length.
+            assert_eq!(body["max_tokens"], DEFAULT_MAX_TOKENS + 16384);
+        }
+        // A client limit is left alone.
+        let body = body_for(
+            serde_json::json!({"model": "a", "reasoning_effort": "high", "max_tokens": 900,
+                "messages": [{"role": "user", "content": "hi"}]}),
+            "claude-opus-4-7",
+        );
+        assert_eq!(body["max_tokens"], 900);
+        assert_eq!(body["output_config"]["effort"], "high");
+        assert_eq!(
+            effort_body("claude-opus-4-7", "minimal")["output_config"]["effort"],
+            "low"
+        );
+    }
+
+    #[test]
+    fn effort_on_claude_4_6_is_adaptive_without_xhigh() {
+        let body = effort_body("claude-sonnet-4-6", "xhigh");
+        assert_eq!(body["thinking"], serde_json::json!({"type": "adaptive"}));
+        assert_eq!(body["output_config"], serde_json::json!({"effort": "high"}));
+        assert_eq!(
+            effort_body("claude-opus-4-6", "medium")["output_config"]["effort"],
+            "medium"
+        );
+        // `max` is an Anthropic level on 4.6+ and passes through.
+        assert_eq!(
+            effort_body("claude-opus-4-6", "max")["output_config"]["effort"],
+            "max"
+        );
+    }
+
+    #[test]
+    fn effort_on_older_models_is_a_manual_budget_below_max_tokens() {
+        for (effort, budget) in [("low", 1024), ("medium", 4096), ("high", 16384)] {
+            let body = effort_body("claude-sonnet-4-5", effort);
+            assert_eq!(
+                body["thinking"],
+                serde_json::json!({"type": "enabled", "budget_tokens": budget})
+            );
+            assert!(body.get("output_config").is_none());
+            // No client limit: the default answer room goes on top.
+            assert_eq!(body["max_tokens"], DEFAULT_MAX_TOKENS + budget, "{effort}");
+        }
+
+        let with_max = |effort: &str, max: u32| {
+            let body = body_for(
+                serde_json::json!({"model": "a", "reasoning_effort": effort, "max_tokens": max,
+                    "messages": [{"role": "user", "content": "hi"}]}),
+                "claude-3-7-sonnet-20250219",
+            );
+            (
+                body["thinking"]["budget_tokens"].as_u64().unwrap(),
+                body["max_tokens"].as_u64().unwrap(),
+            )
+        };
+        // The budget fits in half the limit: both kept.
+        assert_eq!(with_max("high", 64000), (16384, 64000));
+        // It does not: it shrinks to half, and the limit is never raised --
+        // raising 20000 by the budget would pass Opus 4's 32K output cap.
+        assert_eq!(with_max("high", 20000), (10000, 20000));
+        // Too small for the 1024 minimum: grows by just that minimum.
+        assert_eq!(with_max("low", 1000), (1024, 2024));
+    }
+
+    #[test]
+    fn effort_none_or_unknown_leaves_thinking_off() {
+        for (model, effort) in [
+            ("claude-opus-4-7", "none"),
+            ("claude-sonnet-4-6", "bogus"),
+            ("claude-haiku-4-5", "none"),
+            ("claude-haiku-4-5", "bogus"),
+        ] {
+            let body = effort_body(model, effort);
+            assert!(body.get("thinking").is_none(), "{model}/{effort}");
+            assert!(body.get("output_config").is_none(), "{model}/{effort}");
+        }
+    }
+
+    #[test]
+    fn derived_thinking_drops_temperature_and_forced_tool_choice() {
+        let tools = serde_json::json!([{"type": "function", "function": {"name": "f",
+            "parameters": {"type": "object", "properties": {}}}}]);
+        for model in ["claude-opus-4-7", "claude-sonnet-4-6", "claude-haiku-4-5"] {
+            for forced in [
+                serde_json::json!("required"),
+                serde_json::json!({"type": "function", "function": {"name": "f"}}),
+            ] {
+                let body = body_for(
+                    serde_json::json!({"model": "a", "reasoning_effort": "low",
+                        "temperature": 0.2, "tools": tools, "tool_choice": forced,
+                        "messages": [{"role": "user", "content": "hi"}]}),
+                    model,
+                );
+                assert!(body.get("thinking").is_some(), "{model}");
+                assert!(body.get("temperature").is_none(), "{model}");
+                assert_eq!(
+                    body["tool_choice"],
+                    serde_json::json!({"type": "auto"}),
+                    "{model}: {forced}"
+                );
+            }
+            // `top_p` below 0.95 is rejected while thinking, and any `top_p`
+            // on 4.7+.
+            let since_4_7 = model == "claude-opus-4-7";
+            for (top_p, kept) in [(0.5, false), (0.95, !since_4_7), (1.0, !since_4_7)] {
+                let body = body_for(
+                    serde_json::json!({"model": "a", "reasoning_effort": "low", "top_p": top_p,
+                        "messages": [{"role": "user", "content": "hi"}]}),
+                    model,
+                );
+                assert_eq!(body.get("top_p").is_some(), kept, "{model}: {top_p}");
+            }
+            // A non-forced choice is kept.
+            let body = body_for(
+                serde_json::json!({"model": "a", "reasoning_effort": "low",
+                    "tools": tools, "tool_choice": "none",
+                    "messages": [{"role": "user", "content": "hi"}]}),
+                model,
+            );
+            assert_eq!(body["tool_choice"], serde_json::json!({"type": "none"}));
+        }
+        // Without thinking, all are forwarded as before.
+        let body = body_for(
+            serde_json::json!({"model": "a", "temperature": 0.2, "top_p": 0.5, "tools": tools,
+                "tool_choice": "required", "messages": [{"role": "user", "content": "hi"}]}),
+            "claude-opus-4-7",
+        );
+        assert!(body.get("temperature").is_some());
+        assert!(body.get("top_p").is_some());
+        assert_eq!(body["tool_choice"], serde_json::json!({"type": "any"}));
+    }
+
+    #[test]
+    fn manual_thinking_skips_a_tool_turn_with_no_thinking_to_replay() {
+        // A Chat Completions tool loop: the assistant turn cannot start with a
+        // thinking block, which manual thinking requires.
+        let tool_loop = |model: &str| {
+            body_for(
+                serde_json::json!({"model": "a", "reasoning_effort": "high", "messages": [
+                    {"role": "user", "content": "hi"},
+                    {"role": "assistant", "content": null, "tool_calls": [{"id": "c1",
+                        "type": "function", "function": {"name": "f", "arguments": "{}"}}]},
+                    {"role": "tool", "tool_call_id": "c1", "content": "42"}
+                ]}),
+                model,
+            )
+        };
+        let body = tool_loop("claude-sonnet-4-5");
+        assert!(body.get("thinking").is_none());
+        assert_eq!(body["max_tokens"], DEFAULT_MAX_TOKENS);
+        // Adaptive thinking has no such rule.
+        assert_eq!(tool_loop("claude-opus-4-7")["thinking"]["type"], "adaptive");
+
+        // A finished tool loop (the last assistant turn is plain text) is fine.
+        let body = body_for(
+            serde_json::json!({"model": "a", "reasoning_effort": "high", "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": null, "tool_calls": [{"id": "c1",
+                    "type": "function", "function": {"name": "f", "arguments": "{}"}}]},
+                {"role": "tool", "tool_call_id": "c1", "content": "42"},
+                {"role": "assistant", "content": "done"},
+                {"role": "user", "content": "thanks"}
+            ]}),
+            "claude-sonnet-4-5",
+        );
+        assert_eq!(body["thinking"]["type"], "enabled");
+    }
+
+    #[test]
+    fn explicit_anthropic_thinking_wins_over_reasoning_effort() {
+        let body = body_for(
+            serde_json::json!({"model": "a", "reasoning_effort": "high", "temperature": 1.0,
+                "_anthropic_thinking": {"type": "enabled", "budget_tokens": 2000},
+                "messages": [{"role": "user", "content": "hi"}]}),
+            "claude-opus-4-7",
+        );
+        assert_eq!(
+            body["thinking"],
+            serde_json::json!({"type": "enabled", "budget_tokens": 2000})
+        );
+        assert!(body.get("output_config").is_none());
+        assert_eq!(body["temperature"], 1.0);
+    }
+
+    fn responses_to_anthropic_body(input: Value, model_id: &str) -> Value {
+        let req: crate::responses_types::ResponsesRequest = serde_json::from_value(input).unwrap();
+        let chat = crate::responses_types::to_chat_completion_request(&req).unwrap();
+        let extras = extract_anthropic_extras(&chat, model_id);
+        serde_json::to_value(build_request_body(&chat, model_id, false, &extras)).unwrap()
+    }
+
+    #[test]
+    fn responses_reasoning_item_replays_as_leading_thinking_block() {
+        use crate::responses_types::encode_anthropic_thinking_signature;
+        // `instructions` becomes a system message that is filtered out of the
+        // Anthropic `messages`, so the replay must index the unfiltered list.
+        let body = responses_to_anthropic_body(
+            serde_json::json!({"model": "m", "instructions": "be brief",
+                "reasoning": {"effort": "low"},
+                "tools": [{"type": "function", "name": "f",
+                    "parameters": {"type": "object", "properties": {}}}],
+                "input": [
+                {"role": "user", "content": "hi"},
+                {"type": "reasoning", "id": "rs", "summary": [],
+                 "content": [{"type": "reasoning_text", "text": "I should call f"}],
+                 "encrypted_content": encode_anthropic_thinking_signature("sig-1")},
+                {"type": "function_call", "call_id": "c1", "name": "f", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "c1", "output": "42"}
+            ]}),
+            "claude-haiku-4-5",
+        );
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[1]["role"], "assistant");
+        assert_eq!(
+            messages[1]["content"],
+            serde_json::json!([
+                {"type": "thinking", "thinking": "I should call f", "signature": "sig-1"},
+                {"type": "tool_use", "id": "c1", "name": "f", "input": {}}
+            ])
+        );
+        // Manual thinking on the tool-loop turn, which is only valid because
+        // the assistant turn above starts with its thinking block.
+        assert_eq!(body["thinking"]["type"], "enabled");
+    }
+
+    #[test]
+    fn narrated_tool_turn_keeps_manual_thinking() {
+        use crate::responses_types::encode_anthropic_thinking_signature;
+        // Claude usually writes text before a tool call. The translation makes
+        // that two assistant messages with the thinking block on the first;
+        // Anthropic merges them into one turn that starts with the block.
+        let body = responses_to_anthropic_body(
+            serde_json::json!({"model": "m", "reasoning": {"effort": "high"},
+                "tools": [{"type": "function", "name": "f",
+                    "parameters": {"type": "object", "properties": {}}}],
+                "input": [
+                {"role": "user", "content": "hi"},
+                {"type": "reasoning", "id": "rs", "summary": [],
+                 "content": [{"type": "reasoning_text", "text": "plan"}],
+                 "encrypted_content": encode_anthropic_thinking_signature("sig-n")},
+                {"role": "assistant", "content": "Let me check."},
+                {"type": "function_call", "call_id": "c1", "name": "f", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "c1", "output": "42"}
+            ]}),
+            "claude-sonnet-4-5",
+        );
+        assert_eq!(body["thinking"]["type"], "enabled");
+        assert_eq!(body["messages"][1]["content"][0]["type"], "thinking");
+        assert_eq!(body["messages"][2]["content"][0]["type"], "tool_use");
+    }
+
+    #[test]
+    fn replayed_thinking_precedes_assistant_text() {
+        use crate::responses_types::encode_anthropic_thinking_signature;
+        let body = responses_to_anthropic_body(
+            serde_json::json!({"model": "m", "input": [
+                {"role": "user", "content": "hi"},
+                {"type": "reasoning", "id": "rs", "summary": [],
+                 "content": [{"type": "reasoning_text", "text": "t"}],
+                 "encrypted_content": encode_anthropic_thinking_signature("s")},
+                {"role": "assistant", "content": "hello"},
+                {"role": "user", "content": "again"}
+            ]}),
+            "claude-opus-4-7",
+        );
+        assert_eq!(
+            body["messages"][1]["content"],
+            serde_json::json!([
+                {"type": "thinking", "thinking": "t", "signature": "s"},
+                {"type": "text", "text": "hello"}
+            ])
+        );
+        // Other messages are untouched.
+        assert_eq!(body["messages"][2]["content"], "again");
+    }
+
+    #[test]
+    fn replay_index_off_an_assistant_message_is_ignored() {
+        // A trailing reasoning item has no assistant message to precede.
+        let body = body_for(
+            serde_json::json!({"model": "a", "messages": [{"role": "user", "content": "hi"}],
+                "_responses_anthropic_thinking_blocks":
+                    [{"message_index": 0, "thinking": "t", "signature": "s"},
+                     {"message_index": 1, "thinking": "t", "signature": "s"}]}),
+            "claude-opus-4-7",
+        );
+        assert_eq!(
+            body["messages"],
+            serde_json::json!([{"role": "user", "content": "hi"}])
+        );
+    }
+
+    #[test]
+    fn single_signed_thinking_block_carries_its_signature() {
+        let json = r#"{"id":"m","model":"c","content":[{"type":"thinking","thinking":"hmm","signature":"sig-9"},{"type":"text","text":"answer"}],"stop_reason":"end_turn","usage":null}"#;
+        let resp: AnthropicResponse = serde_json::from_str(json).unwrap();
+        let msg = anthropic_to_openai_response(resp, "c").choices[0]
+            .message
+            .clone();
+        assert_eq!(msg.extra[RESPONSES_THINKING_SIGNATURE], "sig-9");
+        assert_eq!(msg.reasoning_content.as_deref(), Some("hmm"));
+    }
+
+    #[test]
+    fn several_thinking_blocks_drop_the_signature() {
+        // Their text is joined into one reasoning_content, which no single
+        // block's signature verifies.
+        let json = r#"{"id":"m","model":"c","content":[{"type":"thinking","thinking":"a","signature":"s1"},{"type":"tool_use","id":"t","name":"f","input":{}},{"type":"thinking","thinking":"b","signature":"s2"}],"stop_reason":"tool_use","usage":null}"#;
+        let resp: AnthropicResponse = serde_json::from_str(json).unwrap();
+        let msg = anthropic_to_openai_response(resp, "c").choices[0]
+            .message
+            .clone();
+        assert!(!msg.extra.contains_key(RESPONSES_THINKING_SIGNATURE));
+        assert_eq!(msg.reasoning_content.as_deref(), Some("ab"));
+    }
+
+    #[test]
+    fn captured_signature_round_trips_through_responses() {
+        use crate::responses_emitter::to_responses_response;
+        use crate::responses_types::{
+            decode_anthropic_thinking_signature, OutputItem, ResponsesRequest,
+        };
+        let json = r#"{"id":"m","model":"c","content":[{"type":"thinking","thinking":"plan","signature":"sig-rt"},{"type":"tool_use","id":"c1","name":"f","input":{}}],"stop_reason":"tool_use","usage":null}"#;
+        let resp: AnthropicResponse = serde_json::from_str(json).unwrap();
+        let req: ResponsesRequest =
+            serde_json::from_value(serde_json::json!({"model": "m", "input": "go"})).unwrap();
+        let out = to_responses_response(anthropic_to_openai_response(resp, "c"), &req, "resp_x");
+        let OutputItem::Reasoning {
+            encrypted_content, ..
+        } = &out.output[0]
+        else {
+            panic!("first output item must be reasoning");
+        };
+        let enc = encrypted_content.as_deref().expect("encrypted_content");
+        assert_eq!(decode_anthropic_thinking_signature(enc), Some("sig-rt"));
+
+        // The client sends the output back as input on the next turn.
+        let mut input = vec![serde_json::json!({"role": "user", "content": "go"})];
+        for item in &out.output {
+            input.push(serde_json::to_value(item).unwrap());
+        }
+        input.push(
+            serde_json::json!({"type": "function_call_output", "call_id": "c1",
+            "output": "ok"}),
+        );
+        let body = responses_to_anthropic_body(
+            serde_json::json!({"model": "m", "input": input}),
+            "claude-haiku-4-5",
+        );
+        assert_eq!(
+            body["messages"][1]["content"][0],
+            serde_json::json!({"type": "thinking", "thinking": "plan", "signature": "sig-rt"})
+        );
+    }
+
+    #[test]
+    fn streamed_signature_reaches_the_responses_reasoning_item() {
+        use crate::responses_emitter::ResponsesEmitter;
+        use crate::responses_types::{decode_anthropic_thinking_signature, ResponsesRequest};
+        let events = [
+            (
+                "message_start",
+                r#"{"type":"message_start","message":{"id":"msg_1","usage":{"input_tokens":3}}}"#,
+            ),
+            (
+                "content_block_start",
+                r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}"#,
+            ),
+            (
+                "content_block_delta",
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"think"}}"#,
+            ),
+            (
+                "content_block_delta",
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig-s"}}"#,
+            ),
+            (
+                "content_block_stop",
+                r#"{"type":"content_block_stop","index":0}"#,
+            ),
+            (
+                "content_block_start",
+                r#"{"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}"#,
+            ),
+            (
+                "content_block_delta",
+                r#"{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"hi"}}"#,
+            ),
+            (
+                "content_block_stop",
+                r#"{"type":"content_block_stop","index":1}"#,
+            ),
+            (
+                "message_delta",
+                r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":2}}"#,
+            ),
+            ("message_stop", r#"{"type":"message_stop"}"#),
+        ];
+        let req: ResponsesRequest =
+            serde_json::from_value(serde_json::json!({"model": "m", "input": "go"})).unwrap();
+        let mut processor = AnthropicEventProcessor::new("x".into());
+        let mut emitter = ResponsesEmitter::new(&req, "resp_s");
+        let mut frames = Vec::new();
+        for (event, data) in events {
+            for chunk in processor.process(event, data, "c", "anthropic") {
+                frames.extend(emitter.on_chunk(chunk.unwrap()));
+            }
+        }
+        frames.extend(emitter.finish());
+        let done = frames
+            .iter()
+            .map(|f| serde_json::from_str::<Value>(&f.data).unwrap())
+            .find(|v| v["type"] == "response.output_item.done" && v["item"]["type"] == "reasoning")
+            .expect("reasoning item done");
+        let enc = done["item"]["encrypted_content"].as_str().unwrap();
+        assert_eq!(decode_anthropic_thinking_signature(enc), Some("sig-s"));
     }
 }

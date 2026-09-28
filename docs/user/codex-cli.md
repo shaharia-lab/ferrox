@@ -76,8 +76,12 @@ name.
 - **Tools.** Codex's own tools (`exec_command`, `write_stdin`, `view_image`, …) are plain
   `function` tools and work on every provider. File edits go through `apply_patch` inside
   `exec_command`.
-- **Reasoning.** Reasoning from providers that return it (GLM, Kimi) comes back as `reasoning`
-  output items.
+- **Reasoning.** Reasoning from providers that return it (GLM, Kimi, Claude) comes back as
+  `reasoning` output items. On Anthropic, Codex's `model_reasoning_effort` turns on extended
+  thinking for the target model: adaptive thinking with that effort on Claude 4.6+, a thinking
+  budget on Claude 3.7–4.5. GLM and Kimi behind the Anthropic adapter are left as they are.
+  The thinking block's signature comes back as the item's `encrypted_content`, so the next
+  turn replays it and tool loops keep working.
 
 ## Troubleshooting
 

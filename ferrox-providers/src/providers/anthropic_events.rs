@@ -156,6 +156,18 @@ impl AnthropicEventProcessor {
                             )));
                         }
                     }
+                    "signature_delta" => {
+                        // Closes a thinking block. Carried on the chunk's
+                        // `extra` so the Responses encoder can hand it back to
+                        // the client as `encrypted_content` for replay.
+                        if let Some(sig) = v
+                            .pointer("/delta/signature")
+                            .and_then(|s| s.as_str())
+                            .filter(|s| !s.is_empty())
+                        {
+                            results.push(Ok(make_signature_chunk(&self.message_id, model_id, sig)));
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -285,6 +297,17 @@ pub fn make_reasoning_chunk(id: &str, model: &str, thinking: String) -> ChatComp
         usage: None,
         extra: Default::default(),
     }
+}
+
+/// Empty-delta chunk carrying a thinking block's `signature` under
+/// [`RESPONSES_THINKING_SIGNATURE`](crate::responses_emitter::RESPONSES_THINKING_SIGNATURE).
+pub fn make_signature_chunk(id: &str, model: &str, signature: &str) -> ChatCompletionChunk {
+    let mut chunk = make_final_chunk(id, model, None, None);
+    chunk.choices[0].extra.insert(
+        crate::responses_emitter::RESPONSES_THINKING_SIGNATURE.to_string(),
+        Value::from(signature),
+    );
+    chunk
 }
 
 fn stream_tool_chunk(id: &str, model: &str, stc: StreamToolCall) -> ChatCompletionChunk {
@@ -480,6 +503,32 @@ mod tests {
         let delta = &results[0].as_ref().unwrap().choices[0].delta;
         assert_eq!(delta.reasoning_content.as_deref(), Some("hmm"));
         assert!(delta.content.is_none());
+    }
+
+    #[test]
+    fn signature_delta_yields_signature_carrier_chunk() {
+        let mut p = make_processor();
+        let data = r#"{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"EqQBCkg"}}"#;
+        let results = p.process("content_block_delta", data, "claude-3", "anthropic");
+        assert_eq!(results.len(), 1);
+        let choice = &results[0].as_ref().unwrap().choices[0];
+        assert_eq!(
+            choice.extra[crate::responses_emitter::RESPONSES_THINKING_SIGNATURE],
+            "EqQBCkg"
+        );
+        assert!(choice.delta.reasoning_content.is_none());
+        assert!(choice.delta.content.is_none());
+        assert!(choice.finish_reason.is_none());
+    }
+
+    #[test]
+    fn empty_signature_delta_yields_nothing() {
+        let mut p = make_processor();
+        let data =
+            r#"{"type":"content_block_delta","delta":{"type":"signature_delta","signature":""}}"#;
+        assert!(p
+            .process("content_block_delta", data, "claude-3", "anthropic")
+            .is_empty());
     }
 
     #[test]
