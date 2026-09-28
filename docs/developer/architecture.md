@@ -325,6 +325,14 @@ request/latency/token metrics, the `usage_log` row, the `token_usage` webhook
 and the budget reconciliation — in one place, so each handler keeps only its
 own wire encoding.
 
+The budget reservation that `auth_middleware` takes for a budgeted inference
+request travels as its own request extension, a `BudgetReservation` guard
+(`budget_enforcer.rs`). The finalizer claims it with one atomic swap and
+reconciles it against actual usage. Every other exit drops the last clone
+unclaimed, and that drop spawns a full refund. Those exits are an error
+return, an extractor rejection, a dispatch failure, and a handler future
+cancelled by a client disconnect. Requests without a budget never allocate one.
+
 ---
 
 ## Concurrency model

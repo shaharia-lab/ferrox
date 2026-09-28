@@ -465,8 +465,8 @@ pub struct RequestContext {
     pub token_budget: Option<i64>,
     /// Budget period from JWT claims ("daily" or "monthly").
     pub budget_period: Option<String>,
-    /// Tokens reserved in the pre-request budget check.
-    /// Used by handlers for post-response reconciliation.
+    /// Tokens reserved in the pre-request budget check. Informational: the
+    /// gateway settles the reservation through its own guard, not this field.
     pub budget_reserved_tokens: u32,
 }
 

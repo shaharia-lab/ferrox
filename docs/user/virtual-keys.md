@@ -170,6 +170,18 @@ Ferrox reads the following optional custom claims from the JWT payload to contro
 | `ferrox/token_budget` | integer | No budget enforcement |
 | `ferrox/budget_period` | string (`"daily"` or `"monthly"`) | No budget enforcement |
 
+### How a budget is charged
+
+With a Redis-backed budget, each inference request (`POST /v1/chat/completions`,
+`/v1/responses`, `/anthropic/v1/messages`) reserves 4096 tokens before it runs.
+The request is rejected with `429` if that reservation would exceed the budget.
+Once a response comes back with usage, the reservation is replaced by the actual
+token count. A request that fails before a provider answers is refunded in full.
+That covers a rejected body, a disallowed model, an unknown alias, every target
+failing, and a client that disconnects while it waits. The model listings
+(`GET /v1/models`, `GET /anthropic/v1/models`) reserve nothing. If a provider
+answers without reporting usage, the 4096-token reservation stays charged.
+
 ### Key rotation
 
 Ferrox caches JWKS keys and refreshes them in the background (see `jwks_cache_ttl_secs`). During a key rotation:

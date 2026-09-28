@@ -1,5 +1,6 @@
 use axum::{
     extract::{Request, State},
+    http::Method,
     middleware::Next,
     response::Response,
 };
@@ -8,6 +9,7 @@ use serde::Deserialize;
 use subtle::ConstantTimeEq;
 use uuid::Uuid;
 
+use crate::budget_enforcer::BudgetReservation;
 use crate::config::RateLimitConfig;
 use crate::error::ProxyError;
 use crate::state::AppState;
@@ -78,16 +80,25 @@ pub async fn auth_middleware(
         .unwrap_or_else(|| Uuid::new_v4().to_string());
 
     // Pre-request budget reservation (Redis-backed, if configured).
-    // Reserves a pessimistic token estimate; handlers reconcile after the response.
-    let budget_reserved_tokens = if let (Some(ref client_id), Some(budget), Some(ref period)) = (
+    // Reserves a pessimistic token estimate. The reservation travels as its
+    // own request extension: the handler's finalizer claims it after dispatch
+    // and reconciles actual usage; any other exit drops it and refunds it.
+    // Only inference routes (POST) consume tokens, so the model listings
+    // behind this middleware (GET, and the HEAD axum serves with it) reserve
+    // nothing.
+    let consumes_tokens = !matches!(*req.method(), Method::GET | Method::HEAD);
+    let mut reservation = None;
+    if let (true, Some(ref client_id), Some(budget), Some(ref period)) = (
+        consumes_tokens,
         &outcome.client_id,
         outcome.token_budget,
         &outcome.budget_period,
     ) {
         let estimate = crate::budget_enforcer::DEFAULT_RESERVE_TOKENS;
+        let client_id = client_id.to_string();
         if state
             .budget_enforcer
-            .reserve_tokens(&client_id.to_string(), period, budget, estimate)
+            .reserve_tokens(&client_id, period, budget, estimate)
             .await
             .is_err()
         {
@@ -96,10 +107,13 @@ pub async fn auth_middleware(
                 outcome.key_name
             )));
         }
-        estimate
-    } else {
-        0
-    };
+        reservation = Some(BudgetReservation::new(
+            state.budget_enforcer.clone(),
+            client_id,
+            period.clone(),
+            estimate,
+        ));
+    }
 
     let ctx = RequestContext {
         request_id,
@@ -108,10 +122,13 @@ pub async fn auth_middleware(
         client_id: outcome.client_id,
         token_budget: outcome.token_budget,
         budget_period: outcome.budget_period,
-        budget_reserved_tokens,
+        budget_reserved_tokens: reservation.as_ref().map_or(0, BudgetReservation::reserved),
     };
 
     req.extensions_mut().insert(ctx);
+    if let Some(reservation) = reservation {
+        req.extensions_mut().insert(reservation);
+    }
     Ok(next.run(req).await)
 }
 

@@ -1,3 +1,6 @@
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use deadpool_redis::Pool;
 
@@ -214,6 +217,128 @@ impl BudgetEnforcer for RedisBudgetEnforcer {
 /// Default reservation estimate when `max_tokens` is not provided in the request.
 pub const DEFAULT_RESERVE_TOKENS: u32 = 4096;
 
+/// A pre-request budget reservation that refunds itself unless claimed.
+///
+/// `auth_middleware` creates one per reserved request and carries it as a
+/// request extension. A `RequestFinalizer` claims it once the request has been
+/// dispatched and reconciles it against actual usage. Every other exit — a
+/// 400/403/404, a dispatch failure, a body the extractor rejects, a handler
+/// future dropped on client disconnect, a route that never dispatches — drops
+/// the last clone unclaimed, and the drop refunds the whole reservation
+/// (`reconcile_tokens(reserved, 0)`), spawned on the runtime since `drop`
+/// cannot await.
+///
+/// Cloning is a refcount bump (request extensions must be `Clone`); the
+/// claim is a single atomic swap, so exactly one clone ever settles it. Only
+/// requests with a budget pay for the allocation.
+#[derive(Clone)]
+pub struct BudgetReservation(Arc<ReservationInner>);
+
+struct ReservationInner {
+    enforcer: Arc<dyn BudgetEnforcer>,
+    client_id: String,
+    period: String,
+    reserved: u32,
+    armed: AtomicBool,
+}
+
+/// A claimed reservation: the caller now owes the reconciliation.
+pub struct ClaimedReservation {
+    pub enforcer: Arc<dyn BudgetEnforcer>,
+    pub client_id: String,
+    pub period: String,
+    pub reserved: u32,
+}
+
+impl BudgetReservation {
+    pub fn new(
+        enforcer: Arc<dyn BudgetEnforcer>,
+        client_id: String,
+        period: String,
+        reserved: u32,
+    ) -> Self {
+        Self(Arc::new(ReservationInner {
+            enforcer,
+            client_id,
+            period,
+            reserved,
+            armed: AtomicBool::new(true),
+        }))
+    }
+
+    /// Tokens this reservation holds against the budget.
+    pub fn reserved(&self) -> u32 {
+        self.0.reserved
+    }
+
+    /// Take over settling the reservation. Returns `Some` exactly once across
+    /// all clones; after that, dropping the reservation refunds nothing.
+    pub fn claim(&self) -> Option<ClaimedReservation> {
+        let inner = &self.0;
+        inner
+            .armed
+            .swap(false, Ordering::AcqRel)
+            .then(|| ClaimedReservation {
+                enforcer: inner.enforcer.clone(),
+                client_id: inner.client_id.clone(),
+                period: inner.period.clone(),
+                reserved: inner.reserved,
+            })
+    }
+}
+
+impl Drop for ReservationInner {
+    fn drop(&mut self) {
+        if !*self.armed.get_mut() {
+            return;
+        }
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let enforcer = self.enforcer.clone();
+        let client_id = std::mem::take(&mut self.client_id);
+        let period = std::mem::take(&mut self.period);
+        let reserved = self.reserved;
+        handle.spawn(async move {
+            enforcer
+                .reconcile_tokens(&client_id, &period, reserved, 0)
+                .await;
+        });
+    }
+}
+
+/// Test double that records every `reconcile_tokens` call.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct RecordingBudget {
+    pub(crate) reserves: std::sync::atomic::AtomicUsize,
+    pub(crate) calls: std::sync::Mutex<Vec<(String, String, u32, u32)>>,
+}
+
+#[cfg(test)]
+impl RecordingBudget {
+    pub(crate) fn reconciles(&self) -> Vec<(String, String, u32, u32)> {
+        self.calls.lock().unwrap().clone()
+    }
+}
+
+#[cfg(test)]
+#[async_trait]
+impl BudgetEnforcer for RecordingBudget {
+    async fn reserve_tokens(&self, _: &str, _: &str, _: i64, _: u32) -> Result<(), ()> {
+        self.reserves.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+    async fn reconcile_tokens(&self, client_id: &str, period: &str, reserved: u32, actual: u32) {
+        self.calls.lock().unwrap().push((
+            client_id.to_string(),
+            period.to_string(),
+            reserved,
+            actual,
+        ));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -229,6 +354,51 @@ mod tests {
         enforcer
             .reconcile_tokens("client-1", "daily", 500, 300)
             .await;
+    }
+
+    fn reservation(budget: &Arc<RecordingBudget>) -> BudgetReservation {
+        BudgetReservation::new(budget.clone(), "c1".into(), "daily".into(), 4096)
+    }
+
+    #[tokio::test]
+    async fn unclaimed_reservation_refunds_once_on_last_drop() {
+        let budget = Arc::new(RecordingBudget::default());
+        let r = reservation(&budget);
+        let clone = r.clone();
+        drop(r);
+        tokio::task::yield_now().await;
+        assert!(budget.reconciles().is_empty(), "a clone is still alive");
+
+        drop(clone);
+        tokio::task::yield_now().await;
+        assert_eq!(
+            budget.reconciles(),
+            vec![("c1".to_string(), "daily".to_string(), 4096, 0)]
+        );
+    }
+
+    #[tokio::test]
+    async fn claimed_reservation_does_not_refund() {
+        let budget = Arc::new(RecordingBudget::default());
+        let r = reservation(&budget);
+        let claimed = r.clone().claim().expect("first claim");
+        assert_eq!(
+            (claimed.client_id.as_str(), claimed.period.as_str()),
+            ("c1", "daily")
+        );
+        assert_eq!(claimed.reserved, 4096);
+        assert!(r.claim().is_none(), "claimed at most once across clones");
+
+        drop(r);
+        tokio::task::yield_now().await;
+        assert!(budget.reconciles().is_empty());
+    }
+
+    #[test]
+    fn drop_outside_a_runtime_does_not_panic() {
+        let budget = Arc::new(RecordingBudget::default());
+        drop(reservation(&budget));
+        assert!(budget.reconciles().is_empty());
     }
 
     #[tokio::test]
