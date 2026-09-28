@@ -162,7 +162,8 @@ pub(crate) async fn dispatch_stream(
 /// its error warrants failover — each available fallback, every attempt
 /// wrapped in the retry policy and recorded on the target's circuit breaker.
 /// `call` makes one attempt against a provider and upstream model id, so
-/// each surface chooses per target what that attempt is.
+/// each surface chooses per target what that attempt is. `streaming` only
+/// selects the log messages.
 ///
 /// `skip` returns why a target cannot serve this request at all (a
 /// Responses request using native-only features, on a translate-only
@@ -184,6 +185,12 @@ where
     F: Fn(Arc<dyn ProviderAdapter>, String) -> Fut,
     Fut: Future<Output = Result<T, ProxyError>>,
 {
+    let log = if streaming {
+        &STREAM_LOG
+    } else {
+        &NON_STREAM_LOG
+    };
+
     // Try primary targets: the strategy picks among the available ones this
     // request can go to.
     let primary = pool.select_target(|t| skip(t).is_none());
@@ -205,9 +212,9 @@ where
                 tracing::warn!(
                     provider = %provider_name,
                     model_id = %model_id,
-                    streaming,
                     error = %e,
-                    "Primary target failed — trying fallback chain"
+                    "{}",
+                    log.primary_failed
                 );
             }
             Err(e) => return Err(e),
@@ -237,14 +244,14 @@ where
                 tracing::info!(
                     provider = %provider_name,
                     model_id = %model_id,
-                    streaming,
-                    "Request served by fallback"
+                    "{}",
+                    log.served_by_fallback
                 );
                 return Ok((out, provider_name, model_id));
             }
             Err(e) => {
                 fallback.circuit_breaker.record_failure();
-                tracing::warn!(provider = %provider_name, streaming, error = %e, "Fallback failed");
+                tracing::warn!(provider = %provider_name, error = %e, "{}", log.fallback_failed);
             }
         }
     }
@@ -270,6 +277,26 @@ where
         }),
     }
 }
+
+/// The failover log messages, unchanged per mode so existing log queries keep
+/// matching.
+struct DispatchLog {
+    primary_failed: &'static str,
+    served_by_fallback: &'static str,
+    fallback_failed: &'static str,
+}
+
+const NON_STREAM_LOG: DispatchLog = DispatchLog {
+    primary_failed: "Primary target failed — trying fallback chain",
+    served_by_fallback: "Request served by fallback",
+    fallback_failed: "Fallback failed",
+};
+
+const STREAM_LOG: DispatchLog = DispatchLog {
+    primary_failed: "Primary streaming target failed — trying fallback",
+    served_by_fallback: "Streaming request served by fallback",
+    fallback_failed: "Streaming fallback failed",
+};
 
 async fn attempt<T, F, Fut>(
     target: &RouteTarget,

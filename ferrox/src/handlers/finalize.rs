@@ -378,16 +378,20 @@ impl<T: Metered + Unpin> Stream for FinalizedStream<T> {
                         finalizer.record_token_metrics(c);
                         this.last_usage = Some(c);
                     }
-                    if chunk.is_terminal() {
-                        this.held = Some(chunk);
-                        continue;
+                    if !chunk.is_terminal() {
+                        return Poll::Ready(Some(Ok(chunk)));
                     }
-                    return Poll::Ready(Some(Ok(chunk)));
+                    // The answer is complete: settle now, release it after,
+                    // and read nothing more from the upstream — a trailing
+                    // frame must not overtake it.
+                    this.held = Some(chunk);
+                    match this.settle() {
+                        Some(fut) => this.reconcile = Some(fut),
+                        None => return Poll::Ready(this.held.take().map(Ok)),
+                    }
                 }
-                // The answer is already complete: an upstream error after
-                // its terminal item ends the stream rather than replacing it.
-                Some(Err(e)) if this.held.is_none() => return Poll::Ready(Some(Err(e))),
-                Some(Err(_)) | None => match this.settle() {
+                Some(Err(e)) => return Poll::Ready(Some(Err(e))),
+                None => match this.settle() {
                     Some(fut) => this.reconcile = Some(fut),
                     None => return Poll::Ready(this.held.take().map(Ok)),
                 },
@@ -703,7 +707,9 @@ mod tests {
         let inner = futures::stream::iter(vec![
             event("response.created", None),
             event("response.completed", Some(usage(3, 4))),
-            // Noise after the terminal event must not replace it.
+            // Anything after the terminal event must not overtake or replace
+            // it: nothing more is read from the upstream.
+            event("response.output_text.delta", None),
             Err(ProxyError::StreamError("reset".into())),
         ])
         .boxed();
