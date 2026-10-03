@@ -302,11 +302,11 @@ sequenceDiagram
     R->>P: resolve model alias
 
     loop primary targets (LB strategy)
-        P->>CB: is_available()?
+        P->>CB: can_serve()? (read-only)
         CB-->>P: true / false
     end
 
-    P->>CB: select target
+    P->>CB: try_acquire() on the selected target
     CB->>Up: send request (with retry)
 
     alt success
@@ -413,6 +413,10 @@ stateDiagram-v2
         AtomicBool CAS guards the probe slot.
     end note
 ```
+
+Selection never claims the probe slot. `RoutePool::select_target` filters the primaries with the read-only `CircuitBreaker::can_serve()`, and calls `try_acquire()` only on the target the strategy picked, so a half-open primary that is not chosen stays available to the next request. If another request claims the pick's slot in between, the strategy picks again among the remaining targets. Fallbacks are acquired one at a time, just before each is attempted.
+
+`try_acquire()` returns a `ProbePermit` that the dispatcher settles with the attempt's outcome (`success()` / `failure()`). A permit dropped unsettled releases the slot and leaves the state and counters untouched. That covers an error that says nothing about the target's health (for example an upstream 400) and a request cancelled mid-attempt (client disconnect), so no exit leaves a half-open target out of rotation.
 
 ---
 

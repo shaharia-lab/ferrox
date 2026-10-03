@@ -1090,8 +1090,8 @@ data: {"type":"response.output_text.delta","delta":"Hi"}"#
         );
         let router = crate::router::ModelRouter::from_config(&config, &registry).unwrap();
         let pool = router.resolve("resp-skip-probe").unwrap();
-        // Open the fallback's breaker; with no recovery timeout, its next
-        // availability check moves it to half-open and claims the probe.
+        // Open the fallback's breaker; with no recovery timeout, the next
+        // request admitted on it moves it to half-open and claims the probe.
         pool.fallbacks[0].circuit_breaker.record_failure();
 
         let req: ChatCompletionRequest =
@@ -1115,7 +1115,7 @@ data: {"type":"response.output_text.delta","delta":"Hi"}"#
         assert!(result.is_err());
 
         assert!(
-            pool.fallbacks[0].is_available(),
+            pool.fallbacks[0].can_serve(),
             "the skipped target's probe slot must still be free"
         );
     }
