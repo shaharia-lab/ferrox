@@ -336,7 +336,11 @@ pub fn is_model_allowed(model: &str, allowed: &[String]) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
+    use crate::lb::circuit_breaker::CircuitState;
+    use crate::lb::test_support::{pool, trip, Reply};
 
     fn allowed(models: &[&str]) -> Vec<String> {
         models.iter().map(|s| s.to_string()).collect()
@@ -375,11 +379,6 @@ mod tests {
             &allowed(&["gpt-4", "*", "claude-3"])
         ));
     }
-
-    use std::time::Duration;
-
-    use crate::lb::circuit_breaker::CircuitState;
-    use crate::lb::test_support::{pool, trip, Reply};
 
     async fn dispatch_chat(
         pool: &RoutePool,
