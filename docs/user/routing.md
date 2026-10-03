@@ -131,6 +131,8 @@ stateDiagram-v2
 
 Only one probe request is permitted at a time in HalfOpen state, preventing a thundering herd on recovery.
 
+A probe that ends without a verdict on the target (an upstream error that does not trigger failover, such as a `400`, or a client that disconnects mid-request) counts as neither success nor failure: the circuit stays HalfOpen and the next request probes again.
+
 ### Configuration
 
 ```yaml

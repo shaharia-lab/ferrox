@@ -6,7 +6,8 @@ use rand::Rng;
 /// Lock-free load balancing strategy.
 ///
 /// `select` is called with a slice of booleans indicating which target indices
-/// are currently available (circuit breaker closed/half-open and claiming probe slot).
+/// are currently available (circuit breaker closed, or able to take a half-open
+/// probe). Nothing is claimed for them: the caller acquires only the index returned.
 /// Returns `None` if no target is available.
 pub enum LbStrategy {
     RoundRobin {

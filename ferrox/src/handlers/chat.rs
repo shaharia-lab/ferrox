@@ -210,17 +210,19 @@ where
         Some(_) => None,
         None => pool.targets.iter().find_map(&skip),
     };
-    if let Some(target) = primary {
+    // A permit dropped unsettled gives a claimed half-open probe slot back:
+    // the non-failover error below, and this future being dropped mid-attempt.
+    if let Some((target, permit)) = primary {
         let provider_name = target.provider.name().to_string();
         let model_id = target.model_id.clone();
 
         match attempt(target, retry_config, &pool.alias, &call).await {
             Ok(out) => {
-                target.circuit_breaker.record_success();
+                permit.success();
                 return Ok((out, provider_name, model_id));
             }
             Err(e) if should_failover(&e) => {
-                target.circuit_breaker.record_failure();
+                permit.failure();
                 tracing::warn!(
                     provider = %provider_name,
                     model_id = %model_id,
@@ -235,21 +237,21 @@ where
 
     // Fallback chain
     for fallback in &pool.fallbacks {
-        // `skip` before `is_available`: the latter claims a half-open
-        // breaker's probe slot, which only an attempt gives back.
+        // `skip` before `try_acquire`: a target that is not attempted must
+        // not claim its half-open breaker's probe slot.
         if let Some(reason) = skip(fallback) {
             skipped.get_or_insert(reason);
             continue;
         }
-        if !fallback.is_available() {
+        let Some(permit) = fallback.try_acquire() else {
             continue;
-        }
+        };
         let provider_name = fallback.provider.name().to_string();
         let model_id = fallback.model_id.clone();
 
         match attempt(fallback, retry_config, &pool.alias, &call).await {
             Ok(out) => {
-                fallback.circuit_breaker.record_success();
+                permit.success();
                 FALLBACK_TOTAL
                     .with_label_values(&[pool.alias.as_str(), "", provider_name.as_str()])
                     .inc();
@@ -262,7 +264,7 @@ where
                 return Ok((out, provider_name, model_id));
             }
             Err(e) => {
-                fallback.circuit_breaker.record_failure();
+                permit.failure();
                 tracing::warn!(provider = %provider_name, error = %e, "{}", log.fallback_failed);
             }
         }
@@ -334,7 +336,11 @@ pub fn is_model_allowed(model: &str, allowed: &[String]) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
+    use crate::lb::circuit_breaker::CircuitState;
+    use crate::lb::test_support::{pool, trip, Reply};
 
     fn allowed(models: &[&str]) -> Vec<String> {
         models.iter().map(|s| s.to_string()).collect()
@@ -372,5 +378,73 @@ mod tests {
             "anything",
             &allowed(&["gpt-4", "*", "claude-3"])
         ));
+    }
+
+    async fn dispatch_chat(
+        pool: &RoutePool,
+        retry: &RetryConfig,
+    ) -> Result<(ChatCompletionResponse, String, String), ProxyError> {
+        let req: ChatCompletionRequest =
+            serde_json::from_value(serde_json::json!({"model": "m", "messages": []})).unwrap();
+        dispatch_non_stream(pool, &req, retry).await
+    }
+
+    #[tokio::test]
+    async fn a_probe_ending_in_a_non_failover_error_releases_its_slot() {
+        let (pool, config) = pool("chat-probe-400", "failover", &[Reply::BadRequest], &[]);
+        let breaker = &pool.targets[0].circuit_breaker;
+        trip(&pool.targets[0], true);
+
+        let err = dispatch_chat(&pool, &config.defaults.retry)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ProxyError::ProviderError { status: 400, .. }),
+            "{err}"
+        );
+
+        // Neither a success nor a failure: still half-open, and the next
+        // request may probe.
+        assert_eq!(breaker.state(), CircuitState::HalfOpen);
+        assert!(!breaker.probe_in_flight());
+        assert!(pool.select_target(|_| true).is_some());
+    }
+
+    #[tokio::test]
+    async fn dropping_dispatch_mid_probe_releases_the_primary_slot() {
+        let (pool, config) = pool("chat-probe-drop", "round_robin", &[Reply::Hang], &[]);
+        let breaker = &pool.targets[0].circuit_breaker;
+        trip(&pool.targets[0], true);
+
+        let mut request = Box::pin(dispatch_chat(&pool, &config.defaults.retry));
+        let pending = tokio::time::timeout(Duration::from_millis(20), &mut request).await;
+        assert!(pending.is_err(), "the upstream never answers");
+        assert!(breaker.probe_in_flight(), "the attempt holds the probe");
+
+        // The client disconnects.
+        drop(request);
+        assert_eq!(breaker.state(), CircuitState::HalfOpen);
+        assert!(!breaker.probe_in_flight());
+    }
+
+    #[tokio::test]
+    async fn dropping_dispatch_mid_probe_releases_a_fallback_slot() {
+        let (pool, config) = pool(
+            "chat-fallback-drop",
+            "failover",
+            &[Reply::Unavailable],
+            &[Reply::Hang],
+        );
+        let breaker = &pool.fallbacks[0].circuit_breaker;
+        trip(&pool.fallbacks[0], true);
+
+        let mut request = Box::pin(dispatch_chat(&pool, &config.defaults.retry));
+        let pending = tokio::time::timeout(Duration::from_millis(20), &mut request).await;
+        assert!(pending.is_err(), "the fallback never answers");
+        assert!(breaker.probe_in_flight(), "the attempt holds the probe");
+
+        drop(request);
+        assert_eq!(breaker.state(), CircuitState::HalfOpen);
+        assert!(!breaker.probe_in_flight());
     }
 }
