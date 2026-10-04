@@ -5,6 +5,8 @@
 #        ├──────────→  docker      builds + pushes the ferrox gateway image to GHCR
 #        ├──────────→  docker-cp   builds + pushes the ferrox-cp image to GHCR
 #        └──────────→  homebrew    updates the Homebrew tap formula
+#   upload-assets + docker + docker-cp  →  announce   posts the release to Discord
+#                                          (stable releases only, non-blocking)
 #
 # Docker images are tagged with the semver version, major.minor, major, and latest.
 # Binary artifacts include .sha256 sidecar files for supply-chain verification.
@@ -21,7 +23,8 @@ env:
   IMAGE_NAME: ${{ github.repository }}
 
 # Least-privilege default token scope. Jobs widen it locally where needed
-# (upload-assets/docker/docker-cp declare their own writes; homebrew uses a PAT).
+# (upload-assets/docker/docker-cp declare their own writes; homebrew uses a PAT;
+# announce adds actions: read).
 permissions:
   contents: read
 
@@ -369,3 +372,36 @@ jobs:
           fi
 
           echo "Homebrew formulas updated successfully!"
+
+  # ── Discord announcement ──────────────────────────────────────────────────────
+  # Posts one message to the release channel once the binaries and both images
+  # are out, so the announcement never links to a release that cannot be
+  # installed yet. It does not wait for homebrew: a tap hiccup must not suppress
+  # the announcement.
+  # Non-blocking: a Discord outage or a rejected webhook marks this job failed
+  # (with a warning annotation) but leaves the release run green.
+  # Pre-releases are not announced, and no DISCORD_WEBHOOK secret (a fork) is a
+  # clean skip. All logic lives in .github/scripts/announce-release.sh.
+  announce:
+    # The script finds earlier announcements of the same run by this exact name
+    # (ANNOUNCE_JOB_NAME in announce-release.sh) — change both together.
+    name: Announce on Discord
+    needs: [upload-assets, docker, docker-cp]
+    if: ${{ !github.event.release.prerelease && startsWith(github.event.release.tag_name, 'v') }}
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    permissions:
+      contents: read
+      actions: read  # read earlier attempts of this run, to not announce twice
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - name: Post release announcement
+        # Release fields and the webhook reach the script through env only:
+        # the notes are untrusted text and must never be inlined into a script.
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          RELEASE_URL: ${{ github.event.release.html_url }}
+          RELEASE_BODY: ${{ github.event.release.body }}
+        run: .github/scripts/announce-release.sh

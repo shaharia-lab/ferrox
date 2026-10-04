@@ -218,6 +218,17 @@ jobs:
       - run: pip install check-jsonschema
       - run: check-jsonschema --schemafile ferrox/config.schema.json ferrox/config/*.yaml
 
+  # ── Release scripts ───────────────────────────────────────────────────────────
+  # release.yml only runs on a published release, so its shell logic is tested
+  # here. curl and gh are stubbed: nothing is posted anywhere.
+  release-scripts:
+    name: Release scripts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - run: shellcheck .github/scripts/*.sh
+      - run: .github/scripts/announce-release.test.sh
+
   # ── Docker build — ferrox (gateway) ──────────────────────────────────────────
   # Builds the ferrox gateway Docker image to verify the Dockerfile is healthy.
   # Image is NOT pushed here; pushing only happens in release.yml on a
