@@ -9,16 +9,20 @@
 #   RELEASE_BODY      release notes (markdown), may be empty
 #   GH_TOKEN, GITHUB_REPOSITORY, GITHUB_RUN_ID, GITHUB_RUN_ATTEMPT
 #                     used to look up earlier attempts of this run (dedup)
+#   GITHUB_OUTPUT     receives `announced=true` once Discord accepted the post
 #   DRY_RUN=1         print the payload and exit: no webhook, no API call
 #
 # The webhook URL is a credential: it is never echoed, never passed on a command
 # line (curl reads it from stdin) and curl's own error output is discarded.
 set -euo pipefail
 
-# Display name of the workflow job that runs this script. The dedup below finds
-# earlier successful announcements by this name, so it must stay identical to
-# `jobs.announce.name` in .github/workflows/release.yml.
+# Display names of the workflow job that runs this script and of its marker
+# step, which only runs after a real post (`announced=true`). The dedup below
+# finds earlier announcements by these names, so they must stay identical to
+# `jobs.announce.name` and that step's `name` in .github/workflows/release.yml
+# (announce-release.test.sh checks it).
 ANNOUNCE_JOB_NAME="Announce on Discord"
+ANNOUNCED_STEP_NAME="Mark release announced"
 
 # Discord caps an embed description at 4096 characters. The notes get 3500 and
 # the rest is headroom for the "read the full notes" link and the install hints.
@@ -36,13 +40,16 @@ if [ "$DRY_RUN" != "1" ]; then
   fi
 
   # "Re-run all jobs" starts a new attempt of the same run. If an earlier
-  # attempt already announced this release, do not announce it again.
+  # attempt already announced this release, do not announce it again. The
+  # marker step is the evidence, not the job's conclusion: a job that skipped
+  # for lack of a webhook also succeeded, and must not count as an announcement.
   attempt="${GITHUB_RUN_ATTEMPT:-1}"
   n=1
   while [ "$n" -lt "$attempt" ]; do
     if ! announced=$(gh api --paginate \
       "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/${n}/jobs" \
-      --jq ".jobs[] | select(.name == \"${ANNOUNCE_JOB_NAME}\" and .conclusion == \"success\") | .id"); then
+      --jq ".jobs[] | select(.name == \"${ANNOUNCE_JOB_NAME}\") | .steps[]?
+            | select(.name == \"${ANNOUNCED_STEP_NAME}\" and .conclusion == \"success\") | .name"); then
       # Posting without knowing would risk a duplicate; failing leaves the job
       # re-runnable.
       echo "::warning::Discord announcement not sent: could not read attempt ${n} of this run to rule out a duplicate"
@@ -95,10 +102,13 @@ case "$DISCORD_WEBHOOK" in
   *) endpoint="${DISCORD_WEBHOOK}?wait=true" ;;
 esac
 
+# No --retry: the POST is not idempotent, and curl would re-send it after a
+# timeout or a 5xx even though Discord may already have published the message.
+# A failed job is visible and can be re-run by hand instead.
 rc=0
 code=$(printf 'url = "%s"\n' "$endpoint" | curl --config - \
   --silent --output /dev/null --write-out '%{http_code}' \
-  --max-time 20 --retry 2 \
+  --max-time 20 \
   --header 'Content-Type: application/json' \
   --data "$payload" 2>/dev/null) || rc=$?
 
@@ -106,6 +116,7 @@ case "$code" in
   2??)
     if [ "$rc" -eq 0 ]; then
       echo "Announced ${RELEASE_TAG} on Discord (HTTP ${code})"
+      [ -z "${GITHUB_OUTPUT:-}" ] || echo "announced=true" >> "$GITHUB_OUTPUT"
       exit 0
     fi
     ;;

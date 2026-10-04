@@ -137,10 +137,13 @@ gh run watch <RUN_ID> --repo shaharia-lab/ferrox --exit-status   # blocks until 
 
   `success` → announced (or cleanly skipped: the job log says so when
   `DISCORD_WEBHOOK` is not set). `failure` → Discord rejected the webhook or was
-  unreachable; the warning annotation on the run carries the HTTP status. The
-  release itself is fine — re-run just that job
-  (`gh run rerun <RUN_ID> --failed`) or post by hand. Re-running a run that
-  already announced posts nothing.
+  unreachable; the warning annotation on the run carries the HTTP status and
+  curl's exit code. The release itself is fine — re-run just that job
+  (`gh run rerun --job <JOB_ID> --repo shaharia-lab/ferrox`, the id is
+  `.databaseId` in the query above) or post by hand. **`curl exit 28` is a
+  timeout: Discord may have published the message anyway, so look at the channel
+  before re-running.** Re-running a run that already announced posts nothing; a
+  run that only skipped (no webhook yet) does announce when re-run.
 
 ## Phase 4 — Verify the artifacts
 

@@ -383,8 +383,9 @@ jobs:
   # Pre-releases are not announced, and no DISCORD_WEBHOOK secret (a fork) is a
   # clean skip. All logic lives in .github/scripts/announce-release.sh.
   announce:
-    # The script finds earlier announcements of the same run by this exact name
-    # (ANNOUNCE_JOB_NAME in announce-release.sh) — change both together.
+    # The script finds earlier announcements of the same run by this job's name
+    # and by the name of its last step (ANNOUNCE_JOB_NAME / ANNOUNCED_STEP_NAME
+    # in announce-release.sh) — change them together.
     name: Announce on Discord
     needs: [upload-assets, docker, docker-cp]
     if: ${{ !github.event.release.prerelease && startsWith(github.event.release.tag_name, 'v') }}
@@ -396,6 +397,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - name: Post release announcement
+        id: post
         # Release fields and the webhook reach the script through env only:
         # the notes are untrusted text and must never be inlined into a script.
         env:
@@ -405,3 +407,8 @@ jobs:
           RELEASE_URL: ${{ github.event.release.html_url }}
           RELEASE_BODY: ${{ github.event.release.body }}
         run: .github/scripts/announce-release.sh
+      # Runs only when Discord accepted the post. A re-run of this workflow
+      # looks for this step in earlier attempts to decide it already announced.
+      - name: Mark release announced
+        if: steps.post.outputs.announced == 'true'
+        run: echo "Release announced on Discord"

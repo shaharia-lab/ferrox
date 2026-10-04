@@ -24,12 +24,24 @@ echo "curl: (22) error talking to $(cat "$STUB_DIR/curl.stdin")" >&2
 printf '%s' "${STUB_HTTP_CODE:-204}"
 exit "${STUB_CURL_EXIT:-0}"
 EOF
-# gh stub: records the path it was asked for, prints $STUB_GH_OUT for it.
+# gh stub: records the call, then answers `gh api <path> --jq <filter>` the way
+# gh does: the jobs of that attempt ($STUB_GH_ATTEMPT_<n>, default none) run
+# through the real filter the script passed.
 cat > "$WORK/bin/gh" <<'EOF'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$STUB_DIR/gh.calls"
 [ "${STUB_GH_EXIT:-0}" = "0" ] || exit "$STUB_GH_EXIT"
-case "$*" in *"/attempts/${STUB_GH_HIT_ATTEMPT:-none}/jobs"*) echo 4242 ;; esac
+filter=.
+attempt=
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --jq) filter=$2; shift ;;
+    */attempts/*/jobs) attempt=${1%/jobs}; attempt=${attempt##*/} ;;
+  esac
+  shift
+done
+jobs_var="STUB_GH_ATTEMPT_${attempt}"
+jq -r "$filter" <<<"${!jobs_var:-{\"jobs\":[]\}}"
 EOF
 chmod +x "$WORK/bin/curl" "$WORK/bin/gh"
 
@@ -44,6 +56,7 @@ run() {
     RELEASE_TAG=v1.2.3 \
     RELEASE_URL=https://github.com/shaharia-lab/ferrox/releases/tag/v1.2.3 \
     GITHUB_REPOSITORY=shaharia-lab/ferrox GITHUB_RUN_ID=77 GITHUB_RUN_ATTEMPT=1 \
+    GITHUB_OUTPUT="$STUB_DIR/output" \
     "$@" "$SCRIPT" 2>&1) || status=$?
 }
 
@@ -109,12 +122,19 @@ check "webhook is not on curl's command line" lacks "$(cat "$STUB_DIR/curl.args"
 check "webhook is not in the output" lacks "$out" "s3cr3t-token"
 check "posted body is the embed" [ "$(jq -r '.embeds[0].title' "$STUB_DIR/curl.data")" = "Ferrox v1.2.3" ]
 check "first attempt makes no API call" [ ! -f "$STUB_DIR/gh.calls" ]
+check "success sets the announced output" [ "$(cat "$STUB_DIR/output")" = "announced=true" ]
+
+run post-query DISCORD_WEBHOOK="${WEBHOOK}?thread_id=9"
+check "a webhook with a query gets &wait=true" \
+  [ "$(cat "$STUB_DIR/curl.stdin")" = "url = \"${WEBHOOK}?thread_id=9&wait=true\"" ]
 
 run rejected DISCORD_WEBHOOK="$WEBHOOK" STUB_HTTP_CODE=404
 check "non-2xx fails the job" [ "$status" -eq 1 ]
 check "non-2xx warns with the status" \
   contains "$out" "::warning::Discord announcement failed (HTTP 404, curl exit 0)"
 check "failure does not leak the webhook" lacks "$out" "s3cr3t-token"
+check "failure does not set the announced output" [ ! -s "$STUB_DIR/output" ]
+check "the POST is never retried by curl" lacks "$(cat "$STUB_DIR/curl.args")" "--retry"
 
 run neterr DISCORD_WEBHOOK="$WEBHOOK" STUB_HTTP_CODE=000 STUB_CURL_EXIT=6
 check "network error fails the job" [ "$status" -eq 1 ]
@@ -127,8 +147,31 @@ run nosecret DISCORD_WEBHOOK=
 check "absent secret exits 0" [ "$status" -eq 0 ]
 check "absent secret posts nothing" not_posted
 check "absent secret logs a notice" contains "$out" "::notice::DISCORD_WEBHOOK not set"
+check "absent secret does not set the announced output" [ ! -s "$STUB_DIR/output" ]
 
-run rerun-dup DISCORD_WEBHOOK="$WEBHOOK" GITHUB_RUN_ATTEMPT=3 STUB_GH_HIT_ATTEMPT=2
+# ── names shared with the workflow ───────────────────────────────────────────
+WORKFLOW="$(dirname "$SCRIPT")/../workflows/release.yml"
+job_name=$(sed -n 's/^ANNOUNCE_JOB_NAME="\(.*\)"$/\1/p' "$SCRIPT")
+step_name=$(sed -n 's/^ANNOUNCED_STEP_NAME="\(.*\)"$/\1/p' "$SCRIPT")
+check "release.yml names the job as the script expects" grep -qx "    name: ${job_name}" "$WORKFLOW"
+check "release.yml names the marker step as the script expects" \
+  grep -qx "      - name: ${step_name}" "$WORKFLOW"
+
+# jobs_json JOB_CONCLUSION [MARKER_STEP_CONCLUSION] — one attempt's jobs, as the
+# API returns them. Without a marker conclusion the announce job has no marker
+# step, which is what a clean skip looks like.
+jobs_json() {
+  jq -n --arg job "$1" --arg marker "${2:-}" '{jobs: [
+    {name: "Docker image (ferrox)", conclusion: "success",
+     steps: [{name: "Mark release announced", conclusion: "success"}]},
+    {name: "Announce on Discord", conclusion: $job,
+     steps: ([{name: "Post release announcement", conclusion: $job}]
+       + (if $marker == "" then [] else [{name: "Mark release announced", conclusion: $marker}] end))}
+  ]}'
+}
+
+run rerun-dup DISCORD_WEBHOOK="$WEBHOOK" GITHUB_RUN_ATTEMPT=3 \
+  STUB_GH_ATTEMPT_1="$(jobs_json failure)" STUB_GH_ATTEMPT_2="$(jobs_json success success)"
 check "re-run after a successful announce exits 0" [ "$status" -eq 0 ]
 check "re-run after a successful announce posts nothing" not_posted
 check "re-run logs a notice" contains "$out" "::notice::v1.2.3 was already announced in attempt 2"
@@ -138,6 +181,16 @@ check "earlier attempts are read from this run" \
 run rerun-first DISCORD_WEBHOOK="$WEBHOOK" GITHUB_RUN_ATTEMPT=2
 check "re-run with no earlier announce posts" posted
 check "re-run with no earlier announce exits 0" [ "$status" -eq 0 ]
+
+run rerun-failed DISCORD_WEBHOOK="$WEBHOOK" GITHUB_RUN_ATTEMPT=2 STUB_GH_ATTEMPT_1="$(jobs_json failure)"
+check "re-run after a failed announce posts" posted
+
+run rerun-skipped DISCORD_WEBHOOK="$WEBHOOK" GITHUB_RUN_ATTEMPT=2 STUB_GH_ATTEMPT_1="$(jobs_json success)"
+check "re-run after a clean skip (job succeeded, nothing posted) posts" posted
+
+run rerun-marker-skipped DISCORD_WEBHOOK="$WEBHOOK" GITHUB_RUN_ATTEMPT=2 \
+  STUB_GH_ATTEMPT_1="$(jobs_json success skipped)"
+check "re-run after a skipped marker step posts" posted
 
 run rerun-apierr DISCORD_WEBHOOK="$WEBHOOK" GITHUB_RUN_ATTEMPT=2 STUB_GH_EXIT=1
 check "unreadable earlier attempt fails the job" [ "$status" -eq 1 ]
