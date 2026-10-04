@@ -22,6 +22,11 @@ Releasing is **tag-driven**. Publishing a GitHub Release for a `vX.Y.Z` tag fire
   `{{version}}`, `{{major}}.{{minor}}`, `{{major}}`, and `latest`.
 - **homebrew** — updates the tap formula (`ferrox.rb` + a versioned
   `ferrox@X.Y.Z.rb`).
+- **announce** — after binaries and both images are out, posts the release to
+  the Shaharia Lab Discord release channel (`.github/scripts/announce-release.sh`,
+  webhook from the `DISCORD_WEBHOOK` secret). Stable `v*` releases only —
+  pre-releases are not announced. It is **non-blocking**: the run stays green
+  when it fails, so check it explicitly (Phase 3).
 
 There is **no manual version-bump commit**: the `version` fields in
 `ferrox/Cargo.toml` / `ferrox-cp/Cargo.toml` are not the source of truth — the
@@ -36,7 +41,7 @@ the workflow → verify. That's it.
 0 preflight (gh auth · on main · synced · CI green)
 → 1 pick the next semver version from commits since the last tag (confirm with the user)
 → 2 publish the GitHub Release (creates the tag, auto-generates notes) — this triggers release.yml
-→ 3 watch the release workflow to success (binaries · docker · docker-cp · homebrew)
+→ 3 watch the release workflow to success (binaries · docker · docker-cp · homebrew · announce)
 → 4 verify artifacts (GHCR tags · release assets + .sha256)
 → 5 report
 ```
@@ -122,6 +127,24 @@ gh run watch <RUN_ID> --repo shaharia-lab/ferrox --exit-status   # blocks until 
   release+tag (`gh release delete vX.Y.Z --cleanup-tag --yes`) and re-cut from the
   new commit. Never leave a published release with a broken/missing image.
 
+- **The `announce` job never fails the run** (`continue-on-error`), so a green
+  run does not prove the release was announced. Look at the job itself:
+
+  ```bash
+  gh run view <RUN_ID> --repo shaharia-lab/ferrox --json jobs \
+    -q '.jobs[] | select(.name == "Announce on Discord") | {conclusion, databaseId}'
+  ```
+
+  `success` → announced (or cleanly skipped: the job log says so when
+  `DISCORD_WEBHOOK` is not set). `failure` → Discord rejected the webhook or was
+  unreachable; the warning annotation on the run carries the HTTP status and
+  curl's exit code. The release itself is fine — re-run just that job
+  (`gh run rerun --job <JOB_ID> --repo shaharia-lab/ferrox`, with the
+  `databaseId` printed above) or post by hand. **`curl exit 28` is a
+  timeout: Discord may have published the message anyway, so look at the channel
+  before re-running.** Re-running a run that already announced posts nothing; a
+  run that only skipped (no webhook yet) does announce when re-run.
+
 ## Phase 4 — Verify the artifacts
 
 ```bash
@@ -141,7 +164,7 @@ as a failed release (Phase 3 recovery).
 
 One compact summary: version tagged, release URL, workflow conclusion, images
 pushed (tags), assets attached. Note anything skipped (e.g. Homebrew tap PAT
-absent) so it's visible.
+absent) and whether the Discord announcement went out, so it's visible.
 
 ---
 
