@@ -25,6 +25,7 @@ use futures::{Stream, StreamExt as _};
 use uuid::Uuid;
 
 use crate::budget_enforcer::{BudgetEnforcer, BudgetReservation, ClaimedReservation};
+use crate::classifier::RoutingRecord;
 use crate::error::ProxyError;
 use crate::event_dispatcher::{EventDispatcher, TokenUsageEvent};
 use crate::state::AppState;
@@ -79,6 +80,9 @@ pub(crate) struct RequestFinalizer {
     model_id: String,
     start: Instant,
     surface: Surface,
+    /// The classifier's routing decision; `None` for a statically routed
+    /// alias.
+    routing: Option<RoutingRecord>,
 }
 
 /// A budget reconciliation owed once the request's usage is known.
@@ -157,7 +161,16 @@ impl RequestFinalizer {
             model_id,
             start,
             surface,
+            routing: None,
         }
+    }
+
+    /// Record the routing decision of a request to a classified alias in its
+    /// usage row and webhook. `None`, a statically routed alias, changes
+    /// nothing.
+    pub(crate) fn with_routing(mut self, routing: Option<RoutingRecord>) -> Self {
+        self.routing = routing;
+        self
     }
 
     /// Close a non-streaming request: token metrics, request metrics, usage row,
@@ -273,6 +286,13 @@ impl RequestFinalizer {
             .as_ref()
             .and_then(BudgetReservation::claim);
         let c = counts?;
+        // The classifier's own tokens are recorded, never charged: the budget
+        // reconciliation below counts the served request's tokens only.
+        let routing = self.routing.as_ref();
+        let routing_reason = routing.map(|r| r.reason);
+        let classifier_confidence = routing.and_then(|r| r.confidence);
+        let classifier_latency_ms = routing.map(|r| r.latency_ms);
+        let classifier_input_tokens = routing.and_then(|r| r.input_tokens);
         self.event_dispatcher.dispatch(TokenUsageEvent {
             event: "token_usage",
             request_id: self.request_id.clone(),
@@ -287,7 +307,17 @@ impl RequestFinalizer {
             cache_write_tokens: (c.cache_write > 0).then_some(c.cache_write),
             latency_ms: Some(latency_ms),
             timestamp: chrono::Utc::now(),
+            requested_model: routing.map(|r| r.requested_model.clone()),
+            routing_reason,
+            classifier_confidence,
+            classifier_latency_ms,
+            classifier_input_tokens,
+            classifier_model: routing.and_then(|r| r.model.clone()),
         });
+        let (requested_model, classifier_model) = match self.routing {
+            Some(r) => (Some(r.requested_model), r.model),
+            None => (None, None),
+        };
         self.usage_writer.record(UsageEvent {
             client_id: self.client_id,
             request_id: self.request_id,
@@ -298,6 +328,12 @@ impl RequestFinalizer {
             cache_read_tokens: c.cache_read,
             cache_write_tokens: c.cache_write,
             latency_ms: Some(latency_ms),
+            requested_model,
+            routing_reason,
+            classifier_confidence,
+            classifier_latency_ms,
+            classifier_input_tokens,
+            classifier_model,
         });
 
         claimed.map(|claimed| Reconcile::new(claimed, c.prompt + c.completion))
@@ -619,6 +655,121 @@ mod tests {
                 .get(),
             7.0
         );
+    }
+
+    fn routing() -> RoutingRecord {
+        RoutingRecord {
+            requested_model: "auto".into(),
+            reason: "classified",
+            confidence: Some(0.9),
+            latency_ms: 84,
+            input_tokens: Some(31),
+            model: Some("jev-1".into()),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_classified_request_records_its_routing_decision() {
+        let mut h = Harness::new("fin-classified");
+        h.take()
+            .with_routing(Some(routing()))
+            .finish(Some(&usage(10, 5)))
+            .await;
+
+        let row = h.usage_rx.try_recv().expect("usage row");
+        // `model` stays the alias that served the request.
+        assert_eq!(row.model, "fin-classified");
+        assert_eq!(row.requested_model.as_deref(), Some("auto"));
+        assert_eq!(row.routing_reason, Some("classified"));
+        assert_eq!(row.classifier_confidence, Some(0.9));
+        assert_eq!(row.classifier_latency_ms, Some(84));
+        assert_eq!(row.classifier_input_tokens, Some(31));
+        assert_eq!(row.classifier_model.as_deref(), Some("jev-1"));
+
+        let ev = h.event_rx.try_recv().expect("webhook event");
+        assert_eq!(ev.model, "fin-classified");
+        assert_eq!(ev.requested_model.as_deref(), Some("auto"));
+        assert_eq!(ev.routing_reason, Some("classified"));
+        assert_eq!(ev.classifier_confidence, Some(0.9));
+        assert_eq!(ev.classifier_latency_ms, Some(84));
+        assert_eq!(ev.classifier_input_tokens, Some(31));
+        assert_eq!(ev.classifier_model.as_deref(), Some("jev-1"));
+    }
+
+    #[tokio::test]
+    async fn a_static_request_records_no_routing_decision() {
+        let mut h = Harness::new("fin-static");
+        h.take()
+            .with_routing(None)
+            .finish(Some(&usage(10, 5)))
+            .await;
+
+        let row = h.usage_rx.try_recv().expect("usage row");
+        assert_eq!(row.requested_model, None);
+        assert_eq!(row.routing_reason, None);
+        assert_eq!(row.classifier_confidence, None);
+        assert_eq!(row.classifier_latency_ms, None);
+        assert_eq!(row.classifier_input_tokens, None);
+        assert_eq!(row.classifier_model, None);
+
+        // Nothing about routing reaches the webhook payload either.
+        let ev = h.event_rx.try_recv().expect("webhook event");
+        let payload = serde_json::to_value(&ev).unwrap();
+        let routing_keys: Vec<&String> = payload
+            .as_object()
+            .unwrap()
+            .keys()
+            .filter(|k| {
+                k.starts_with("classifier_") || k.starts_with("rout") || *k == "requested_model"
+            })
+            .collect();
+        assert!(routing_keys.is_empty(), "{routing_keys:?}");
+    }
+
+    /// The classifier's tokens are recorded, never charged to the client:
+    /// the reconciled amount is the served request's prompt + completion,
+    /// whatever the classifier billed.
+    #[tokio::test]
+    async fn classifier_tokens_are_not_charged_to_the_client_budget() {
+        let charged = |h: &Harness| {
+            let reconciles = h.reconciles();
+            assert_eq!(reconciles.len(), 1);
+            reconciles[0].3
+        };
+
+        let mut classified = Harness::new("fin-budget-classified");
+        let record = RoutingRecord {
+            input_tokens: Some(5000),
+            ..routing()
+        };
+        classified
+            .take()
+            .with_routing(Some(record))
+            .finish(Some(&usage(10, 5)))
+            .await;
+        assert_eq!(charged(&classified), 15);
+
+        let mut stat = Harness::new("fin-budget-static");
+        stat.take().finish(Some(&usage(10, 5))).await;
+        assert_eq!(charged(&stat), charged(&classified));
+
+        // Streaming settles through the same path.
+        let mut streamed = Harness::new("fin-budget-stream");
+        let record = RoutingRecord {
+            input_tokens: Some(5000),
+            ..routing()
+        };
+        let upstream = futures::stream::iter(vec![chunk(Some(usage(10, 5)))]).boxed();
+        let _: Vec<_> = streamed
+            .take()
+            .with_routing(Some(record))
+            .wrap_stream(upstream)
+            .collect()
+            .await;
+        assert_eq!(charged(&streamed), 15);
+        let row = streamed.usage_rx.try_recv().expect("usage row");
+        assert_eq!(row.classifier_input_tokens, Some(5000));
+        assert_eq!((row.prompt_tokens, row.completion_tokens), (10, 5));
     }
 
     #[tokio::test]

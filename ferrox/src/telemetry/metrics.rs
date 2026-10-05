@@ -206,6 +206,40 @@ pub static ROUTING_TARGET_SELECTED: Lazy<CounterVec> = Lazy::new(|| {
     .expect("register ferrox_routing_target_selected")
 });
 
+// ── Classifier ────────────────────────────────────────────────────────────────
+
+/// Routing decisions for requests to a classified alias.
+/// Labels: alias (the classified alias requested), tier (the configured tier
+/// the classifier named, or `none`), reason (classified | low_confidence |
+/// timeout | error | unknown_choice | breaker_open | shadow | opt_out)
+///
+/// Every label is bounded: `alias` and `tier` come from the config, `reason`
+/// is a fixed set. A reason other than `classified` served the alias's
+/// `fallback_alias`. A decision made from a cached answer counts like any
+/// other.
+pub static CLASSIFIER_DECISIONS_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
+    register_counter_vec!(
+        "ferrox_classifier_decisions_total",
+        "Routing decisions for requests to a classified alias",
+        &["alias", "tier", "reason"]
+    )
+    .expect("register ferrox_classifier_decisions_total")
+});
+
+/// Time spent waiting for a classifier's answer, timeouts included. Only a
+/// call is timed: a cached answer, an opt-out or an open breaker adds no
+/// sample.
+/// Labels: classifier (`classifiers[].id`)
+pub static CLASSIFIER_DURATION_SECONDS: Lazy<HistogramVec> = Lazy::new(|| {
+    register_histogram_vec!(
+        "ferrox_classifier_duration_seconds",
+        "Classifier call latency in seconds",
+        &["classifier"],
+        vec![0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0]
+    )
+    .expect("register ferrox_classifier_duration_seconds")
+});
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 /// Render all registered metrics in Prometheus text format.
@@ -226,6 +260,8 @@ pub fn gather() -> String {
     Lazy::force(&RATELIMIT_ALLOWED_TOTAL);
     Lazy::force(&RATELIMIT_DENIED_TOTAL);
     Lazy::force(&RATELIMIT_BACKEND_ERRORS_TOTAL);
+    Lazy::force(&CLASSIFIER_DECISIONS_TOTAL);
+    Lazy::force(&CLASSIFIER_DURATION_SECONDS);
 
     let encoder = TextEncoder::new();
     let families = prometheus::gather();

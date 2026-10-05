@@ -41,7 +41,9 @@ use crate::types::{ChatCompletionRequest, ChatCompletionResponse, RequestContext
     responses(
         (status = 200, description = "Chat completion. JSON body (mirrors the OpenAI Chat \
             Completions response), or an SSE stream of `chat.completion.chunk` events \
-            terminated by `data: [DONE]` when `stream=true`."),
+            terminated by `data: [DONE]` when `stream=true`.",
+            headers(("x-ferrox-routed-model" = String, description = "The statically routed \
+                alias that served the request. Only present when `model` is a classified alias."))),
         (status = 401, description = "Missing or invalid credentials", body = ErrorResponse),
         (status = 403, description = "Model not permitted for this key", body = ErrorResponse),
         (status = 404, description = "Unknown model alias", body = ErrorResponse),
@@ -98,7 +100,8 @@ pub async fn chat_completions(
                     model_id,
                     start,
                     Surface::OpenAi,
-                );
+                )
+                .with_routing(decision.routing_record());
                 // The wrapper finishes its accounting before it ends, so the
                 // chained `[DONE]` always follows the recorded usage.
                 let sse_stream = finalizer
@@ -117,9 +120,11 @@ pub async fn chat_completions(
                         Ok::<Event, ProxyError>(Event::default().data("[DONE]"))
                     }));
 
-                Ok(Sse::new(sse_stream)
-                    .keep_alive(KeepAlive::default())
-                    .into_response())
+                Ok(decision.with_routed_model_header(
+                    Sse::new(sse_stream)
+                        .keep_alive(KeepAlive::default())
+                        .into_response(),
+                ))
             }
             Err(e) => {
                 record_error_metrics(model_alias, "", &e, start);
@@ -140,9 +145,10 @@ pub async fn chat_completions(
                     start,
                     Surface::OpenAi,
                 )
+                .with_routing(decision.routing_record())
                 .finish(resp.usage.as_ref())
                 .await;
-                Ok(Json(resp).into_response())
+                Ok(decision.with_routed_model_header(Json(resp).into_response()))
             }
             Err(e) => {
                 record_error_metrics(model_alias, "", &e, start);

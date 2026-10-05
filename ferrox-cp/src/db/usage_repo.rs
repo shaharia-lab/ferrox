@@ -44,15 +44,36 @@ impl<'a> UsageRepository<'a> {
         let cache_write_tokens: Vec<Option<i32>> =
             records.iter().map(|r| r.cache_write_tokens).collect();
         let latency_ms: Vec<Option<i32>> = records.iter().map(|r| r.latency_ms).collect();
+        let requested_models: Vec<Option<&str>> = records
+            .iter()
+            .map(|r| r.requested_model.as_deref())
+            .collect();
+        let routing_reasons: Vec<Option<&str>> = records
+            .iter()
+            .map(|r| r.routing_reason.as_deref())
+            .collect();
+        let classifier_confidences: Vec<Option<f64>> =
+            records.iter().map(|r| r.classifier_confidence).collect();
+        let classifier_latency_ms: Vec<Option<i32>> =
+            records.iter().map(|r| r.classifier_latency_ms).collect();
+        let classifier_input_tokens: Vec<Option<i32>> =
+            records.iter().map(|r| r.classifier_input_tokens).collect();
+        let classifier_models: Vec<Option<&str>> = records
+            .iter()
+            .map(|r| r.classifier_model.as_deref())
+            .collect();
 
         sqlx::query(
             r#"
             INSERT INTO usage_log
                 (client_id, request_id, model, provider, prompt_tokens, completion_tokens, total_tokens,
-                 cache_read_tokens, cache_write_tokens, latency_ms)
+                 cache_read_tokens, cache_write_tokens, latency_ms,
+                 requested_model, routing_reason, classifier_confidence, classifier_latency_ms,
+                 classifier_input_tokens, classifier_model)
             SELECT * FROM UNNEST(
                 $1::uuid[], $2::text[], $3::text[], $4::text[],
-                $5::int[], $6::int[], $7::int[], $8::int[], $9::int[], $10::int[]
+                $5::int[], $6::int[], $7::int[], $8::int[], $9::int[], $10::int[],
+                $11::text[], $12::text[], $13::float8[], $14::int[], $15::int[], $16::text[]
             )
             "#,
         )
@@ -66,6 +87,12 @@ impl<'a> UsageRepository<'a> {
         .bind(&cache_read_tokens)
         .bind(&cache_write_tokens)
         .bind(&latency_ms)
+        .bind(&requested_models)
+        .bind(&routing_reasons)
+        .bind(&classifier_confidences)
+        .bind(&classifier_latency_ms)
+        .bind(&classifier_input_tokens)
+        .bind(&classifier_models)
         .execute(self.db)
         .await
         .map_err(RepoError::Database)?;
@@ -118,7 +145,9 @@ impl<'a> UsageRepository<'a> {
             SELECT id, client_id, request_id, model, provider,
                    prompt_tokens, completion_tokens, total_tokens,
                    cache_read_tokens, cache_write_tokens,
-                   latency_ms, created_at
+                   latency_ms, created_at,
+                   requested_model, routing_reason, classifier_confidence,
+                   classifier_latency_ms, classifier_input_tokens, classifier_model
             FROM usage_log
             WHERE client_id = $1
               AND ($2::timestamptz IS NULL OR created_at >= $2)
@@ -157,6 +186,14 @@ pub struct UsageInsert {
     pub cache_read_tokens: Option<i32>,
     pub cache_write_tokens: Option<i32>,
     pub latency_ms: Option<i32>,
+    /// The routing decision of a request to a classified alias. All `None`
+    /// (SQL `NULL`) for a statically routed one.
+    pub requested_model: Option<String>,
+    pub routing_reason: Option<String>,
+    pub classifier_confidence: Option<f64>,
+    pub classifier_latency_ms: Option<i32>,
+    pub classifier_input_tokens: Option<i32>,
+    pub classifier_model: Option<String>,
 }
 
 #[cfg(test)]
@@ -195,6 +232,12 @@ mod tests {
             cache_read_tokens: None,
             cache_write_tokens: None,
             latency_ms: Some(150),
+            requested_model: None,
+            routing_reason: None,
+            classifier_confidence: None,
+            classifier_latency_ms: None,
+            classifier_input_tokens: None,
+            classifier_model: None,
         }
     }
 
@@ -257,6 +300,122 @@ mod tests {
             None,
             "NULL must stay distinct from a recorded 0"
         );
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn insert_batch_round_trips_the_routing_decision(pool: sqlx::PgPool) {
+        let cid = create_client(&pool, "classifier-columns").await;
+        let repo = UsageRepository::new(&pool);
+
+        // Served by `fast` for a request to the classified alias `auto`.
+        let mut classified = sample_insert(cid, "fast", 47, 2);
+        classified.requested_model = Some("auto".to_string());
+        classified.routing_reason = Some("classified".to_string());
+        classified.classifier_confidence = Some(0.9);
+        classified.classifier_latency_ms = Some(84);
+        classified.classifier_input_tokens = Some(31);
+        classified.classifier_model = Some("jev-1".to_string());
+        // The classifier timed out: a decision, but no answer to report.
+        let mut timed_out = sample_insert(cid, "smart", 100, 50);
+        timed_out.requested_model = Some("auto".to_string());
+        timed_out.routing_reason = Some("timeout".to_string());
+        timed_out.classifier_latency_ms = Some(50);
+        // A statically routed request.
+        let stat = sample_insert(cid, "fast", 10, 5);
+
+        repo.insert_batch(&[classified, timed_out, stat])
+            .await
+            .expect("insert ok");
+
+        let rows = repo
+            .list(UsageFilter {
+                client_id: cid,
+                ..Default::default()
+            })
+            .await
+            .expect("list ok");
+        assert_eq!(rows.len(), 3);
+        let by_prompt = |p: i32| {
+            rows.iter()
+                .find(|r| r.prompt_tokens == p)
+                .unwrap_or_else(|| panic!("row with prompt_tokens={p}"))
+        };
+
+        let row = by_prompt(47);
+        assert_eq!(row.model, "fast");
+        assert_eq!(row.requested_model.as_deref(), Some("auto"));
+        assert_eq!(row.routing_reason.as_deref(), Some("classified"));
+        assert_eq!(row.classifier_confidence, Some(0.9));
+        assert_eq!(row.classifier_latency_ms, Some(84));
+        assert_eq!(row.classifier_input_tokens, Some(31));
+        assert_eq!(row.classifier_model.as_deref(), Some("jev-1"));
+
+        let row = by_prompt(100);
+        assert_eq!(row.routing_reason.as_deref(), Some("timeout"));
+        assert_eq!(row.classifier_latency_ms, Some(50));
+        assert_eq!(row.classifier_confidence, None);
+        assert_eq!(row.classifier_input_tokens, None);
+        assert_eq!(row.classifier_model, None);
+
+        // NULL in every column: not a request to a classified alias.
+        let row = by_prompt(10);
+        assert_eq!(row.requested_model, None);
+        assert_eq!(row.routing_reason, None);
+        assert_eq!(row.classifier_confidence, None);
+        assert_eq!(row.classifier_latency_ms, None);
+        assert_eq!(row.classifier_input_tokens, None);
+        assert_eq!(row.classifier_model, None);
+    }
+
+    /// The classifier migration applies on a database that already holds
+    /// usage at the previous schema version, and leaves those rows `NULL`.
+    #[sqlx::test(migrations = false)]
+    async fn classifier_migration_applies_to_an_existing_database(pool: sqlx::PgPool) {
+        const CLASSIFIER_MIGRATION: i64 = 20240005000000;
+        let (before, after): (Vec<_>, Vec<_>) = crate::MIGRATOR
+            .iter()
+            .partition(|m| m.version < CLASSIFIER_MIGRATION);
+        assert_eq!(after.first().map(|m| m.version), Some(CLASSIFIER_MIGRATION));
+
+        for migration in before {
+            sqlx::raw_sql(&migration.sql)
+                .execute(&pool)
+                .await
+                .expect("earlier migration applies");
+        }
+        let cid = create_client(&pool, "pre-classifier").await;
+        sqlx::query(
+            "INSERT INTO usage_log (client_id, request_id, model, provider, prompt_tokens, \
+             completion_tokens, total_tokens) VALUES ($1, 'req-old', 'fast', 'openai', 10, 5, 15)",
+        )
+        .bind(cid)
+        .execute(&pool)
+        .await
+        .expect("row at the previous schema version");
+
+        for migration in after {
+            sqlx::raw_sql(&migration.sql)
+                .execute(&pool)
+                .await
+                .expect("classifier migration applies");
+        }
+
+        let repo = UsageRepository::new(&pool);
+        repo.insert_batch(&[sample_insert(cid, "fast", 20, 10)])
+            .await
+            .expect("insert after the migration");
+        let rows = repo
+            .list(UsageFilter {
+                client_id: cid,
+                ..Default::default()
+            })
+            .await
+            .expect("list ok");
+        assert_eq!(rows.len(), 2);
+        let old = rows.iter().find(|r| r.request_id == "req-old").unwrap();
+        assert_eq!(old.requested_model, None);
+        assert_eq!(old.routing_reason, None);
+        assert_eq!(old.classifier_confidence, None);
     }
 
     /// Decided behaviour for a gateway running against an unmigrated database:

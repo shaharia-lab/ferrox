@@ -21,6 +21,17 @@ pub struct UsageRecord {
     pub cache_write_tokens: Option<i32>,
     pub latency_ms: Option<i32>,
     pub created_at: DateTime<Utc>,
+    /// The routing decision of a request to a classified model alias: the
+    /// alias the client asked for (`model` is the one that served it), why it
+    /// was routed there, and what the classifier reported. `NULL` on a
+    /// statically routed request — and, for the last three, when the
+    /// classifier gave no answer.
+    pub requested_model: Option<String>,
+    pub routing_reason: Option<String>,
+    pub classifier_confidence: Option<f64>,
+    pub classifier_latency_ms: Option<i32>,
+    pub classifier_input_tokens: Option<i32>,
+    pub classifier_model: Option<String>,
 }
 
 /// Aggregated token usage for a client over a time period.

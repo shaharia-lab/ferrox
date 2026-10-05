@@ -10,7 +10,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use axum::body::Body;
-use axum::http::{Request, StatusCode};
+use axum::http::{HeaderMap, Request, StatusCode};
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 use tower::ServiceExt as _;
@@ -120,6 +120,18 @@ async fn post_with(
     classifier: Option<&str>,
     body: &Value,
 ) -> (StatusCode, String) {
+    let (status, _, body) = send(app, path, key, classifier, body).await;
+    (status, body)
+}
+
+/// [`post_with`], with the response headers.
+async fn send(
+    app: &axum::Router,
+    path: &str,
+    key: &str,
+    classifier: Option<&str>,
+    body: &Value,
+) -> (StatusCode, HeaderMap, String) {
     let mut request = Request::builder()
         .method("POST")
         .uri(path)
@@ -131,10 +143,17 @@ async fn post_with(
     let request = request.body(Body::from(body.to_string())).unwrap();
     let resp = app.clone().oneshot(request).await.unwrap();
     let status = resp.status();
+    let headers = resp.headers().clone();
     let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
         .await
         .unwrap();
-    (status, String::from_utf8(bytes.to_vec()).unwrap())
+    (status, headers, String::from_utf8(bytes.to_vec()).unwrap())
+}
+
+fn routed_model(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get("x-ferrox-routed-model")
+        .map(|v| v.to_str().unwrap())
 }
 
 /// The first `model` an answer reports: the JSON body's, or that of the
@@ -161,21 +180,24 @@ fn reported_model(body: &str, stream: bool) -> Option<String> {
 
 /// Request `auto` on every surface, streaming and not, and check which alias
 /// and provider served it.
-async fn assert_auto_is_served_by(reply: Answer, alias: &str, provider: &str) {
+async fn assert_auto_is_served_by(reply: Answer, alias: &str, provider: &str, reason: &str) {
     for surface in &SURFACES {
         for stream in [false, true] {
             let case = format!("{} stream={stream} {reply:?}", surface.path);
             let mut gateway = gateway(reply.clone());
 
-            let (status, body) = post(
+            let (status, headers, body) = send(
                 &gateway.app,
                 surface.path,
                 "sk-all",
+                None,
                 &(surface.body)("auto", stream),
             )
             .await;
             assert_eq!(status, StatusCode::OK, "{case}: {body}");
             assert_eq!(gateway.classifier.calls(), 1, "{case}");
+            // The client is told which alias answered.
+            assert_eq!(routed_model(&headers), Some(alias), "{case}");
 
             // The classifier saw the conversation, whatever the surface.
             let (input, _) = gateway.classifier.seen().expect(&case);
@@ -186,6 +208,22 @@ async fn assert_auto_is_served_by(reply: Answer, alias: &str, provider: &str) {
             let usage = gateway.usage_rx.recv().await.expect(&case);
             assert_eq!(usage.model, alias, "{case}");
             assert_eq!(usage.provider, provider, "{case}");
+            // ... with the alias that was asked for, and why it went there.
+            assert_eq!(usage.requested_model.as_deref(), Some("auto"), "{case}");
+            assert_eq!(usage.routing_reason, Some(reason), "{case}");
+            assert!(usage.classifier_latency_ms.is_some(), "{case}");
+            let answered = matches!(reply, Answer::Tier(..));
+            assert_eq!(usage.classifier_confidence.is_some(), answered, "{case}");
+            assert_eq!(
+                usage.classifier_input_tokens,
+                answered.then_some(3),
+                "{case}"
+            );
+            assert_eq!(
+                usage.classifier_model.as_deref(),
+                answered.then_some("fake-1"),
+                "{case}"
+            );
 
             let expected = if stream {
                 (surface.stream_model)(provider)
@@ -199,13 +237,19 @@ async fn assert_auto_is_served_by(reply: Answer, alias: &str, provider: &str) {
 
 #[tokio::test]
 async fn a_classified_alias_is_served_by_the_chosen_tiers_pool() {
-    assert_auto_is_served_by(Answer::Tier("simple", Some(0.9)), "fast", "fast-up").await;
+    assert_auto_is_served_by(
+        Answer::Tier("simple", Some(0.9)),
+        "fast",
+        "fast-up",
+        "classified",
+    )
+    .await;
 }
 
 #[tokio::test]
 async fn a_failing_classifier_serves_the_fallback_pool() {
     let failed = ClassifierError::Failed("upstream said 529".to_string());
-    assert_auto_is_served_by(Answer::Fail(failed), "smart", "smart-up").await;
+    assert_auto_is_served_by(Answer::Fail(failed), "smart", "smart-up", "error").await;
 }
 
 /// `allowed_models` is checked against the requested alias only: a key
@@ -260,26 +304,58 @@ async fn a_key_not_allowed_the_classified_alias_is_refused_before_the_classifier
     }
 }
 
+/// A statically routed alias answers exactly as it did before classifiers:
+/// no routed-model header, no routing decision in its usage.
 #[tokio::test]
 async fn a_static_alias_never_reaches_the_classifier() {
     for surface in &SURFACES {
-        let mut gateway = gateway(Answer::Tier("complex", Some(0.9)));
+        for stream in [false, true] {
+            let case = format!("{} stream={stream}", surface.path);
+            let mut gateway = gateway(Answer::Tier("complex", Some(0.9)));
 
-        let (status, body) = post(
+            let (status, headers, body) = send(
+                &gateway.app,
+                surface.path,
+                "sk-all",
+                None,
+                &(surface.body)("fast", stream),
+            )
+            .await;
+
+            assert_eq!(status, StatusCode::OK, "{case}: {body}");
+            assert_eq!(routed_model(&headers), None, "{case}");
+            assert_eq!(gateway.classifier.calls(), 0, "{case}");
+            let usage = gateway.usage_rx.recv().await.unwrap();
+            assert_eq!(
+                (usage.model.as_str(), usage.provider.as_str()),
+                ("fast", "fast-up"),
+                "{case}"
+            );
+            assert_eq!(usage.requested_model, None, "{case}");
+            assert_eq!(usage.routing_reason, None, "{case}");
+            assert_eq!(usage.classifier_confidence, None, "{case}");
+            assert_eq!(usage.classifier_latency_ms, None, "{case}");
+            assert_eq!(usage.classifier_input_tokens, None, "{case}");
+            assert_eq!(usage.classifier_model, None, "{case}");
+        }
+    }
+}
+
+/// The header reports a served request: a refused one carries none.
+#[tokio::test]
+async fn an_error_response_carries_no_routed_model_header() {
+    for surface in &SURFACES {
+        let gateway = gateway(Answer::Tier("simple", Some(0.9)));
+        let (status, headers, _) = send(
             &gateway.app,
             surface.path,
-            "sk-all",
-            &(surface.body)("fast", false),
+            "sk-fast",
+            None,
+            &(surface.body)("auto", false),
         )
         .await;
-
-        assert_eq!(status, StatusCode::OK, "{}: {body}", surface.path);
-        assert_eq!(gateway.classifier.calls(), 0, "{}", surface.path);
-        let usage = gateway.usage_rx.recv().await.unwrap();
-        assert_eq!(
-            (usage.model.as_str(), usage.provider.as_str()),
-            ("fast", "fast-up")
-        );
+        assert_eq!(status, StatusCode::FORBIDDEN, "{}", surface.path);
+        assert_eq!(routed_model(&headers), None, "{}", surface.path);
     }
 }
 

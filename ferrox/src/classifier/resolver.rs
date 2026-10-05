@@ -6,7 +6,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context as _};
-use axum::http::HeaderMap;
+use axum::http::{HeaderMap, HeaderValue};
+use axum::response::Response;
 use sha2::Sha256;
 
 use super::cache::{self, DecisionCache};
@@ -18,6 +19,14 @@ use crate::error::ProxyError;
 use crate::lb::circuit_breaker::CircuitBreaker;
 use crate::lb::RoutePool;
 use crate::router::ModelRouter;
+use crate::telemetry::metrics::{CLASSIFIER_DECISIONS_TOTAL, CLASSIFIER_DURATION_SECONDS};
+
+/// Response header naming the alias that served a request to a classified
+/// alias.
+pub const ROUTED_MODEL_HEADER: &str = "x-ferrox-routed-model";
+
+/// The `tier` label of a decision with no configured tier to name.
+const NO_TIER: &str = "none";
 
 /// Request header a client sets to [`SKIP_CLASSIFIER`] to have a classified
 /// alias served by its `fallback_alias` without the classifier being called.
@@ -88,6 +97,25 @@ pub struct ClassificationRecord {
     pub cached: bool,
 }
 
+/// The routing decision for a request to a classified alias, as the usage
+/// row and the `token_usage` webhook record it. Owned, so it outlives the
+/// [`RouteDecision`] it was read from.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RoutingRecord {
+    /// The classified alias the client asked for.
+    pub requested_model: String,
+    /// [`Reason::as_str`].
+    pub reason: &'static str,
+    /// The classifier's confidence, when it answered with a finite one.
+    pub confidence: Option<f64>,
+    /// Time spent on classification, input extraction included.
+    pub latency_ms: u64,
+    /// Tokens the classifier billed, when it answered.
+    pub input_tokens: Option<u32>,
+    /// The classifier model that answered, when one did.
+    pub model: Option<String>,
+}
+
 /// The outcome of resolving a requested alias.
 pub struct RouteDecision<'a> {
     /// The alias the client asked for. Authorization is checked against it.
@@ -104,6 +132,35 @@ impl RouteDecision<'_> {
     /// to. Logs, metrics and usage are recorded under it.
     pub fn served_alias(&self) -> &str {
         &self.pool.alias
+    }
+
+    /// What the usage row and the webhook record about this decision. `None`
+    /// for a statically routed alias, which allocates nothing.
+    pub fn routing_record(&self) -> Option<RoutingRecord> {
+        let record = self.classification.as_ref()?;
+        let answer = record.classification.as_ref();
+        Some(RoutingRecord {
+            requested_model: self.requested_alias.to_string(),
+            reason: record.reason.as_str(),
+            // JSON has no NaN or infinity: such a confidence is not recorded.
+            confidence: answer.and_then(|c| c.confidence).filter(|c| c.is_finite()),
+            latency_ms: record.latency.as_millis() as u64,
+            input_tokens: answer.map(|c| c.input_tokens),
+            model: answer.map(|c| c.model.clone()),
+        })
+    }
+
+    /// Name the served alias in [`ROUTED_MODEL_HEADER`] on a successful
+    /// response to a classified alias. A statically routed alias's response
+    /// is returned untouched, as is one whose served alias cannot be a
+    /// header value.
+    pub fn with_routed_model_header(&self, mut response: Response) -> Response {
+        if self.classification.is_some() {
+            if let Ok(alias) = HeaderValue::from_str(self.served_alias()) {
+                response.headers_mut().insert(ROUTED_MODEL_HEADER, alias);
+            }
+        }
+        response
     }
 
     /// Log the classifier's part in this decision. Silent for a statically
@@ -133,6 +190,8 @@ impl RouteDecision<'_> {
 
 /// A classified alias, with everything a request needs resolved at startup.
 struct ClassifiedRoute {
+    /// `classifiers[].id` of the backend, the `classifier` metric label.
+    classifier_id: String,
     classifier: Arc<dyn Classifier>,
     /// The classifier's breaker, shared by every alias that uses it.
     breaker: Arc<CircuitBreaker>,
@@ -217,17 +276,41 @@ impl ClassifiedRoute {
         cached: bool,
     ) -> RouteDecision<'a> {
         let (pool, reason, classification, error) = self.decide(outcome);
-        RouteDecision {
-            requested_alias: alias,
-            pool,
-            classification: Some(ClassificationRecord {
-                reason,
-                classification,
-                error,
-                latency: start.elapsed(),
-                cached,
-            }),
-        }
+        // Every label is bounded: the alias and the tier names come from the
+        // config, the reason is a fixed set. An `unknown_choice` answer
+        // carries a string the backend made up, which must not become one.
+        let tier = classification
+            .as_ref()
+            .and_then(|answer| self.tiers.iter().find(|t| t.name == answer.tier))
+            .map_or(NO_TIER, |t| t.name.as_str());
+        let record = ClassificationRecord {
+            reason,
+            classification,
+            error,
+            latency: start.elapsed(),
+            cached,
+        };
+        counted_decision(alias, pool, tier, record)
+    }
+}
+
+/// The decision for a request to the classified alias `alias`, counted in
+/// `ferrox_classifier_decisions_total`: the one place such a decision is
+/// built, so none goes uncounted. `tier` is a configured tier's name or
+/// [`NO_TIER`].
+fn counted_decision<'a>(
+    alias: &'a str,
+    pool: Arc<RoutePool>,
+    tier: &str,
+    record: ClassificationRecord,
+) -> RouteDecision<'a> {
+    CLASSIFIER_DECISIONS_TOTAL
+        .with_label_values(&[alias, tier, record.reason.as_str()])
+        .inc();
+    RouteDecision {
+        requested_alias: alias,
+        pool,
+        classification: Some(record),
     }
 }
 
@@ -335,6 +418,7 @@ impl RouteResolver {
             classified.insert(
                 model.alias.clone(),
                 ClassifiedRoute {
+                    classifier_id: settings.id.clone(),
                     classifier,
                     breaker: breakers[settings.id.as_str()].clone(),
                     cache: caches.get(settings.id.as_str()).cloned(),
@@ -399,17 +483,19 @@ impl RouteResolver {
         // Before the breaker and the input: an opted-out request costs
         // neither, and says nothing about the classifier's health.
         if skip_classifier {
-            return Ok(RouteDecision {
-                requested_alias: alias,
-                pool: route.fallback.clone(),
-                classification: Some(ClassificationRecord {
-                    reason: Reason::OptOut,
-                    classification: None,
-                    error: None,
-                    latency: start.elapsed(),
-                    cached: false,
-                }),
-            });
+            let record = ClassificationRecord {
+                reason: Reason::OptOut,
+                classification: None,
+                error: None,
+                latency: start.elapsed(),
+                cached: false,
+            };
+            return Ok(counted_decision(
+                alias,
+                route.fallback.clone(),
+                NO_TIER,
+                record,
+            ));
         }
         // With a decision cache the input comes first, because the key is
         // made from it: an answer already given is served whatever state the
@@ -449,10 +535,16 @@ impl RouteResolver {
             Err(ClassifierError::NoInput)
         } else if let Some(permit) = route.breaker.try_acquire() {
             let answer = route.classifier.classify(&input, &route.tiers);
+            // The call alone: a request the classifier was never asked about
+            // (breaker open, nothing to classify) is not a classifier latency.
+            let called = Instant::now();
             let outcome = match tokio::time::timeout(route.timeout, answer).await {
                 Ok(outcome) => outcome,
                 Err(_) => Err(ClassifierError::Timeout),
             };
+            CLASSIFIER_DURATION_SECONDS
+                .with_label_values(&[route.classifier_id.as_str()])
+                .observe(called.elapsed().as_secs_f64());
             match &outcome {
                 // An answer nobody can use is still a classifier that works.
                 Ok(_) | Err(ClassifierError::UnknownChoice) => permit.success(),
@@ -948,6 +1040,244 @@ mod tests {
         assert_eq!(expired.served_alias(), "fast");
         assert!(!expired.classification.unwrap().cached);
         assert_eq!(classifier.calls(), 2);
+    }
+
+    /// `gateway_config` with the classified alias renamed, so a test owns
+    /// the `ferrox_classifier_decisions_total` series it asserts on.
+    fn config_with_alias(alias: &str) -> Config {
+        let mut config = gateway_config(json!({}));
+        let auto = config
+            .models
+            .iter_mut()
+            .find(|m| m.alias == "auto")
+            .unwrap();
+        auto.alias = alias.to_string();
+        config
+    }
+
+    fn decisions(alias: &str, tier: &str, reason: Reason) -> f64 {
+        CLASSIFIER_DECISIONS_TOTAL
+            .with_label_values(&[alias, tier, reason.as_str()])
+            .get()
+    }
+
+    /// Every `tier` label value recorded for `alias`, as a scrape shows them.
+    fn tier_labels(alias: &str) -> Vec<String> {
+        let mut tiers: Vec<String> = crate::telemetry::metrics::gather()
+            .lines()
+            .filter(|l| l.starts_with("ferrox_classifier_decisions_total{"))
+            .filter(|l| l.contains(&format!(r#"alias="{alias}""#)))
+            .filter_map(|l| l.split(r#"tier=""#).nth(1)?.split('"').next())
+            .map(str::to_string)
+            .collect();
+        tiers.sort_unstable();
+        tiers.dedup();
+        tiers
+    }
+
+    /// The `tier` label is a configured tier name or `none`, never a string
+    /// the backend made up; each decision counts once under its reason.
+    #[tokio::test]
+    async fn decisions_are_counted_with_bounded_labels() {
+        let alias = "auto-metric-labels";
+        let config = config_with_alias(alias);
+        let cases = [
+            (
+                Answer::Tier("simple", Some(0.9)),
+                "simple",
+                Reason::Classified,
+            ),
+            // The classifier named the tier, though it was not followed.
+            (
+                Answer::Tier("simple", Some(0.1)),
+                "simple",
+                Reason::LowConfidence,
+            ),
+            (
+                Answer::Tier("made-up-by-the-backend", Some(0.9)),
+                "none",
+                Reason::UnknownChoice,
+            ),
+            (
+                Answer::Fail(ClassifierError::UnknownChoice),
+                "none",
+                Reason::UnknownChoice,
+            ),
+            (
+                Answer::Fail(ClassifierError::Timeout),
+                "none",
+                Reason::Timeout,
+            ),
+            (
+                Answer::Fail(ClassifierError::Failed("boom".to_string())),
+                "none",
+                Reason::Error,
+            ),
+        ];
+        let mut expected: HashMap<(&str, &str), f64> = HashMap::new();
+        for (reply, tier, reason) in cases {
+            let classifier = FakeClassifier::new(reply.clone());
+            let resolver = resolver_for(&config, &classifier);
+            resolver.resolve(alias, false, input).await.unwrap();
+
+            let count = expected.entry((tier, reason.as_str())).or_default();
+            *count += 1.0;
+            assert_eq!(decisions(alias, tier, reason), *count, "{reply:?}");
+        }
+
+        assert_eq!(tier_labels(alias), ["none", "simple"]);
+        // A statically routed alias is not a classifier decision.
+        let classifier = FakeClassifier::new(Answer::Tier("simple", Some(0.9)));
+        resolver_for(&config, &classifier)
+            .resolve("fast", false, input)
+            .await
+            .unwrap();
+        assert!(tier_labels("fast").is_empty());
+    }
+
+    /// An opt-out, a shadow answer and a cached answer are decisions like
+    /// any other: counted under their reason and recorded with the request.
+    #[tokio::test]
+    async fn an_opt_out_a_shadow_and_a_cache_hit_are_counted_and_recorded() {
+        let alias = "auto-metric-modes";
+        let classifier = FakeClassifier::new(Answer::Tier("simple", Some(0.9)));
+
+        let resolver = resolver_for(&config_with_alias(alias), &classifier);
+        let decision = resolver.resolve(alias, true, input).await.unwrap();
+        assert_eq!(decisions(alias, "none", Reason::OptOut), 1.0);
+        let record = decision.routing_record().unwrap();
+        assert_eq!(record.reason, "opt_out");
+        assert_eq!(
+            (record.confidence, record.input_tokens, record.model),
+            (None, None, None)
+        );
+
+        // The second identical request is answered from the cache: counted
+        // again, and recorded with the tokens this request was billed — none.
+        let fresh = resolver.resolve(alias, false, input).await.unwrap();
+        assert_eq!(fresh.routing_record().unwrap().input_tokens, Some(3));
+        let hit = resolver.resolve(alias, false, input).await.unwrap();
+        assert!(hit.classification.as_ref().unwrap().cached);
+        assert_eq!(classifier.calls(), 1);
+        assert_eq!(decisions(alias, "simple", Reason::Classified), 2.0);
+        let record = hit.routing_record().unwrap();
+        assert_eq!(record.reason, "classified");
+        assert_eq!(record.input_tokens, Some(0));
+        assert_eq!(record.model.as_deref(), Some("fake-1"));
+
+        // Shadow mode names the tier that would have served the request.
+        let resolver = resolver_for(&shadowed(config_with_alias(alias)), &classifier);
+        let decision = resolver.resolve(alias, false, input).await.unwrap();
+        assert_eq!(decision.served_alias(), "smart");
+        assert_eq!(decisions(alias, "simple", Reason::Shadow), 1.0);
+        assert_eq!(decision.routing_record().unwrap().reason, "shadow");
+    }
+
+    /// The duration histogram times the classifier call: a request the
+    /// classifier was never asked about adds no sample.
+    #[tokio::test]
+    async fn only_a_call_to_the_classifier_is_timed() {
+        let id = "timed-classifier";
+        // Its own classifier id, so the series is this test's alone.
+        let mut config = gateway_config(json!({}));
+        config.classifiers[0].id = id.to_string();
+        let auto = config
+            .models
+            .iter_mut()
+            .find(|m| m.alias == "auto")
+            .unwrap();
+        auto.classifier.as_mut().unwrap().classifier = id.to_string();
+        let samples = || {
+            CLASSIFIER_DURATION_SECONDS
+                .with_label_values(&[id])
+                .get_sample_count()
+        };
+        let classifier = FakeClassifier::new(Answer::Hang);
+        let providers = Upstream::registry();
+        let router = ModelRouter::from_config(&config, &providers).unwrap();
+        let backend: Arc<dyn Classifier> = classifier.clone();
+        let registry = ClassifierRegistry::from([(id.to_string(), backend)]);
+        let resolver = RouteResolver::from_config(&config, router, &registry).unwrap();
+
+        resolver
+            .resolve("auto", false, |_| ClassifierInput::default())
+            .await
+            .unwrap();
+        assert_eq!(samples(), 0, "nothing to classify");
+
+        // A timed-out call is a classifier latency too.
+        let decision = resolver.resolve("auto", false, input).await.unwrap();
+        assert_eq!(decision.classification.unwrap().reason, Reason::Timeout);
+        assert_eq!(samples(), 1);
+    }
+
+    #[tokio::test]
+    async fn the_routing_record_carries_what_the_classifier_reported() {
+        let classifier = FakeClassifier::new(Answer::Tier("simple", Some(0.9)));
+        let decision = resolver(&classifier)
+            .resolve("auto", false, input)
+            .await
+            .unwrap();
+        let record = decision.routing_record().unwrap();
+        assert_eq!(record.requested_model, "auto");
+        assert_eq!(record.reason, "classified");
+        assert_eq!(record.confidence, Some(0.9));
+        assert_eq!(record.input_tokens, Some(3));
+        assert_eq!(record.model.as_deref(), Some("fake-1"));
+        assert_eq!(
+            record.latency_ms,
+            decision.classification.unwrap().latency.as_millis() as u64
+        );
+
+        // No answer: only the request, the reason and the time spent.
+        let classifier = FakeClassifier::new(Answer::Fail(ClassifierError::Timeout));
+        let decision = resolver(&classifier)
+            .resolve("auto", false, input)
+            .await
+            .unwrap();
+        let record = decision.routing_record().unwrap();
+        assert_eq!(record.reason, "timeout");
+        assert_eq!(
+            (record.confidence, record.input_tokens, record.model),
+            (None, None, None)
+        );
+
+        // A confidence JSON cannot carry is not recorded.
+        let classifier = FakeClassifier::new(Answer::Tier("simple", Some(f64::NAN)));
+        let decision = resolver(&classifier)
+            .resolve("auto", false, input)
+            .await
+            .unwrap();
+        let record = decision.routing_record().unwrap();
+        assert_eq!(record.reason, "low_confidence");
+        assert_eq!(record.confidence, None);
+        assert_eq!(record.model.as_deref(), Some("fake-1"));
+
+        let decision = resolver(&classifier)
+            .resolve("fast", false, input)
+            .await
+            .unwrap();
+        assert_eq!(decision.routing_record(), None);
+    }
+
+    #[tokio::test]
+    async fn the_routed_model_header_is_set_for_a_classified_alias_only() {
+        let classifier = FakeClassifier::new(Answer::Tier("simple", Some(0.9)));
+        let resolver = resolver(&classifier);
+        let header = |response: Response| {
+            response
+                .headers()
+                .get(ROUTED_MODEL_HEADER)
+                .map(|v| v.to_str().unwrap().to_string())
+        };
+
+        let decision = resolver.resolve("auto", false, input).await.unwrap();
+        let response = decision.with_routed_model_header(Response::default());
+        assert_eq!(header(response).as_deref(), Some("fast"));
+
+        let decision = resolver.resolve("fast", false, input).await.unwrap();
+        let response = decision.with_routed_model_header(Response::default());
+        assert_eq!(header(response), None);
     }
 
     #[tokio::test]

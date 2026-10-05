@@ -74,7 +74,9 @@ use crate::types::RequestContext;
             API `response` object), or an SSE stream of typed `response.*` events ending in \
             exactly one of `response.completed` / `response.incomplete` / `response.failed` \
             when `stream=true` (no `[DONE]` sentinel). From a `responses: native` provider, \
-            the upstream's own body or events, passed through."),
+            the upstream's own body or events, passed through.",
+            headers(("x-ferrox-routed-model" = String, description = "The statically routed \
+                alias that served the request. Only present when `model` is a classified alias."))),
         (status = 400, description = "Malformed body, or a stateful / unsupported feature \
             (`previous_response_id`, `conversation`, `prompt`, `background`; `store: true` \
             on an alias with a native target; hosted built-in tools, `input_file` and \
@@ -152,9 +154,12 @@ pub async fn responses(
             start,
             Surface::Responses,
         )
+        .with_routing(decision.routing_record())
     };
 
-    if req.is_streaming() {
+    // Every successful answer below, native or translated, streamed or not,
+    // leaves through the one place that names the served alias.
+    let response: Result<Response, ProxyError> = if req.is_streaming() {
         let served = dispatch(
             pool,
             retry_config,
@@ -260,7 +265,8 @@ pub async fn responses(
                 Err(e)
             }
         }
-    }
+    };
+    response.map(|response| decision.with_routed_model_header(response))
 }
 
 /// What one attempt produced: the upstream's own Responses answer, or a chat
