@@ -182,6 +182,7 @@ async fn an_error_status_fails_without_a_retry() {
     let cases = [
         (401, failed(401)),
         (422, failed(422)),
+        (408, unavailable(408)),
         (429, unavailable(429)),
         (529, unavailable(529)),
     ];
@@ -271,6 +272,25 @@ fn a_key_that_cannot_be_a_header_fails_at_startup() {
         err.to_string(),
         "Classifier 'jev-main': api_key is not a valid HTTP header value"
     );
+}
+
+#[test]
+fn a_base_url_that_is_not_http_fails_at_startup() {
+    for base_url in [
+        "api.typesafe.ai",
+        "ftp://api.typesafe.ai",
+        "https://api typesafe",
+    ] {
+        let err = JevClassifier::new(&config(base_url), reqwest::Client::new())
+            .err()
+            .expect(base_url);
+
+        assert_eq!(
+            err.to_string(),
+            "Classifier 'jev-main': base_url is not a valid http(s) URL",
+            "{base_url}"
+        );
+    }
 }
 
 /// Jev's 422 body is a FastAPI error list that echoes the request, `state`
@@ -421,6 +441,82 @@ async fn only_an_unavailable_classifier_trips_the_breaker() {
         }
         assert_eq!(calls(&server).await, 3, "{reason:?}");
     }
+}
+
+/// A probe that comes back with a rejected key says nothing about whether
+/// the classifier is up: the breaker stays half-open and the next request
+/// probes again.
+#[tokio::test]
+async fn a_probe_that_is_rejected_leaves_the_breaker_half_open() {
+    let server = server(ResponseTemplate::new(529)).await;
+    let resolver = resolver(
+        &server,
+        json!({"circuit_breaker": {
+            "failure_threshold": 1, "success_threshold": 1, "recovery_timeout_secs": 0
+        }}),
+    );
+    assert_eq!(resolve(&resolver).await.0, Reason::Error);
+
+    server.reset().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(401))
+        .mount(&server)
+        .await;
+    for _ in 0..3 {
+        assert_eq!(resolve(&resolver).await.0, Reason::Error);
+    }
+    assert_eq!(calls(&server).await, 3);
+
+    server.reset().await;
+    Mock::given(method("POST"))
+        .respond_with(chose("simple"))
+        .mount(&server)
+        .await;
+    assert_eq!(resolve(&resolver).await.0, Reason::Classified);
+}
+
+/// One breaker per classifier: failures seen through one alias keep every
+/// alias using that classifier from calling it.
+#[tokio::test]
+async fn aliases_sharing_a_classifier_share_its_breaker() {
+    let server = server(ResponseTemplate::new(529)).await;
+    let mut config = gateway_config(json!({
+        "base_url": server.uri(),
+        "circuit_breaker": {"failure_threshold": 1, "recovery_timeout_secs": 30},
+    }));
+    let mut second = config.models.last().unwrap().clone();
+    second.alias = "auto-2".to_string();
+    config.models.push(second);
+    let router = ModelRouter::from_config(&config, &Upstream::registry()).unwrap();
+    let resolver = RouteResolver::build(&config, router).unwrap();
+
+    assert_eq!(resolve(&resolver).await.0, Reason::Error);
+
+    let decision = resolver.resolve("auto-2", input).await.unwrap();
+    assert_eq!(decision.served_alias(), "smart");
+    assert_eq!(decision.classification.unwrap().reason, Reason::BreakerOpen);
+    assert_eq!(calls(&server).await, 1);
+}
+
+/// With the breaker open a request is not even read for its text.
+#[tokio::test]
+async fn an_open_breaker_skips_input_extraction() {
+    let server = server(ResponseTemplate::new(529)).await;
+    let resolver = resolver(
+        &server,
+        json!({"circuit_breaker": {"failure_threshold": 1, "recovery_timeout_secs": 30}}),
+    );
+    assert_eq!(resolve(&resolver).await.0, Reason::Error);
+
+    let decision = resolver
+        .resolve("auto", |_| panic!("an open breaker must not extract input"))
+        .await
+        .unwrap();
+
+    assert_eq!(decision.served_alias(), "smart");
+    let record = decision.classification.unwrap();
+    assert_eq!(record.reason, Reason::BreakerOpen);
+    assert_eq!(record.error, Some(ClassifierError::BreakerOpen));
 }
 
 /// The real API, with the key in `TYPESAFE_API_KEY`:

@@ -74,7 +74,7 @@ pub enum ClassifierError {
     #[error("classifier chose an option that was not offered")]
     UnknownChoice,
     /// The classifier could not be reached or is overloaded (a connection
-    /// error, HTTP 429 or 5xx). Counts against its circuit breaker, as a
+    /// error, HTTP 408, 429 or 5xx). Counts against its circuit breaker, as a
     /// timeout does.
     #[error("{0}")]
     Unavailable(String),

@@ -35,7 +35,7 @@ pub struct JevClassifier {
     /// The id of the `classifiers` entry, for logs.
     id: String,
     client: reqwest::Client,
-    url: String,
+    url: reqwest::Url,
     /// `Bearer <api_key>`, marked sensitive so it is never printed.
     authorization: HeaderValue,
     model: String,
@@ -52,10 +52,20 @@ impl JevClassifier {
                 )
             })?;
         authorization.set_sensitive(true);
+        let url = format!("{}/v1/systemone", config.base_url.trim_end_matches('/'));
+        let url = reqwest::Url::parse(&url)
+            .ok()
+            .filter(|url| matches!(url.scheme(), "http" | "https"))
+            .with_context(|| {
+                format!(
+                    "Classifier '{}': base_url is not a valid http(s) URL",
+                    config.id
+                )
+            })?;
         Ok(Self {
             id: config.id.clone(),
             client,
-            url: format!("{}/v1/systemone", config.base_url.trim_end_matches('/')),
+            url,
             authorization,
             model: config.model.clone(),
         })
@@ -63,6 +73,15 @@ impl JevClassifier {
 
     /// The failure for a request that got no complete response.
     fn unreachable(&self, error: &reqwest::Error, message: &'static str) -> ClassifierError {
+        // The request could not even be built: no later call will fare
+        // better, so this is not an outage.
+        if error.is_builder() {
+            tracing::error!(
+                classifier = %self.id,
+                "Classifier request could not be built; check its configuration"
+            );
+            return ClassifierError::Failed("classifier request could not be built".to_string());
+        }
         let kind = if error.is_connect() {
             "connect"
         } else if error.is_timeout() {
@@ -84,7 +103,10 @@ impl JevClassifier {
             .get(REQUEST_ID_HEADER)
             .and_then(|v| v.to_str().ok());
         let message = format!("classifier returned HTTP {}", status.as_u16());
-        if status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
+        let unavailable = status == StatusCode::TOO_MANY_REQUESTS
+            || status == StatusCode::REQUEST_TIMEOUT
+            || status.is_server_error();
+        if unavailable {
             tracing::warn!(
                 classifier = %self.id,
                 status = status.as_u16(),
@@ -124,7 +146,7 @@ impl Classifier for JevClassifier {
         };
         let response = self
             .client
-            .post(&self.url)
+            .post(self.url.clone())
             .header(AUTHORIZATION, self.authorization.clone())
             .json(&request)
             .send()

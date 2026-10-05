@@ -165,6 +165,29 @@ impl ClassifiedRoute {
     }
 }
 
+impl ClassifiedRoute {
+    /// The decision for a request to `alias` whose classification, begun at
+    /// `start`, ended in `outcome`.
+    fn decision<'a>(
+        &self,
+        alias: &'a str,
+        outcome: Result<Classification, ClassifierError>,
+        start: Instant,
+    ) -> RouteDecision<'a> {
+        let (pool, reason, classification, error) = self.decide(outcome);
+        RouteDecision {
+            requested_alias: alias,
+            pool,
+            classification: Some(ClassificationRecord {
+                reason,
+                classification,
+                error,
+                latency: start.elapsed(),
+            }),
+        }
+    }
+}
+
 /// Resolves a requested model alias to the pool that serves it.
 ///
 /// A statically routed alias resolves exactly as [`ModelRouter::resolve`]
@@ -289,7 +312,14 @@ impl RouteResolver {
         };
 
         let start = Instant::now();
-        let input = input(route.max_input_chars);
+        // Asked before the input is built: an open breaker costs a request
+        // no extraction either. Reads only, so nothing is claimed for a
+        // request that then has nothing to classify.
+        let input = if route.breaker.can_serve() {
+            input(route.max_input_chars)
+        } else {
+            return Ok(route.decision(alias, Err(ClassifierError::BreakerOpen), start));
+        };
         let outcome = if input.turns.is_empty() {
             Err(ClassifierError::NoInput)
         } else if let Some(permit) = route.breaker.try_acquire() {
@@ -310,18 +340,7 @@ impl RouteResolver {
         } else {
             Err(ClassifierError::BreakerOpen)
         };
-        let (pool, reason, classification, error) = route.decide(outcome);
-
-        Ok(RouteDecision {
-            requested_alias: alias,
-            pool,
-            classification: Some(ClassificationRecord {
-                reason,
-                classification,
-                error,
-                latency: start.elapsed(),
-            }),
-        })
+        Ok(route.decision(alias, outcome, start))
     }
 }
 
