@@ -84,11 +84,12 @@ mod tests {
 
         let registry: ProviderRegistry = HashMap::new();
         let router = ModelRouter::from_config(&config, &registry).unwrap();
+        let resolver = crate::classifier::RouteResolver::build(&config, router).unwrap();
         let jwks_cache = JwksCache::new(vec![], 300, reqwest::Client::new());
 
         AppState {
             rate_limit_backend: Arc::new(MemoryBackend::new()),
-            router: Arc::new(router),
+            resolver: Arc::new(resolver),
             providers: Arc::new(registry),
             metrics: Arc::new(Metrics::new()),
             ready: Arc::new(AtomicBool::new(true)),

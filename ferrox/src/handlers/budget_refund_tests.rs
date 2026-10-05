@@ -121,6 +121,7 @@ impl Gateway {
             .await
             .unwrap();
         let router = crate::router::ModelRouter::from_config(&config, &registry).unwrap();
+        let resolver = crate::classifier::RouteResolver::build(&config, router).unwrap();
         let jwks_cache = crate::jwks::JwksCache::new(
             config.trusted_issuers.clone(),
             300,
@@ -137,7 +138,7 @@ impl Gateway {
         let budget = Arc::new(RecordingBudget::default());
         let state = AppState {
             rate_limit_backend: Arc::new(crate::ratelimit::MemoryBackend::new()),
-            router: Arc::new(router),
+            resolver: Arc::new(resolver),
             providers: Arc::new(registry),
             metrics: Arc::new(crate::metrics::Metrics::new()),
             ready: Arc::new(AtomicBool::new(true)),

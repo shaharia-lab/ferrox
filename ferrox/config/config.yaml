@@ -185,8 +185,8 @@ models:
 # A classified alias has a `classifier` block instead of `routing`: a
 # classifier looks at each request and picks one of the listed tiers. Every
 # tier and the fallback must be a statically routed alias from `models`.
-# NOTE: this configuration is validated at startup, but classification is not
-# wired into request handling yet — a classified alias answers 404 for now.
+# NOTE: the `jev` backend is not built in yet, so for now every request to a
+# classified alias is served by its `fallback_alias`.
 # ─────────────────────────────────────────
 # classifiers:
 #   - id: jev-main

@@ -15,6 +15,7 @@ use ferrox_providers::responses_emitter::{
 use futures::StreamExt;
 
 use crate::budget_enforcer::BudgetReservation;
+use crate::classifier::ClassifierInput;
 use crate::config::RetryConfig;
 use crate::error::ProxyError;
 use crate::handlers::finalize::{record_error_metrics, RequestFinalizer, Surface};
@@ -58,12 +59,20 @@ pub async fn chat_completions(
         )));
     }
 
-    let pool = state.router.resolve(&req.model)?;
+    let decision = state
+        .resolver
+        .resolve(&req.model, |max_input_chars| {
+            ClassifierInput::from_chat(&req, max_input_chars)
+        })
+        .await?;
+    decision.log_classification(&ctx.request_id);
+    let pool = &decision.pool;
+    let model_alias = decision.served_alias();
 
     tracing::info!(
         request_id = %ctx.request_id,
         key_name = %ctx.key_name,
-        model_alias = %req.model,
+        model_alias = %model_alias,
         streaming = req.is_streaming(),
         "Dispatching request"
     );
@@ -71,13 +80,13 @@ pub async fn chat_completions(
     let retry_config = &state.config.defaults.retry;
 
     if req.is_streaming() {
-        match dispatch_stream(&pool, &req, retry_config).await {
+        match dispatch_stream(pool, &req, retry_config).await {
             Ok((stream, provider_name, model_id)) => {
                 let finalizer = RequestFinalizer::new(
                     &state,
                     &ctx,
                     reservation.map(|Extension(r)| r),
-                    req.model.clone(),
+                    model_alias.to_string(),
                     provider_name,
                     model_id,
                     start,
@@ -106,19 +115,19 @@ pub async fn chat_completions(
                     .into_response())
             }
             Err(e) => {
-                record_error_metrics(&req.model, "", &e, start);
+                record_error_metrics(model_alias, "", &e, start);
                 Err(e)
             }
         }
     } else {
-        match dispatch_non_stream(&pool, &req, retry_config).await {
+        match dispatch_non_stream(pool, &req, retry_config).await {
             Ok((mut resp, provider_name, model_id)) => {
                 strip_thinking_signature(&mut resp);
                 RequestFinalizer::new(
                     &state,
                     &ctx,
                     reservation.map(|Extension(r)| r),
-                    req.model.clone(),
+                    model_alias.to_string(),
                     provider_name,
                     model_id,
                     start,
@@ -129,7 +138,7 @@ pub async fn chat_completions(
                 Ok(Json(resp).into_response())
             }
             Err(e) => {
-                record_error_metrics(&req.model, "", &e, start);
+                record_error_metrics(model_alias, "", &e, start);
                 Err(e)
             }
         }

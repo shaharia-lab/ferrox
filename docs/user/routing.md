@@ -18,6 +18,34 @@ flowchart TD
     B -- no, all open --> G
 ```
 
+## Classified aliases
+
+An alias configured with `classifier` instead of `routing` has no pool of its own. For each request a classifier reads the conversation and picks one of the alias's tiers, and the request is then handled exactly like one sent to that tier's alias: same strategy, retries, fallback chain and circuit breakers. See [Classified aliases](configuration.md#classified-aliases) for the configuration.
+
+| Outcome (`reason`) | Served by |
+|---|---|
+| `classified`: the classifier chose a listed tier | That tier's alias |
+| `low_confidence`: the answer's confidence is below `confidence_threshold` | `fallback_alias` |
+| `timeout`: no answer within the classifier's `timeout_ms` | `fallback_alias` |
+| `error`: the classifier failed, or the request has no user text | `fallback_alias` |
+| `unknown_choice`: the answer names a tier that is not listed | `fallback_alias` |
+
+The classifier is tried once and never fails a request. Each classified request logs one `Classified request` line with the requested alias, the served alias and the reason.
+
+**What the classifier sees.** Only text: the last user message and as many of the user and assistant turns before it as fit in the classifier's `max_input_chars`. A last user message longer than the cap is cut to its final `max_input_chars` characters. Images, tool calls, tool results and the system prompt (`system` and `developer` messages, Responses `instructions`) are never sent. The same rules apply on all three inbound endpoints.
+
+**Authorization.** `allowed_models` is checked against the alias the client asked for, before the classifier runs. A key allowed `auto` is served by whichever tier is chosen, even if it may not request that tier's alias by name; a key not allowed `auto` gets `403` and the classifier is not called.
+
+**Accounting.** Logs, metrics and usage records carry the alias that served the request (the tier's or the fallback's), not the classified alias.
+
+**The `model` field of the response.** A classified alias changes nothing here; each endpoint reports what it reports for a statically routed alias:
+
+| Endpoint | Non-streaming | Streaming |
+|---|---|---|
+| `POST /v1/chat/completions` | The upstream's model id | The upstream's model id |
+| `POST /v1/responses` | The requested alias (the upstream's model id from a `responses: native` provider) | Same |
+| `POST /anthropic/v1/messages` | The upstream's model id | The requested alias |
+
 ## Routing strategies
 
 ### round_robin

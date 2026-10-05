@@ -171,7 +171,9 @@ See [Routing](routing.md) for details on circuit breakers and fallback behavior.
 
 An alias has exactly one of `routing` or `classifier`. With `classifier`, a classifier from the top-level [`classifiers`](#classifiers) list picks one of the listed tiers per request.
 
-> **Not active yet.** This configuration is parsed and validated at startup, but classification is not wired into request handling: a classified alias is listed by `GET /v1/models` and answers `404` when requested.
+A request to a classified alias is served by the alias of the tier the classifier chose, or by `fallback_alias` when the classifier fails, times out, answers with too little confidence or names a tier that is not listed. The classifier never fails a request. See [Classified aliases](routing.md#classified-aliases) for how such a request is handled.
+
+> **No classifier backend yet.** The `jev` backend is not built in, so until it is, every request to a classified alias is served by its `fallback_alias`. `shadow` and the `cache_*` and `circuit_breaker` fields of a classifier are parsed and validated but have no effect yet.
 
 ```yaml
 models:
