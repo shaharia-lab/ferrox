@@ -36,7 +36,7 @@ use async_trait::async_trait;
 use crate::config::{ClassifierConfig, ClassifierType};
 
 pub use input::ClassifierInput;
-pub use resolver::{skip_requested, RouteResolver};
+pub use resolver::{skip_requested, RouteResolver, RoutingRecord};
 
 /// One option a classifier chooses between.
 #[derive(Debug, Clone, PartialEq, Eq)]

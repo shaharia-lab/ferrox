@@ -51,7 +51,9 @@ fn proxy_error_to_anthropic_response(e: &ProxyError) -> Response {
     ),
     responses(
         (status = 200, description = "Message response. JSON body (mirrors the Anthropic \
-            Messages response), or an Anthropic SSE event stream when `stream=true`."),
+            Messages response), or an Anthropic SSE event stream when `stream=true`.",
+            headers(("x-ferrox-routed-model" = String, description = "The statically routed \
+                alias that served the request. Only present when `model` is a classified alias."))),
         (status = 401, description = "Missing or invalid credentials", body = ErrorResponse),
         (status = 403, description = "Model not permitted for this key", body = ErrorResponse),
         (status = 404, description = "Unknown model alias", body = ErrorResponse),
@@ -174,7 +176,8 @@ pub async fn anthropic_messages(
                     model_id,
                     start,
                     Surface::Anthropic,
-                );
+                )
+                .with_routing(decision.routing_record());
                 // Meter the OpenAI-format stream before converting it to
                 // Anthropic SSE; the converter drains it before emitting
                 // `message_stop`, so usage is recorded ahead of that frame.
@@ -189,9 +192,11 @@ pub async fn anthropic_messages(
                     Ok::<_, ProxyError>(axum::response::sse::Event::default().comment("done"))
                 }));
 
-                Ok(Sse::new(sse_stream)
-                    .keep_alive(KeepAlive::default())
-                    .into_response())
+                Ok(decision.with_routed_model_header(
+                    Sse::new(sse_stream)
+                        .keep_alive(KeepAlive::default())
+                        .into_response(),
+                ))
             }
             Err(e) => {
                 record_error_count(model_alias, "", &e);
@@ -211,9 +216,11 @@ pub async fn anthropic_messages(
                     start,
                     Surface::Anthropic,
                 )
+                .with_routing(decision.routing_record())
                 .finish(resp.usage.as_ref())
                 .await;
-                Ok(Json(to_anthropic_response(resp)).into_response())
+                Ok(decision
+                    .with_routed_model_header(Json(to_anthropic_response(resp)).into_response()))
             }
             Err(e) => {
                 record_error_metrics(model_alias, "", &e, start);

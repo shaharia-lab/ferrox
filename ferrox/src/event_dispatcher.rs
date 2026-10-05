@@ -29,6 +29,22 @@ pub struct TokenUsageEvent {
     pub cache_write_tokens: Option<u32>,
     pub latency_ms: Option<u64>,
     pub timestamp: DateTime<Utc>,
+    /// The routing decision of a request to a classified alias: the alias the
+    /// client asked for (`model` is the one that served it), why it was
+    /// routed there, and what the classifier reported. Omitted for a
+    /// statically routed alias, so its payload stays byte-identical.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub requested_model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub routing_reason: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub classifier_confidence: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub classifier_latency_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub classifier_input_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub classifier_model: Option<String>,
 }
 
 /// Handle for dispatching events from request handlers.
@@ -244,6 +260,12 @@ mod tests {
             cache_write_tokens: None,
             latency_ms: Some(200),
             timestamp: Utc::now(),
+            requested_model: None,
+            routing_reason: None,
+            classifier_confidence: None,
+            classifier_latency_ms: None,
+            classifier_input_tokens: None,
+            classifier_model: None,
         }
     }
 
@@ -270,6 +292,12 @@ mod tests {
             cache_write_tokens: None,
             latency_ms: Some(843),
             timestamp: Utc::now(),
+            requested_model: None,
+            routing_reason: None,
+            classifier_confidence: None,
+            classifier_latency_ms: None,
+            classifier_input_tokens: None,
+            classifier_model: None,
         };
         let json = serde_json::to_value(&event).unwrap();
         assert_eq!(json["event"], "token_usage");
@@ -289,7 +317,8 @@ mod tests {
             .map(String::as_str)
             .collect();
         keys.sort_unstable();
-        // Exactly the pre-cache-counter key set: no new keys, no nulls.
+        // Exactly the key set from before the cache counters and the routing
+        // decision existed: no new keys, no nulls.
         assert_eq!(
             keys,
             [
@@ -318,6 +347,70 @@ mod tests {
         let json = serde_json::to_value(&event).unwrap();
         assert_eq!(json["cache_read_tokens"], 3968);
         assert_eq!(json["cache_write_tokens"], 100);
+    }
+
+    /// The payload of a statically routed request, byte for byte as it was
+    /// before the routing fields existed.
+    #[test]
+    fn a_static_request_serializes_to_the_same_bytes_as_before() {
+        let event = TokenUsageEvent {
+            client_id: Some(Uuid::nil()),
+            timestamp: DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+            ..sample_event()
+        };
+        assert_eq!(
+            serde_json::to_string(&event).unwrap(),
+            concat!(
+                r#"{"event":"token_usage","request_id":"req-123","#,
+                r#""client_id":"00000000-0000-0000-0000-000000000000","#,
+                r#""key_name":"test-key","model":"gpt-4","provider":"openai","#,
+                r#""prompt_tokens":100,"completion_tokens":50,"total_tokens":150,"#,
+                r#""latency_ms":200,"timestamp":"2023-11-14T22:13:20Z"}"#,
+            )
+        );
+    }
+
+    #[test]
+    fn serialization_includes_the_routing_decision_of_a_classified_request() {
+        let event = TokenUsageEvent {
+            model: "fast".to_string(),
+            requested_model: Some("auto".to_string()),
+            routing_reason: Some("classified"),
+            classifier_confidence: Some(0.9),
+            classifier_latency_ms: Some(84),
+            classifier_input_tokens: Some(31),
+            classifier_model: Some("jev-1".to_string()),
+            ..sample_event()
+        };
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(json["model"], "fast");
+        assert_eq!(json["requested_model"], "auto");
+        assert_eq!(json["routing_reason"], "classified");
+        assert_eq!(json["classifier_confidence"], 0.9);
+        assert_eq!(json["classifier_latency_ms"], 84);
+        assert_eq!(json["classifier_input_tokens"], 31);
+        assert_eq!(json["classifier_model"], "jev-1");
+    }
+
+    /// A classifier that gave no answer (a timeout, say) has nothing to
+    /// report: those keys are left out rather than sent as `null`.
+    #[test]
+    fn serialization_omits_what_an_unanswered_classification_lacks() {
+        let event = TokenUsageEvent {
+            requested_model: Some("auto".to_string()),
+            routing_reason: Some("timeout"),
+            classifier_latency_ms: Some(50),
+            ..sample_event()
+        };
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(json["routing_reason"], "timeout");
+        for absent in [
+            "classifier_confidence",
+            "classifier_input_tokens",
+            "classifier_model",
+        ] {
+            assert!(json.get(absent).is_none(), "{absent}");
+        }
     }
 
     #[tokio::test]

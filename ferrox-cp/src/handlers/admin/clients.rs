@@ -939,6 +939,12 @@ mod tests {
                 cache_read_tokens: None,
                 cache_write_tokens: None,
                 latency_ms: Some(200),
+                requested_model: None,
+                routing_reason: None,
+                classifier_confidence: None,
+                classifier_latency_ms: None,
+                classifier_input_tokens: None,
+                classifier_model: None,
             })
             .collect();
         usage_repo.insert_batch(&records).await.unwrap();
@@ -1052,6 +1058,12 @@ mod tests {
                 cache_read_tokens: None,
                 cache_write_tokens: None,
                 latency_ms: Some(200),
+                requested_model: None,
+                routing_reason: None,
+                classifier_confidence: None,
+                classifier_latency_ms: None,
+                classifier_input_tokens: None,
+                classifier_model: None,
             })
             .collect();
         usage_repo.insert_batch(&records).await.unwrap();

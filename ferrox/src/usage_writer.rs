@@ -18,6 +18,16 @@ pub struct UsageEvent {
     pub cache_read_tokens: u32,
     pub cache_write_tokens: u32,
     pub latency_ms: Option<u64>,
+    /// The routing decision of a request to a classified alias: the alias the
+    /// client asked for (`model` is the one that served it), why it was
+    /// routed there, and what the classifier reported. All `None` for a
+    /// statically routed alias, written as `NULL`.
+    pub requested_model: Option<String>,
+    pub routing_reason: Option<&'static str>,
+    pub classifier_confidence: Option<f64>,
+    pub classifier_latency_ms: Option<u64>,
+    pub classifier_input_tokens: Option<u32>,
+    pub classifier_model: Option<String>,
 }
 
 /// Handle for sending usage events from request handlers.
@@ -136,15 +146,35 @@ async fn flush(pool: &sqlx::PgPool, buffer: &mut Vec<UsageEvent>) {
         .iter()
         .map(|e| e.latency_ms.map(|l| l as i32))
         .collect();
+    let requested_models: Vec<Option<&str>> =
+        valid.iter().map(|e| e.requested_model.as_deref()).collect();
+    let routing_reasons: Vec<Option<&str>> = valid.iter().map(|e| e.routing_reason).collect();
+    let classifier_confidences: Vec<Option<f64>> =
+        valid.iter().map(|e| e.classifier_confidence).collect();
+    let classifier_latency_ms: Vec<Option<i32>> = valid
+        .iter()
+        .map(|e| e.classifier_latency_ms.map(|l| l as i32))
+        .collect();
+    let classifier_input_tokens: Vec<Option<i32>> = valid
+        .iter()
+        .map(|e| e.classifier_input_tokens.map(|t| t as i32))
+        .collect();
+    let classifier_models: Vec<Option<&str>> = valid
+        .iter()
+        .map(|e| e.classifier_model.as_deref())
+        .collect();
 
     let result = sqlx::query(
         r#"
         INSERT INTO usage_log
             (client_id, request_id, model, provider, prompt_tokens, completion_tokens, total_tokens,
-             cache_read_tokens, cache_write_tokens, latency_ms)
+             cache_read_tokens, cache_write_tokens, latency_ms,
+             requested_model, routing_reason, classifier_confidence, classifier_latency_ms,
+             classifier_input_tokens, classifier_model)
         SELECT * FROM UNNEST(
             $1::uuid[], $2::text[], $3::text[], $4::text[],
-            $5::int[], $6::int[], $7::int[], $8::int[], $9::int[], $10::int[]
+            $5::int[], $6::int[], $7::int[], $8::int[], $9::int[], $10::int[],
+            $11::text[], $12::text[], $13::float8[], $14::int[], $15::int[], $16::text[]
         )
         "#,
     )
@@ -158,6 +188,12 @@ async fn flush(pool: &sqlx::PgPool, buffer: &mut Vec<UsageEvent>) {
     .bind(&cache_read_tokens)
     .bind(&cache_write_tokens)
     .bind(&latency_ms)
+    .bind(&requested_models)
+    .bind(&routing_reasons)
+    .bind(&classifier_confidences)
+    .bind(&classifier_latency_ms)
+    .bind(&classifier_input_tokens)
+    .bind(&classifier_models)
     .execute(pool)
     .await;
 
@@ -188,6 +224,12 @@ mod tests {
             cache_read_tokens: 0,
             cache_write_tokens: 0,
             latency_ms: Some(200),
+            requested_model: None,
+            routing_reason: None,
+            classifier_confidence: None,
+            classifier_latency_ms: None,
+            classifier_input_tokens: None,
+            classifier_model: None,
         });
         // Give the drainer a moment to consume.
         tokio::time::sleep(Duration::from_millis(10)).await;

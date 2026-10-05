@@ -74,7 +74,9 @@ use crate::types::RequestContext;
             API `response` object), or an SSE stream of typed `response.*` events ending in \
             exactly one of `response.completed` / `response.incomplete` / `response.failed` \
             when `stream=true` (no `[DONE]` sentinel). From a `responses: native` provider, \
-            the upstream's own body or events, passed through."),
+            the upstream's own body or events, passed through.",
+            headers(("x-ferrox-routed-model" = String, description = "The statically routed \
+                alias that served the request. Only present when `model` is a classified alias."))),
         (status = 400, description = "Malformed body, or a stateful / unsupported feature \
             (`previous_response_id`, `conversation`, `prompt`, `background`; `store: true` \
             on an alias with a native target; hosted built-in tools, `input_file` and \
@@ -152,6 +154,7 @@ pub async fn responses(
             start,
             Surface::Responses,
         )
+        .with_routing(decision.routing_record())
     };
 
     if req.is_streaming() {
@@ -195,9 +198,11 @@ pub async fn responses(
                         None => frame,
                     })
                 });
-                Ok(Sse::new(sse_stream)
-                    .keep_alive(KeepAlive::default())
-                    .into_response())
+                Ok(decision.with_routed_model_header(
+                    Sse::new(sse_stream)
+                        .keep_alive(KeepAlive::default())
+                        .into_response(),
+                ))
             }
             Ok((Served::Translated(stream), provider_name, model_id)) => {
                 // The emitter drains the metered stream before it emits the
@@ -209,9 +214,11 @@ pub async fn responses(
                         .wrap_stream(stream)
                         .boxed(),
                 );
-                Ok(Sse::new(sse_stream)
-                    .keep_alive(KeepAlive::default())
-                    .into_response())
+                Ok(decision.with_routed_model_header(
+                    Sse::new(sse_stream)
+                        .keep_alive(KeepAlive::default())
+                        .into_response(),
+                ))
             }
             Err(e) => {
                 record_error_metrics(model_alias, "", &e, start);
@@ -247,13 +254,17 @@ pub async fn responses(
                 finalizer(provider_name, model_id)
                     .finish(resp.usage.as_ref())
                     .await;
-                Ok(([(CONTENT_TYPE, "application/json")], resp.body).into_response())
+                Ok(decision.with_routed_model_header(
+                    ([(CONTENT_TYPE, "application/json")], resp.body).into_response(),
+                ))
             }
             Ok((Served::Translated(resp), provider_name, model_id)) => {
                 finalizer(provider_name, model_id)
                     .finish(resp.usage.as_ref())
                     .await;
-                Ok(Json(to_responses_response(resp, &req, assign_response_id())).into_response())
+                Ok(decision.with_routed_model_header(
+                    Json(to_responses_response(resp, &req, assign_response_id())).into_response(),
+                ))
             }
             Err(e) => {
                 record_error_metrics(model_alias, "", &e, start);
