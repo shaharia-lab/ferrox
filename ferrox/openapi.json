@@ -15,6 +15,17 @@
           "Anthropic"
         ],
         "operationId": "anthropic_messages",
+        "parameters": [
+          {
+            "name": "x-ferrox-classifier",
+            "in": "header",
+            "description": "Set to `skip` (case-insensitive) to skip classification for this request: a classified alias is then served by its `fallback_alias` and the classifier is not called. Any other value, and the header on a statically routed alias, has no effect.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -178,6 +189,17 @@
           "OpenAI"
         ],
         "operationId": "chat_completions",
+        "parameters": [
+          {
+            "name": "x-ferrox-classifier",
+            "in": "header",
+            "description": "Set to `skip` (case-insensitive) to skip classification for this request: a classified alias is then served by its `fallback_alias` and the classifier is not called. Any other value, and the header on a statically routed alias, has no effect.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -291,6 +313,17 @@
           "OpenAI"
         ],
         "operationId": "responses",
+        "parameters": [
+          {
+            "name": "x-ferrox-classifier",
+            "in": "header",
+            "description": "Set to `skip` (case-insensitive) to skip classification for this request: a classified alias is then served by its `fallback_alias` and the classifier is not called. Any other value, and the header on a statically routed alias, has no effect.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "requestBody": {
           "content": {
             "application/json": {

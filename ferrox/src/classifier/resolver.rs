@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context as _};
+use axum::http::HeaderMap;
 
 use super::{
     Classification, Classifier, ClassifierError, ClassifierInput, ClassifierRegistry, Tier,
@@ -15,6 +16,20 @@ use crate::error::ProxyError;
 use crate::lb::circuit_breaker::CircuitBreaker;
 use crate::lb::RoutePool;
 use crate::router::ModelRouter;
+
+/// Request header a client sets to [`SKIP_CLASSIFIER`] to have a classified
+/// alias served by its `fallback_alias` without the classifier being called.
+const CLASSIFIER_HEADER: &str = "x-ferrox-classifier";
+const SKIP_CLASSIFIER: &str = "skip";
+
+/// Whether the request opts out of classification. Any other value of the
+/// header is ignored.
+pub fn skip_requested(headers: &HeaderMap) -> bool {
+    headers
+        .get(CLASSIFIER_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case(SKIP_CLASSIFIER))
+}
 
 /// How a classified request came to be served by the alias that served it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,6 +46,11 @@ pub enum Reason {
     UnknownChoice,
     /// The classifier's circuit breaker is open, so it was not called.
     BreakerOpen,
+    /// The alias is in shadow mode: the classifier chose a tier that would
+    /// have served the request, and `fallback_alias` served it instead.
+    Shadow,
+    /// The client asked to skip the classifier, so it was not called.
+    OptOut,
 }
 
 impl Reason {
@@ -42,6 +62,8 @@ impl Reason {
             Self::Error => "error",
             Self::UnknownChoice => "unknown_choice",
             Self::BreakerOpen => "breaker_open",
+            Self::Shadow => "shadow",
+            Self::OptOut => "opt_out",
         }
     }
 }
@@ -51,10 +73,11 @@ impl Reason {
 pub struct ClassificationRecord {
     pub reason: Reason,
     /// The classifier's answer, when it gave one — also when the answer was
-    /// not followed (`low_confidence`, `unknown_choice`).
+    /// not followed (`low_confidence`, `unknown_choice`, `shadow`).
     pub classification: Option<Classification>,
     /// Why there is no answer (`timeout`, `error`, `breaker_open`, and an
-    /// `unknown_choice` the backend itself refused).
+    /// `unknown_choice` the backend itself refused). An `opt_out` has neither
+    /// an answer nor an error: the classifier was never asked.
     pub error: Option<ClassifierError>,
     /// Time spent on classification, input extraction included.
     pub latency: Duration,
@@ -111,6 +134,9 @@ struct ClassifiedRoute {
     /// The pool serving each tier; parallel to `tiers`.
     tier_pools: Vec<Arc<RoutePool>>,
     fallback: Arc<RoutePool>,
+    /// Shadow mode: an answer that would have been followed is recorded, and
+    /// `fallback` serves the request all the same.
+    shadow: bool,
     confidence_threshold: f64,
     timeout: Duration,
     max_input_chars: usize,
@@ -153,6 +179,9 @@ impl ClassifiedRoute {
                     .is_some_and(|c| c.is_nan() || c < self.confidence_threshold);
                 if unsure {
                     return (fallback(), Reason::LowConfidence, Some(answer), None);
+                }
+                if self.shadow {
+                    return (fallback(), Reason::Shadow, Some(answer), None);
                 }
                 (
                     self.tier_pools[tier].clone(),
@@ -274,6 +303,7 @@ impl RouteResolver {
                     tiers,
                     tier_pools,
                     fallback: pool(&alias.fallback_alias)?,
+                    shadow: alias.shadow,
                     confidence_threshold: alias.confidence_threshold,
                     timeout: Duration::from_millis(settings.timeout_ms),
                     max_input_chars: settings.max_input_chars,
@@ -292,9 +322,15 @@ impl RouteResolver {
     /// "not configured" one for an alias that does not exist. While its
     /// circuit breaker is open it is not called at all, so a classifier that
     /// keeps timing out stops adding its `timeout_ms` to every request.
+    ///
+    /// `skip_classifier` is the client's opt-out ([`skip_requested`]): a
+    /// classified alias is then served by its `fallback_alias` and the
+    /// classifier is left alone. It is never looked at for a statically
+    /// routed alias.
     pub async fn resolve<'a>(
         &self,
         alias: &'a str,
+        skip_classifier: bool,
         input: impl FnOnce(usize) -> ClassifierInput,
     ) -> Result<RouteDecision<'a>, ProxyError> {
         let not_configured = match self.router.resolve(alias) {
@@ -312,6 +348,20 @@ impl RouteResolver {
         };
 
         let start = Instant::now();
+        // Before the breaker and the input: an opted-out request costs
+        // neither, and says nothing about the classifier's health.
+        if skip_classifier {
+            return Ok(RouteDecision {
+                requested_alias: alias,
+                pool: route.fallback.clone(),
+                classification: Some(ClassificationRecord {
+                    reason: Reason::OptOut,
+                    classification: None,
+                    error: None,
+                    latency: start.elapsed(),
+                }),
+            });
+        }
         // Asked before the input is built: an open breaker costs a request
         // no extraction either. Reads only, so nothing is claimed for a
         // request that then has nothing to classify.
@@ -351,7 +401,7 @@ mod tests {
     use super::*;
     use crate::classifier::input::{Role, Turn};
     use crate::classifier::test_support::{
-        answer, gateway_config, registry_with, Answer, FakeClassifier, Upstream,
+        answer, gateway_config, registry_with, shadowed, Answer, FakeClassifier, Upstream,
     };
 
     fn resolver(classifier: &Arc<FakeClassifier>) -> RouteResolver {
@@ -373,94 +423,207 @@ mod tests {
         }
     }
 
-    /// One case per reason. The alias has tiers `simple` → `fast` and
-    /// `complex` → `smart`, falls back to `smart`, and requires a confidence
-    /// of 0.6, so only a followed `simple` answer is served by `fast`.
+    /// One case per reason, live and in shadow mode. The alias has tiers
+    /// `simple` → `fast` and `complex` → `smart`, falls back to `smart`, and
+    /// requires a confidence of 0.6, so only a followed `simple` answer is
+    /// served by `fast`. In shadow mode nothing is: an answer that would
+    /// have been followed is a `shadow`, every other outcome is unchanged.
     #[tokio::test]
     async fn every_outcome_has_a_reason_and_a_served_alias() {
         let failed = ClassifierError::Failed("upstream said 529".to_string());
+        // (reply, reason and served alias live, reason in shadow mode, error)
         let cases = [
             (
                 Answer::Tier("simple", Some(0.9)),
-                Reason::Classified,
-                "fast",
+                (Reason::Classified, "fast"),
+                Reason::Shadow,
                 None,
             ),
             // A backend without calibrated confidence is taken at its word.
             (
                 Answer::Tier("simple", None),
-                Reason::Classified,
-                "fast",
+                (Reason::Classified, "fast"),
+                Reason::Shadow,
                 None,
             ),
             // Exactly the threshold is confident enough.
             (
                 Answer::Tier("simple", Some(0.6)),
-                Reason::Classified,
-                "fast",
+                (Reason::Classified, "fast"),
+                Reason::Shadow,
+                None,
+            ),
+            // A tier whose alias is the fallback's is still a followed answer.
+            (
+                Answer::Tier("complex", Some(0.9)),
+                (Reason::Classified, "smart"),
+                Reason::Shadow,
                 None,
             ),
             (
                 Answer::Tier("simple", Some(0.59)),
+                (Reason::LowConfidence, "smart"),
                 Reason::LowConfidence,
-                "smart",
                 None,
             ),
             (
                 Answer::Tier("simple", Some(f64::NAN)),
+                (Reason::LowConfidence, "smart"),
                 Reason::LowConfidence,
-                "smart",
                 None,
             ),
             (
                 Answer::Tier("medium", Some(0.9)),
+                (Reason::UnknownChoice, "smart"),
                 Reason::UnknownChoice,
-                "smart",
                 None,
             ),
             (
                 Answer::Fail(failed.clone()),
+                (Reason::Error, "smart"),
                 Reason::Error,
-                "smart",
                 Some(failed),
             ),
             (
                 Answer::Fail(ClassifierError::Timeout),
+                (Reason::Timeout, "smart"),
                 Reason::Timeout,
-                "smart",
                 Some(ClassifierError::Timeout),
             ),
             // Slower than `timeout_ms`: cut off by the resolver.
             (
                 Answer::Hang,
+                (Reason::Timeout, "smart"),
                 Reason::Timeout,
-                "smart",
                 Some(ClassifierError::Timeout),
             ),
         ];
 
-        for (reply, reason, served, error) in cases {
-            let classifier = FakeClassifier::new(reply.clone());
-            let resolver = resolver(&classifier);
-
-            let decision = resolver.resolve("auto", input).await.unwrap();
-            let case = format!("{reply:?}");
-            assert_eq!(decision.requested_alias, "auto", "{case}");
-            assert_eq!(decision.served_alias(), served, "{case}");
-            assert_eq!(classifier.calls(), 1, "{case}");
-
-            let record = decision.classification.expect(&case);
-            assert_eq!(record.reason, reason, "{case}");
-            assert_eq!(record.error, error, "{case}");
-            match reply {
-                // The answer is recorded whether or not it was followed. NaN
-                // never equals itself, so compare the tier.
-                Answer::Tier(tier, _) => {
-                    assert_eq!(record.classification.expect(&case).tier, tier, "{case}");
+        for (reply, live, shadow_reason, error) in cases {
+            for (shadow, (reason, served)) in [(false, live), (true, (shadow_reason, "smart"))] {
+                let classifier = FakeClassifier::new(reply.clone());
+                let mut config = gateway_config(json!({}));
+                if shadow {
+                    config = shadowed(config);
                 }
-                _ => assert_eq!(record.classification, None, "{case}"),
+                let resolver = resolver_for(&config, &classifier);
+
+                let decision = resolver.resolve("auto", false, input).await.unwrap();
+                let case = format!("{reply:?} shadow={shadow}");
+                assert_eq!(decision.requested_alias, "auto", "{case}");
+                assert_eq!(decision.served_alias(), served, "{case}");
+                assert_eq!(classifier.calls(), 1, "{case}");
+
+                let record = decision.classification.expect(&case);
+                assert_eq!(record.reason, reason, "{case}");
+                assert_eq!(record.error, error, "{case}");
+                match reply {
+                    // The answer is recorded whether or not it was followed.
+                    // NaN never equals itself, so compare the tier.
+                    Answer::Tier(tier, _) => {
+                        assert_eq!(record.classification.expect(&case).tier, tier, "{case}");
+                    }
+                    _ => assert_eq!(record.classification, None, "{case}"),
+                }
             }
         }
+    }
+
+    /// Shadow mode keeps the whole answer the classifier would have been
+    /// followed on, not just its tier.
+    #[tokio::test]
+    async fn shadow_records_the_would_be_tier_with_its_confidence() {
+        let classifier = FakeClassifier::new(Answer::Tier("simple", Some(0.9)));
+        let resolver = resolver_for(&shadowed(gateway_config(json!({}))), &classifier);
+
+        let decision = resolver.resolve("auto", false, input).await.unwrap();
+
+        assert_eq!(decision.served_alias(), "smart");
+        assert_eq!(classifier.calls(), 1);
+        let record = decision.classification.unwrap();
+        assert_eq!(record.reason, Reason::Shadow);
+        assert_eq!(record.classification, Some(answer("simple", Some(0.9))));
+        assert_eq!(record.error, None);
+    }
+
+    /// Opting out serves the fallback without reading the request or asking
+    /// the classifier, in shadow mode too.
+    #[tokio::test]
+    async fn an_opt_out_never_builds_the_input_or_calls_the_classifier() {
+        for shadow in [false, true] {
+            let classifier = FakeClassifier::new(Answer::Tier("simple", Some(0.9)));
+            let mut config = gateway_config(json!({}));
+            if shadow {
+                config = shadowed(config);
+            }
+            let resolver = resolver_for(&config, &classifier);
+
+            let decision = resolver
+                .resolve("auto", true, |_| {
+                    panic!("an opt-out must not extract input")
+                })
+                .await
+                .unwrap();
+
+            assert_eq!(decision.requested_alias, "auto", "shadow={shadow}");
+            assert_eq!(decision.served_alias(), "smart", "shadow={shadow}");
+            assert_eq!(classifier.calls(), 0, "shadow={shadow}");
+            let record = decision.classification.unwrap();
+            assert_eq!(record.reason, Reason::OptOut, "shadow={shadow}");
+            assert_eq!(record.classification, None, "shadow={shadow}");
+            assert_eq!(record.error, None, "shadow={shadow}");
+        }
+    }
+
+    /// The opt-out is decided before the breaker is asked: it is reported as
+    /// an opt-out while the breaker is open, and leaves the breaker as it is.
+    #[tokio::test]
+    async fn an_opt_out_is_reported_as_one_while_the_breaker_is_open() {
+        let classifier = FakeClassifier::new(Answer::Fail(ClassifierError::Timeout));
+        let config = gateway_config(json!({
+            "circuit_breaker": {"failure_threshold": 1, "recovery_timeout_secs": 30},
+        }));
+        let resolver = resolver_for(&config, &classifier);
+        let reason = |decision: RouteDecision<'_>| decision.classification.unwrap().reason;
+
+        let tripped = resolver.resolve("auto", false, input).await.unwrap();
+        assert_eq!(reason(tripped), Reason::Timeout);
+
+        let opted_out = resolver.resolve("auto", true, input).await.unwrap();
+        assert_eq!(opted_out.served_alias(), "smart");
+        assert_eq!(reason(opted_out), Reason::OptOut);
+
+        let next = resolver.resolve("auto", false, input).await.unwrap();
+        assert_eq!(reason(next), Reason::BreakerOpen);
+        assert_eq!(classifier.calls(), 1);
+    }
+
+    #[test]
+    fn only_the_skip_value_of_the_header_opts_out() {
+        let cases = [
+            (Some("skip"), true),
+            (Some("SKIP"), true),
+            (Some("Skip"), true),
+            (Some(" skip "), true),
+            (Some(""), false),
+            (Some("skipped"), false),
+            (Some("true"), false),
+            (Some("fast"), false),
+            (None, false),
+        ];
+        for (value, skips) in cases {
+            let mut headers = HeaderMap::new();
+            if let Some(value) = value {
+                headers.insert(CLASSIFIER_HEADER, value.parse().unwrap());
+            }
+            assert_eq!(skip_requested(&headers), skips, "{value:?}");
+        }
+
+        // Not text at all: ignored like any other value.
+        let mut headers = HeaderMap::new();
+        let opaque = axum::http::HeaderValue::from_bytes(b"sk\xffip").unwrap();
+        headers.insert(CLASSIFIER_HEADER, opaque);
+        assert!(!skip_requested(&headers));
     }
 
     #[tokio::test]
@@ -469,7 +632,7 @@ mod tests {
         let resolver = resolver(&classifier);
 
         let decision = resolver
-            .resolve("auto", |_| ClassifierInput::default())
+            .resolve("auto", false, |_| ClassifierInput::default())
             .await
             .unwrap();
 
@@ -487,7 +650,7 @@ mod tests {
         let resolver = resolver_for(&config, &classifier);
 
         let decision = resolver
-            .resolve("auto", |max_input_chars| {
+            .resolve("auto", false, |max_input_chars| {
                 assert_eq!(max_input_chars, 42);
                 input(max_input_chars)
             })
@@ -508,14 +671,19 @@ mod tests {
         let classifier = FakeClassifier::new(Answer::Tier("simple", Some(0.9)));
         let resolver = resolver(&classifier);
 
-        let decision = resolver
-            .resolve("fast", |_| panic!("a static alias must not extract input"))
-            .await
-            .unwrap();
+        // The opt-out is not looked at for a static alias.
+        for skip_classifier in [false, true] {
+            let decision = resolver
+                .resolve("fast", skip_classifier, |_| {
+                    panic!("a static alias must not extract input")
+                })
+                .await
+                .unwrap();
 
-        assert_eq!(decision.requested_alias, "fast");
-        assert_eq!(decision.served_alias(), "fast");
-        assert!(decision.classification.is_none());
+            assert_eq!(decision.requested_alias, "fast");
+            assert_eq!(decision.served_alias(), "fast");
+            assert!(decision.classification.is_none());
+        }
         assert_eq!(classifier.calls(), 0);
     }
 
@@ -525,7 +693,7 @@ mod tests {
         let resolver = resolver(&classifier);
 
         let result = resolver
-            .resolve("nope", |_| {
+            .resolve("nope", false, |_| {
                 panic!("an unknown alias must not extract input")
             })
             .await;

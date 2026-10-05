@@ -30,6 +30,8 @@ An alias configured with `classifier` instead of `routing` has no pool of its ow
 | `error`: the classifier failed, or the request has no user text | `fallback_alias` |
 | `unknown_choice`: the answer names a tier that is not listed | `fallback_alias` |
 | `breaker_open`: the classifier's circuit breaker is open, so it was not called | `fallback_alias` |
+| `shadow`: the alias has `shadow: true` and the classifier chose a listed tier with enough confidence | `fallback_alias` |
+| `opt_out`: the request carries `x-ferrox-classifier: skip`, so the classifier was not called | `fallback_alias` |
 
 The classifier is tried once and never fails a request. Each classified request logs one `Classified request` line with the requested alias, the served alias and the reason.
 

@@ -97,7 +97,7 @@ fn resolver(server: &MockServer, mut classifier: Value) -> RouteResolver {
 
 /// Resolve `auto` once; the reason and the alias that serves the request.
 async fn resolve(resolver: &RouteResolver) -> (Reason, String) {
-    let decision = resolver.resolve("auto", input).await.unwrap();
+    let decision = resolver.resolve("auto", false, input).await.unwrap();
     decision.log_classification("req-1");
     let reason = decision.classification.as_ref().unwrap().reason;
     (reason, decision.served_alias().to_string())
@@ -492,7 +492,7 @@ async fn aliases_sharing_a_classifier_share_its_breaker() {
 
     assert_eq!(resolve(&resolver).await.0, Reason::Error);
 
-    let decision = resolver.resolve("auto-2", input).await.unwrap();
+    let decision = resolver.resolve("auto-2", false, input).await.unwrap();
     assert_eq!(decision.served_alias(), "smart");
     assert_eq!(decision.classification.unwrap().reason, Reason::BreakerOpen);
     assert_eq!(calls(&server).await, 1);
@@ -509,7 +509,9 @@ async fn an_open_breaker_skips_input_extraction() {
     assert_eq!(resolve(&resolver).await.0, Reason::Error);
 
     let decision = resolver
-        .resolve("auto", |_| panic!("an open breaker must not extract input"))
+        .resolve("auto", false, |_| {
+            panic!("an open breaker must not extract input")
+        })
         .await
         .unwrap();
 

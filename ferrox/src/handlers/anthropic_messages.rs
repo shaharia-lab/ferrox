@@ -15,7 +15,7 @@ use crate::anthropic_types::{
     AnthropicMessagesRequest,
 };
 use crate::budget_enforcer::BudgetReservation;
-use crate::classifier::ClassifierInput;
+use crate::classifier::{skip_requested, ClassifierInput};
 use crate::error::ProxyError;
 use crate::handlers::chat::{dispatch_non_stream, dispatch_stream, is_model_allowed};
 use crate::handlers::finalize::{
@@ -43,6 +43,12 @@ fn proxy_error_to_anthropic_response(e: &ProxyError) -> Response {
     tag = "Anthropic",
     security(("api_key_auth" = []), ("bearer_auth" = [])),
     request_body = AnthropicMessagesRequestCore,
+    params(
+        ("x-ferrox-classifier" = Option<String>, Header, nullable = false, description = "Set to `skip` \
+            (case-insensitive) to skip classification for this request: a classified alias \
+            is then served by its `fallback_alias` and the classifier is not called. Any \
+            other value, and the header on a statically routed alias, has no effect."),
+    ),
     responses(
         (status = 200, description = "Message response. JSON body (mirrors the Anthropic \
             Messages response), or an Anthropic SSE event stream when `stream=true`."),
@@ -132,9 +138,11 @@ pub async fn anthropic_messages(
     // the same input here as on `/v1/chat/completions`.
     let decision = match state
         .resolver
-        .resolve(&internal_req.model, |max_input_chars| {
-            ClassifierInput::from_chat(&internal_req, max_input_chars)
-        })
+        .resolve(
+            &internal_req.model,
+            skip_requested(&headers),
+            |max_input_chars| ClassifierInput::from_chat(&internal_req, max_input_chars),
+        )
         .await
     {
         Ok(decision) => decision,
