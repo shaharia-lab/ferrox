@@ -1,13 +1,13 @@
 use std::sync::Arc;
 
 use crate::budget_enforcer::BudgetEnforcer;
+use crate::classifier::RouteResolver;
 use crate::config::Config;
 use crate::event_dispatcher::EventDispatcher;
 use crate::jwks::JwksCache;
 use crate::metrics::Metrics;
 use crate::providers::ProviderRegistry;
 use crate::ratelimit::RateLimitBackend;
-use crate::router::ModelRouter;
 use crate::usage_writer::UsageWriter;
 
 #[derive(Clone)]
@@ -15,7 +15,9 @@ use crate::usage_writer::UsageWriter;
 pub struct AppState {
     pub config: Arc<Config>,
     pub providers: Arc<ProviderRegistry>,
-    pub router: Arc<ModelRouter>,
+    /// Resolves a requested model alias to its pool, through a classifier
+    /// when the alias is a classified one.
+    pub resolver: Arc<RouteResolver>,
     /// Pluggable rate limit backend (memory or Redis).
     /// Handles both virtual-key and JWT per-tenant rate limiting.
     pub rate_limit_backend: Arc<dyn RateLimitBackend>,

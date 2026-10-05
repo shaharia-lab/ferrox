@@ -49,6 +49,7 @@ use futures::StreamExt as _;
 use serde_json::{Map, Value};
 
 use crate::budget_enforcer::BudgetReservation;
+use crate::classifier::ClassifierInput;
 use crate::error::ProxyError;
 use crate::handlers::chat::{dispatch, is_model_allowed};
 use crate::handlers::finalize::{record_error_metrics, RequestFinalizer, Surface};
@@ -97,14 +98,22 @@ pub async fn responses(
         )));
     }
 
-    let pool = state.router.resolve(&req.model)?;
-    let plan = Plan::new(&pool, &req, &body)?;
+    let decision = state
+        .resolver
+        .resolve(&req.model, |max_input_chars| {
+            ClassifierInput::from_responses(&req, max_input_chars)
+        })
+        .await?;
+    decision.log_classification(&ctx.request_id);
+    let pool = &decision.pool;
+    let model_alias = decision.served_alias();
+    let plan = Plan::new(pool, &req, &body)?;
     let retry_config = &state.config.defaults.retry;
 
     tracing::info!(
         request_id = %ctx.request_id,
         key_name = %ctx.key_name,
-        model_alias = %req.model,
+        model_alias = %model_alias,
         streaming = req.is_streaming(),
         native_capable = plan.native.is_some(),
         "Dispatching Responses-format request"
@@ -130,7 +139,7 @@ pub async fn responses(
             &state,
             &ctx,
             reservation.clone(),
-            req.model.clone(),
+            model_alias.to_string(),
             provider_name,
             model_id,
             start,
@@ -140,7 +149,7 @@ pub async fn responses(
 
     if req.is_streaming() {
         let served = dispatch(
-            &pool,
+            pool,
             retry_config,
             true,
             |t| plan.skip(t),
@@ -198,13 +207,13 @@ pub async fn responses(
                     .into_response())
             }
             Err(e) => {
-                record_error_metrics(&req.model, "", &e, start);
+                record_error_metrics(model_alias, "", &e, start);
                 Err(e)
             }
         }
     } else {
         let served = dispatch(
-            &pool,
+            pool,
             retry_config,
             false,
             |t| plan.skip(t),
@@ -240,7 +249,7 @@ pub async fn responses(
                 Ok(Json(to_responses_response(resp, &req, assign_response_id())).into_response())
             }
             Err(e) => {
-                record_error_metrics(&req.model, "", &e, start);
+                record_error_metrics(model_alias, "", &e, start);
                 Err(e)
             }
         }
@@ -500,12 +509,13 @@ mod tests {
 
     fn build_harness(config: Config, registry: ProviderRegistry, ok: Arc<OkProvider>) -> Harness {
         let router = crate::router::ModelRouter::from_config(&config, &registry).unwrap();
+        let resolver = crate::classifier::RouteResolver::build(&config, router).unwrap();
         let (usage_writer, usage_rx) = UsageWriter::channel(16);
         let (event_dispatcher, events_rx) = EventDispatcher::channel(16);
         let state = AppState {
             config: Arc::new(config),
             providers: Arc::new(registry),
-            router: Arc::new(router),
+            resolver: Arc::new(resolver),
             rate_limit_backend: Arc::new(crate::ratelimit::MemoryBackend::new()),
             metrics: Arc::new(crate::metrics::Metrics::new()),
             ready: Arc::new(AtomicBool::new(true)),

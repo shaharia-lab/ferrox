@@ -8,3 +8,5 @@ pub mod responses;
 
 #[cfg(test)]
 mod budget_refund_tests;
+#[cfg(test)]
+mod classified_tests;

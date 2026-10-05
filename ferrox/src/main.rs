@@ -1,5 +1,6 @@
 mod auth;
 mod budget_enforcer;
+mod classifier;
 mod config;
 mod event_dispatcher;
 mod handlers;
@@ -81,6 +82,7 @@ async fn main() -> Result<(), anyhow::Error> {
 
     // 6. Build model router (RoutePool per alias, circuit breakers initialized)
     let model_router = ModelRouter::from_config(&config, &providers)?;
+    let resolver = classifier::RouteResolver::build(&config, model_router)?;
 
     // 7. Build rate limit backend (memory or Redis)
     let rate_limit_backend: Arc<dyn RateLimitBackend> = match &config.rate_limiting.backend {
@@ -185,7 +187,7 @@ async fn main() -> Result<(), anyhow::Error> {
     let state = AppState {
         config: Arc::new(config),
         providers: Arc::new(providers),
-        router: Arc::new(model_router),
+        resolver: Arc::new(resolver),
         rate_limit_backend,
         metrics: Arc::new(metrics),
         ready: ready.clone(),

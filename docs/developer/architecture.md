@@ -218,6 +218,11 @@ ferrox/src/
   retry.rs            execute_with_retry, is_retryable, backoff_duration
   metrics.rs          thin shim: initialises telemetry::metrics at startup
 
+  classifier/
+    mod.rs            Classifier trait, Tier, Classification, ClassifierError
+    input.rs          ClassifierInput: capped user/assistant text from a chat or Responses request
+    resolver.rs       RouteResolver: requested alias -> RouteDecision (served pool + classification record)
+
   lb/
     mod.rs            RoutePool, RouteTarget, select_target
     strategy.rs       LbStrategy: RoundRobin, Weighted, Failover, Random

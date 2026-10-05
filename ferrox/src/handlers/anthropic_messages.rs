@@ -15,6 +15,7 @@ use crate::anthropic_types::{
     AnthropicMessagesRequest,
 };
 use crate::budget_enforcer::BudgetReservation;
+use crate::classifier::ClassifierInput;
 use crate::error::ProxyError;
 use crate::handlers::chat::{dispatch_non_stream, dispatch_stream, is_model_allowed};
 use crate::handlers::finalize::{
@@ -91,20 +92,7 @@ pub async fn anthropic_messages(
     }
 
     let is_streaming = req.is_streaming();
-    let model_alias = req.model.clone();
-    let pool = match state.router.resolve(&req.model) {
-        Ok(p) => p,
-        Err(e) => return Ok(proxy_error_to_anthropic_response(&e)),
-    };
     let retry_config = &state.config.defaults.retry;
-
-    tracing::info!(
-        request_id = %ctx.request_id,
-        key_name   = %ctx.key_name,
-        model_alias = %model_alias,
-        streaming  = is_streaming,
-        "Dispatching Anthropic-format request"
-    );
 
     // Forward the `anthropic-beta` header — the only user-controllable Anthropic
     // header documented in the official API reference.  Merge any `betas` array
@@ -140,16 +128,40 @@ pub async fn anthropic_messages(
             .insert("anthropic-beta".to_string(), beta);
     }
 
+    // Resolved on the chat form of the request, so a classified alias sees
+    // the same input here as on `/v1/chat/completions`.
+    let decision = match state
+        .resolver
+        .resolve(&internal_req.model, |max_input_chars| {
+            ClassifierInput::from_chat(&internal_req, max_input_chars)
+        })
+        .await
+    {
+        Ok(decision) => decision,
+        Err(e) => return Ok(proxy_error_to_anthropic_response(&e)),
+    };
+    decision.log_classification(&ctx.request_id);
+    let pool = &decision.pool;
+    let model_alias = decision.served_alias();
+
+    tracing::info!(
+        request_id = %ctx.request_id,
+        key_name   = %ctx.key_name,
+        model_alias = %model_alias,
+        streaming  = is_streaming,
+        "Dispatching Anthropic-format request"
+    );
+
     if is_streaming {
         let msg_id = format!("msg_{}", Uuid::new_v4().simple());
 
-        match dispatch_stream(&pool, &internal_req, retry_config).await {
+        match dispatch_stream(pool, &internal_req, retry_config).await {
             Ok((stream, provider_name, model_id)) => {
                 let finalizer = RequestFinalizer::new(
                     &state,
                     &ctx,
                     reservation.map(|Extension(r)| r),
-                    model_alias,
+                    model_alias.to_string(),
                     provider_name,
                     model_id,
                     start,
@@ -174,18 +186,18 @@ pub async fn anthropic_messages(
                     .into_response())
             }
             Err(e) => {
-                record_error_count(&model_alias, "", &e);
+                record_error_count(model_alias, "", &e);
                 Ok(proxy_error_to_anthropic_response(&e))
             }
         }
     } else {
-        match dispatch_non_stream(&pool, &internal_req, retry_config).await {
+        match dispatch_non_stream(pool, &internal_req, retry_config).await {
             Ok((resp, provider_name, model_id)) => {
                 RequestFinalizer::new(
                     &state,
                     &ctx,
                     reservation.map(|Extension(r)| r),
-                    model_alias,
+                    model_alias.to_string(),
                     provider_name,
                     model_id,
                     start,
@@ -196,7 +208,7 @@ pub async fn anthropic_messages(
                 Ok(Json(to_anthropic_response(resp)).into_response())
             }
             Err(e) => {
-                record_error_metrics(&model_alias, "", &e, start);
+                record_error_metrics(model_alias, "", &e, start);
                 Ok(proxy_error_to_anthropic_response(&e))
             }
         }

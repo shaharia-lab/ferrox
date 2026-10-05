@@ -512,10 +512,11 @@ mod tests {
         fn build_state(config: Config) -> AppState {
             let registry: ProviderRegistry = HashMap::new();
             let router = ModelRouter::from_config(&config, &registry).unwrap();
+            let resolver = crate::classifier::RouteResolver::build(&config, router).unwrap();
             let jwks_cache = JwksCache::new(vec![], 300, reqwest::Client::new());
             AppState {
                 rate_limit_backend: Arc::new(MemoryBackend::new()),
-                router: Arc::new(router),
+                resolver: Arc::new(resolver),
                 providers: Arc::new(registry),
                 metrics: Arc::new(Metrics::new()),
                 ready: Arc::new(AtomicBool::new(true)),
@@ -681,6 +682,7 @@ mod tests {
         async fn build_state(config: Config) -> AppState {
             let registry: ProviderRegistry = HashMap::new();
             let router = ModelRouter::from_config(&config, &registry).unwrap();
+            let resolver = crate::classifier::RouteResolver::build(&config, router).unwrap();
             let jwks_cache = JwksCache::new(
                 config.trusted_issuers.clone(),
                 config.jwks_cache_ttl_secs,
@@ -695,7 +697,7 @@ mod tests {
                 .await;
             AppState {
                 rate_limit_backend: Arc::new(MemoryBackend::new()),
-                router: Arc::new(router),
+                resolver: Arc::new(resolver),
                 providers: Arc::new(registry),
                 metrics: Arc::new(Metrics::new()),
                 ready: Arc::new(AtomicBool::new(true)),

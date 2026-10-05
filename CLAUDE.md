@@ -60,13 +60,13 @@ DATABASE_URL="postgres://postgres:testpass@localhost:5433/postgres" \
 ### Request Flow
 
 ```
-Client → [auth middleware] → [rate limiter] → ModelRouter
+Client → [auth middleware] → [rate limiter] → RouteResolver (ModelRouter)
   → RoutePool → [circuit breaker] → [retry] → Provider adapter → LLM API
 ```
 
 1. **Auth** (`ferrox/src/auth.rs`): Bearer token validates against virtual keys or JWT (JWKS-backed)
 2. **JWKS cache** (`ferrox/src/jwks.rs`): TTL refresh with stale fallback; `jwks_uri` points to ferrox-cp
-3. **ModelRouter** (`ferrox/src/router.rs`): Resolves model alias → `RoutePool`
+3. **RouteResolver** (`ferrox/src/classifier/resolver.rs`): Resolves the requested alias → `RoutePool` through `ModelRouter` (`ferrox/src/router.rs`); a classified alias is first mapped by its `Classifier` to a tier's alias, or to `fallback_alias` on any classifier failure
 4. **RoutePool** (`ferrox/src/lb/`): Selects target using configured strategy
 5. **Circuit Breaker** (`ferrox/src/lb/circuit_breaker.rs`): Per-provider+model, lock-free via `AtomicU8`
 6. **Provider Adapters** (`ferrox-providers/src/providers/`): Translate OpenAI format to/from each provider's API

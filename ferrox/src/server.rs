@@ -112,11 +112,12 @@ mod tests {
 
     fn build_state_with(config: Config, registry: crate::providers::ProviderRegistry) -> AppState {
         let router = crate::router::ModelRouter::from_config(&config, &registry).unwrap();
+        let resolver = crate::classifier::RouteResolver::build(&config, router).unwrap();
         let jwks_cache = crate::jwks::JwksCache::new(vec![], 300, reqwest::Client::new());
         AppState {
             config: Arc::new(config),
             providers: Arc::new(registry),
-            router: Arc::new(router),
+            resolver: Arc::new(resolver),
             rate_limit_backend: Arc::new(crate::ratelimit::MemoryBackend::new()),
             metrics: Arc::new(crate::metrics::Metrics::new()),
             ready: Arc::new(AtomicBool::new(true)),
@@ -276,43 +277,6 @@ mod tests {
                 .map(|m| m["id"].as_str().unwrap())
                 .collect();
             assert_eq!(ids, ["fast", "smart", "auto"], "{path}");
-        }
-    }
-
-    /// Until the resolver exists, a classified alias has no pool: every
-    /// inbound surface answers with the ordinary "not configured" 404.
-    #[tokio::test]
-    async fn classified_alias_is_not_configured_on_every_surface() {
-        let message = serde_json::json!([{"role": "user", "content": "hi"}]);
-        let cases = [
-            (
-                "/v1/chat/completions",
-                serde_json::json!({"model": "auto", "messages": message}),
-            ),
-            (
-                "/v1/responses",
-                serde_json::json!({"model": "auto", "input": "hi"}),
-            ),
-            (
-                "/anthropic/v1/messages",
-                serde_json::json!({"model": "auto", "max_tokens": 16, "messages": message}),
-            ),
-        ];
-        for (path, body) in cases {
-            let request = Request::builder()
-                .method("POST")
-                .uri(path)
-                .header("authorization", "Bearer sk-test")
-                .header("content-type", "application/json")
-                .body(Body::from(body.to_string()))
-                .unwrap();
-            let (status, body) = send(classified_app().await, request).await;
-            assert_eq!(status, StatusCode::NOT_FOUND, "{path}: {body}");
-            assert!(
-                body.to_string()
-                    .contains("Model alias 'auto' is not configured"),
-                "{path}: {body}"
-            );
         }
     }
 }
