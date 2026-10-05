@@ -185,6 +185,11 @@ models:
 # A classified alias has a `classifier` block instead of `routing`: a
 # classifier looks at each request and picks one of the listed tiers. Every
 # tier and the fallback must be a statically routed alias from `models`.
+#
+# Data handling: the last user message and as much of the preceding
+# user/assistant text as fits in `max_input_chars` is sent to the classifier
+# (`base_url`, TypeSafe by default). System prompts, images, tool calls and
+# tool results are never sent. See docs/user/routing.md#classified-aliases.
 # ─────────────────────────────────────────
 # classifiers:
 #   - id: jev-main
@@ -207,10 +212,15 @@ models:
 #       use: jev-main                  # a classifier id from `classifiers`
 #       confidence_threshold: 0.6      # default 0; lower-confidence answers use fallback_alias
 #       fallback_alias: "claude-sonnet"   # used on classifier error, timeout, low confidence or open breaker
-#       shadow: false                  # default; true = classify and record, still serve fallback_alias
+#       shadow: false                  # default; true = classify and record, still serve fallback_alias.
+#                                      # Shadow mode still costs one classifier call (and its latency) per request
 #       tiers:
 #         simple:  { alias: "claude-haiku",  when: "Short factual or chat" }
 #         complex: { alias: "claude-sonnet", when: "Multi-step reasoning or code" }
+#
+# A client can skip the classifier for one request with the header
+# `x-ferrox-classifier: skip`; the request is then served by `fallback_alias`.
+# Successful responses name the alias that served them in `x-ferrox-routed-model`.
 
 # ─────────────────────────────────────────
 # Usage tracking (optional)

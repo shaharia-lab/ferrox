@@ -82,6 +82,21 @@ docker compose up postgres ferrox-cp
 docker compose up
 ```
 
+### Upgrade order
+
+The control plane applies its database migrations at startup, and the gateway
+writes `usage_log` rows straight into the same database (`usage_database_url`).
+When a release adds `usage_log` columns, upgrade and restart `ferrox-cp` first,
+then roll the gateway.
+
+This matters for the classifier columns added by migration
+`20240005000000_usage_log_classifier.sql` (`requested_model`, `routing_reason`,
+`classifier_confidence`, `classifier_latency_ms`, `classifier_input_tokens`,
+`classifier_model`). A gateway that writes them to a database without that
+migration fails every usage flush, for statically routed requests too, and logs
+`failed to flush usage records`. Requests are still served; their usage rows
+are lost.
+
 ### Admin UI
 
 The control plane serves a React single-page application at `/`.  After starting

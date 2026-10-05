@@ -419,6 +419,47 @@ unchanged.
 
 The `request_id` field is unique per request and can be used for idempotent processing on the receiver side.
 
+#### Classified requests
+
+A request to a [classified alias](#classified-aliases) adds its routing decision to the payload. `model` is still the alias that served the request; `requested_model` is the classified alias the client asked for:
+
+```json
+{
+  "event": "token_usage",
+  "request_id": "550e8400-e29b-41d4-a716-446655440000",
+  "client_id": "2a2bfb93-99af-414f-99cb-1891435c0806",
+  "key_name": "my-app",
+  "model": "claude-haiku",
+  "provider": "anthropic-primary",
+  "prompt_tokens": 120,
+  "completion_tokens": 80,
+  "total_tokens": 200,
+  "latency_ms": 843,
+  "timestamp": "2026-10-06T15:36:12.471Z",
+  "requested_model": "auto",
+  "routing_reason": "classified",
+  "classifier_confidence": 0.93,
+  "classifier_latency_ms": 84,
+  "classifier_input_tokens": 31,
+  "classifier_model": "jev-1.13.0"
+}
+```
+
+| Field | Present | Description |
+|---|---|---|
+| `requested_model` | Every classified request | The classified alias the client asked for |
+| `routing_reason` | Every classified request | Why `model` served it: one of the eight [reasons](routing.md#classified-aliases) |
+| `classifier_latency_ms` | Every classified request | Time spent on classification, input extraction included. Near `0` when the classifier was not called |
+| `classifier_confidence` | When the classifier answered and its backend reports a confidence | Confidence in the answer, `0` to `1` |
+| `classifier_input_tokens` | When the classifier answered | Tokens the classifier billed for this request; `0` for an answer read from the decision cache |
+| `classifier_model` | When the classifier answered | The classifier model that answered, as the backend names it (a resolved version such as `jev-1.13.0`, not the configured `jev-latest`) |
+
+The classifier answered when `routing_reason` is `classified`, `shadow` or `low_confidence`, and for an `unknown_choice` whose answer the backend returned. It did not for `timeout`, `error`, `breaker_open` and `opt_out`, where the last three fields are left out. The tier the classifier named is not part of the payload; it is in the `Classified request` log line and the `tier` label of `ferrox_classifier_decisions_total` (see [Observability](observability.md#classifier-metrics)).
+
+All six fields are **omitted entirely** for a request to a statically routed alias, so those payloads are unchanged.
+
+The same six values are stored in `usage_log` as nullable columns of the same names: `NULL` where the payload omits the field. Classifier tokens are recorded there for cost tracking only. They are never added to `prompt_tokens` or `total_tokens`, and never charged to a client's [token budget](virtual-keys.md#how-a-budget-is-charged).
+
 ### Reliability
 
 Webhooks are best-effort. The `usage_log` database (when `usage_database_url` is configured) remains the durable source of truth. Receivers can reconcile against the usage API for any missed webhook events.

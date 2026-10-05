@@ -45,6 +45,56 @@ The same two counters, with the same omit-when-zero rule, are included in the
 `token_usage` webhook payload — see
 [event_endpoints](configuration.md#event-payload).
 
+### Classified requests
+
+A request to a [classified alias](routing.md#classified-aliases) logs one extra
+`info` line, `Classified request`, before it is dispatched:
+
+```json
+{
+  "timestamp": "2026-10-06T10:00:00Z",
+  "level": "INFO",
+  "message": "Classified request",
+  "request_id": "550e8400-e29b-41d4-a716-446655440000",
+  "requested_alias": "auto",
+  "served_alias": "claude-haiku",
+  "reason": "classified",
+  "tier": "simple",
+  "confidence": 0.93,
+  "probabilities": "[(\"simple\", 0.93), (\"complex\", 0.07)]",
+  "classifier_model": "jev-1.13.0",
+  "classifier_input_tokens": 31,
+  "classifier_latency_ms": 84,
+  "cached": false
+}
+```
+
+| Field | Description |
+|---|---|
+| `requested_alias` | The classified alias the client asked for |
+| `served_alias` | The tier's alias or the `fallback_alias` that serves the request |
+| `reason` | One of the eight [reasons](routing.md#classified-aliases) |
+| `tier` | The tier the classifier named, as it named it. With `reason` `shadow`, the tier that would have served the request |
+| `confidence`, `probabilities` | The classifier's confidence in its answer and its per-tier probabilities, when the backend reports them |
+| `classifier_model`, `classifier_input_tokens` | The classifier model that answered and the tokens it billed (`0` for a cached answer) |
+| `classifier_latency_ms` | Time spent on classification, input extraction included |
+| `cached` | `true` when the answer came from the decision cache and the classifier was not called |
+| `error` | Why there is no answer, as a short message such as `classifier timed out` or `classifier circuit breaker is open` |
+
+The answer fields (`tier`, `confidence`, `probabilities`, `classifier_model`,
+`classifier_input_tokens`) are omitted when the classifier gave no answer, and
+`error` is omitted when it gave one. The line never contains request text.
+
+The completion line that follows (`request_completed` and its siblings) carries
+the served alias in `model_alias`, exactly as for a request sent to that alias
+directly.
+
+The decision is also recorded with the request's usage: six optional fields
+(`requested_model`, `routing_reason`, `classifier_confidence`,
+`classifier_latency_ms`, `classifier_input_tokens`, `classifier_model`) in the
+`token_usage` webhook payload and as nullable `usage_log` columns. See
+[Classified requests](configuration.md#classified-requests) for their values.
+
 ---
 
 ## Prometheus metrics
@@ -119,14 +169,49 @@ a failover to a provider that does not cache).
 | `ferrox_circuit_breaker_state` | Gauge | `provider`, `model_alias` | State: `0`=closed, `1`=open, `2`=half-open. A classifier's breaker reports `provider="classifier:<id>"` with an empty `model_alias` |
 | `ferrox_circuit_breaker_trips_total` | Counter | `provider` | Times a circuit transitioned to open |
 
-### Classifier cache metrics
+### Classifier metrics
+
+These exist only for [classified aliases](routing.md#classified-aliases).
 
 | Metric | Type | Labels | Description |
 |---|---|---|---|
+| `ferrox_classifier_decisions_total` | Counter | `alias`, `tier`, `reason` | Routing decisions for requests to a classified alias |
+| `ferrox_classifier_duration_seconds` | Histogram | `classifier` | Time spent waiting for a classifier's answer, timeouts included |
 | `ferrox_classifier_cache_hits_total` | Counter | `classifier` | Classified requests routed by a cached classifier answer, without a classifier call |
 | `ferrox_classifier_cache_misses_total` | Counter | `classifier` | Classified requests whose input had no cached answer |
 
-`classifier` is the `classifiers[].id`. Neither counter moves for a classifier whose cache is disabled.
+- `alias` is the classified alias the client asked for, not the alias that served the request.
+- `tier` is the configured tier the classifier named, or `none` when there is no such tier: the classifier gave no answer, was not called, or named a tier the alias does not list. With `reason="shadow"` or `reason="low_confidence"` it is the tier that was named but not served.
+- `reason` is one of `classified`, `low_confidence`, `timeout`, `error`, `unknown_choice`, `breaker_open`, `shadow`, `opt_out`; see [the table of reasons](routing.md#classified-aliases). Every reason other than `classified` was served by `fallback_alias`. A decision made from a cached answer is counted like any other.
+- `classifier` is the `classifiers[].id`.
+
+`ferrox_classifier_duration_seconds` has buckets from 10 ms to 5 s. Only a real call is timed: a cached answer, an opted-out request, an open breaker and a request with no user text add no sample. Neither cache counter moves for a classifier whose cache is disabled.
+
+**Fallback rate** of a classified alias, the share of its requests the classifier did not route:
+
+```promql
+sum by (alias) (rate(ferrox_classifier_decisions_total{reason!="classified"}[5m]))
+/
+sum by (alias) (rate(ferrox_classifier_decisions_total[5m]))
+```
+
+On an alias in shadow mode every request is a fallback, so graph `reason="shadow"` by `tier` there instead. That is the share of requests whose answer would be followed once the alias goes live; the part of it that would change which model answers is the tiers whose alias differs from `fallback_alias`:
+
+```promql
+sum by (alias, tier) (rate(ferrox_classifier_decisions_total{reason="shadow"}[5m]))
+/ ignoring (tier) group_left
+sum by (alias) (rate(ferrox_classifier_decisions_total[5m]))
+```
+
+**p95 classifier latency**:
+
+```promql
+histogram_quantile(0.95, sum by (le, classifier) (rate(ferrox_classifier_duration_seconds_bucket[5m])))
+```
+
+A classifier that is down shows up as `ferrox_circuit_breaker_state{provider="classifier:<id>"} == 1` (see [Circuit breaker metrics](#circuit-breaker-metrics)) and as a rising `reason="breaker_open"` rate.
+
+The request, token and latency metrics of a classified request are recorded under the alias that served it (`model_alias` is the tier's alias or the fallback's).
 
 ### Webhook metrics
 

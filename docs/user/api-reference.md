@@ -34,11 +34,33 @@ Health and metrics endpoints are public.
 
 ---
 
+## Classifier headers
+
+The three inference endpoints (`POST /v1/chat/completions`, `POST /v1/responses`, `POST /anthropic/v1/messages`) share one optional request header and one response header. Both matter only when `model` is a [classified alias](routing.md#classified-aliases).
+
+| Header | Direction | Description |
+|---|---|---|
+| `x-ferrox-classifier: skip` | Request | Skip classification for this request: the alias is served by its `fallback_alias` and the classifier is not called. The value is case-insensitive. Any other value, and the header on a statically routed alias, has no effect |
+| `x-ferrox-routed-model` | Response | The statically routed alias that served the request: a tier's alias or the `fallback_alias`. Present on every successful response to a classified alias, streaming included (it is sent before the first event). Absent on error responses and on responses to a statically routed alias |
+
+```bash
+curl -i http://localhost:8080/v1/chat/completions \
+  -H "Authorization: Bearer $PROXY_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"auto","messages":[{"role":"user","content":"Hello"}]}'
+# HTTP/1.1 200 OK
+# x-ferrox-routed-model: claude-haiku
+```
+
+---
+
 ## POST /v1/chat/completions
 
 Send a chat completion request. Ferrox routes it to the configured provider based on the `model` field.
 
 ### Request
+
+Optional header: `x-ferrox-classifier: skip` (see [Classifier headers](#classifier-headers)).
 
 ```json
 {
@@ -88,6 +110,8 @@ and a Chat Completions client has none to send back. An explicit Anthropic `thin
 wins over the mapping.
 
 ### Non-streaming response
+
+A successful response to a classified alias, streaming or not, carries the `x-ferrox-routed-model` header (see [Classifier headers](#classifier-headers)).
 
 ```json
 {
@@ -163,6 +187,8 @@ The endpoint is **stateless**: nothing is stored, `store` is accepted and always
 
 ### Request
 
+Optional header: `x-ferrox-classifier: skip` (see [Classifier headers](#classifier-headers)).
+
 ```json
 {
   "model": "claude-sonnet",
@@ -210,6 +236,8 @@ Unknown top-level fields are ignored, so a newer SDK still works.
 A `type: openai` provider configured with `responses: native` receives the client's body unchanged except for `model`, at `{base_url}/responses`, and its `response` object or event stream is passed through verbatim (ids and `model` are the upstream's). Accounting is the same as above. On such a target, the hosted tools and Files-API inputs in the table above are **not** rejected; on an alias with a mix of native and translate-only targets, requests using them go only to the native ones (or get the `400` when none can take them). `store: true` is rejected with a `400` on any alias with a native target. See [providers](providers.md#native-responses-api-passthrough).
 
 ### Non-streaming response
+
+A successful response to a classified alias, streaming or not, carries the `x-ferrox-routed-model` header (see [Classifier headers](#classifier-headers)).
 
 ```json
 {
@@ -320,6 +348,8 @@ Requires `x-api-key: <virtual-key>` (or `Authorization: Bearer <virtual-key>`).
 
 ### Request
 
+Optional header: `x-ferrox-classifier: skip` (see [Classifier headers](#classifier-headers)).
+
 ```json
 {
   "model": "claude-sonnet",
@@ -349,6 +379,8 @@ Requires `x-api-key: <virtual-key>` (or `Authorization: Bearer <virtual-key>`).
 | `top_k` | integer | no | Accepted but not forwarded |
 
 ### Non-streaming response
+
+A successful response to a classified alias, streaming or not, carries the `x-ferrox-routed-model` header (see [Classifier headers](#classifier-headers)).
 
 ```json
 {
