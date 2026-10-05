@@ -7,7 +7,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context as _};
 use axum::http::HeaderMap;
+use sha2::Sha256;
 
+use super::cache::{self, DecisionCache};
 use super::{
     Classification, Classifier, ClassifierError, ClassifierInput, ClassifierRegistry, Tier,
 };
@@ -81,6 +83,9 @@ pub struct ClassificationRecord {
     pub error: Option<ClassifierError>,
     /// Time spent on classification, input extraction included.
     pub latency: Duration,
+    /// The answer came from the decision cache; the classifier was not
+    /// called for this request.
+    pub cached: bool,
 }
 
 /// The outcome of resolving a requested alias.
@@ -119,6 +124,7 @@ impl RouteDecision<'_> {
             classifier_model = answer.map(|c| c.model.as_str()),
             classifier_input_tokens = answer.map(|c| c.input_tokens),
             classifier_latency_ms = record.latency.as_millis() as u64,
+            cached = record.cached,
             error = record.error.as_ref().map(tracing::field::display),
             "Classified request"
         );
@@ -130,6 +136,11 @@ struct ClassifiedRoute {
     classifier: Arc<dyn Classifier>,
     /// The classifier's breaker, shared by every alias that uses it.
     breaker: Arc<CircuitBreaker>,
+    /// The classifier's decision cache, shared by every alias that uses it.
+    /// `None` when the classifier's cache is disabled.
+    cache: Option<Arc<DecisionCache>>,
+    /// The configuration half of this alias's cache keys, hashed at startup.
+    key_prefix: Sha256,
     tiers: Vec<Tier>,
     /// The pool serving each tier; parallel to `tiers`.
     tier_pools: Vec<Arc<RoutePool>>,
@@ -196,12 +207,14 @@ impl ClassifiedRoute {
 
 impl ClassifiedRoute {
     /// The decision for a request to `alias` whose classification, begun at
-    /// `start`, ended in `outcome`.
+    /// `start`, ended in `outcome`. `cached` says the outcome is an answer
+    /// read from the decision cache.
     fn decision<'a>(
         &self,
         alias: &'a str,
         outcome: Result<Classification, ClassifierError>,
         start: Instant,
+        cached: bool,
     ) -> RouteDecision<'a> {
         let (pool, reason, classification, error) = self.decide(outcome);
         RouteDecision {
@@ -212,7 +225,20 @@ impl ClassifiedRoute {
                 classification,
                 error,
                 latency: start.elapsed(),
+                cached,
             }),
+        }
+    }
+}
+
+impl ClassificationRecord {
+    /// The answer, when it was followed — or would have been, in shadow
+    /// mode. Only such an answer is worth keeping for the next identical
+    /// input.
+    fn followed(&self) -> Option<&Classification> {
+        match self.reason {
+            Reason::Classified | Reason::Shadow => self.classification.as_ref(),
+            _ => None,
         }
     }
 }
@@ -258,6 +284,17 @@ impl RouteResolver {
                 (c.id.as_str(), Arc::new(breaker))
             })
             .collect();
+        // One cache per classifier too; none for a classifier that turns
+        // its cache off.
+        let caches: HashMap<&str, Arc<DecisionCache>> = config
+            .classifiers
+            .iter()
+            .filter_map(|c| {
+                let ttl = Duration::from_secs(c.cache_ttl_secs);
+                let cache = DecisionCache::new(&c.id, ttl, c.cache_max_entries as u64)?;
+                Some((c.id.as_str(), Arc::new(cache)))
+            })
+            .collect();
 
         let mut classified = HashMap::new();
         for model in &config.models {
@@ -300,6 +337,13 @@ impl RouteResolver {
                 ClassifiedRoute {
                     classifier,
                     breaker: breakers[settings.id.as_str()].clone(),
+                    cache: caches.get(settings.id.as_str()).cloned(),
+                    key_prefix: cache::key_prefix(
+                        &model.alias,
+                        &settings.id,
+                        &settings.model,
+                        &tiers,
+                    ),
                     tiers,
                     tier_pools,
                     fallback: pool(&alias.fallback_alias)?,
@@ -322,6 +366,10 @@ impl RouteResolver {
     /// "not configured" one for an alias that does not exist. While its
     /// circuit breaker is open it is not called at all, so a classifier that
     /// keeps timing out stops adding its `timeout_ms` to every request.
+    ///
+    /// An answer that was followed is kept in the classifier's decision
+    /// cache, and an identical input to the same alias is then served from
+    /// it without a call until the entry expires.
     ///
     /// `skip_classifier` is the client's opt-out ([`skip_requested`]): a
     /// classified alias is then served by its `fallback_alias` and the
@@ -359,16 +407,43 @@ impl RouteResolver {
                     classification: None,
                     error: None,
                     latency: start.elapsed(),
+                    cached: false,
                 }),
             });
         }
-        // Asked before the input is built: an open breaker costs a request
-        // no extraction either. Reads only, so nothing is claimed for a
-        // request that then has nothing to classify.
-        let input = if route.breaker.can_serve() {
-            input(route.max_input_chars)
-        } else {
-            return Ok(route.decision(alias, Err(ClassifierError::BreakerOpen), start));
+        // With a decision cache the input comes first, because the key is
+        // made from it: an answer already given is served whatever state the
+        // breaker is in, and costs neither a classifier call nor a probe.
+        let (input, key) = match &route.cache {
+            Some(decisions) => {
+                let input = input(route.max_input_chars);
+                if input.turns.is_empty() {
+                    return Ok(route.decision(alias, Err(ClassifierError::NoInput), start, false));
+                }
+                let key = cache::key(&route.key_prefix, &input);
+                // Through `decide` like a fresh answer, so a hit can select
+                // nothing a fresh answer could not.
+                if let Some(answer) = decisions.get(&key) {
+                    return Ok(route.decision(alias, Ok(answer), start, true));
+                }
+                if !route.breaker.can_serve() {
+                    return Ok(route.decision(
+                        alias,
+                        Err(ClassifierError::BreakerOpen),
+                        start,
+                        false,
+                    ));
+                }
+                (input, Some((decisions, key)))
+            }
+            // Without one the breaker is asked before the input is built: an
+            // open breaker costs a request no extraction either. Reads only,
+            // so nothing is claimed for a request that then has nothing to
+            // classify.
+            None if route.breaker.can_serve() => (input(route.max_input_chars), None),
+            None => {
+                return Ok(route.decision(alias, Err(ClassifierError::BreakerOpen), start, false));
+            }
         };
         let outcome = if input.turns.is_empty() {
             Err(ClassifierError::NoInput)
@@ -390,7 +465,15 @@ impl RouteResolver {
         } else {
             Err(ClassifierError::BreakerOpen)
         };
-        Ok(route.decision(alias, outcome, start))
+        let decision = route.decision(alias, outcome, start, false);
+        // Failures, unknown choices and unsure answers are asked again.
+        if let Some((decisions, key)) = key {
+            let followed = decision.classification.as_ref().and_then(|r| r.followed());
+            if let Some(answer) = followed {
+                decisions.insert(key, answer.clone());
+            }
+        }
+        Ok(decision)
     }
 }
 
@@ -624,6 +707,247 @@ mod tests {
         let opaque = axum::http::HeaderValue::from_bytes(b"sk\xffip").unwrap();
         headers.insert(CLASSIFIER_HEADER, opaque);
         assert!(!skip_requested(&headers));
+    }
+
+    fn asking(text: &'static str) -> impl FnOnce(usize) -> ClassifierInput {
+        move |_| ClassifierInput {
+            turns: vec![Turn {
+                role: Role::User,
+                text: text.to_string(),
+            }],
+        }
+    }
+
+    /// The same alias as `auto`, under another name.
+    fn with_second_alias(mut config: Config) -> Config {
+        let mut second = config.models.last().unwrap().clone();
+        second.alias = "auto-2".to_string();
+        config.models.push(second);
+        config
+    }
+
+    #[tokio::test]
+    async fn an_identical_input_is_served_from_the_cache_without_a_call() {
+        let classifier = FakeClassifier::new(Answer::Tier("simple", Some(0.9)));
+        let resolver = resolver(&classifier);
+
+        let first = resolver.resolve("auto", false, input).await.unwrap();
+        let second = resolver.resolve("auto", false, input).await.unwrap();
+
+        assert_eq!(classifier.calls(), 1);
+        assert_eq!(first.served_alias(), "fast");
+        assert_eq!(second.served_alias(), "fast");
+        let first = first.classification.unwrap();
+        assert!(!first.cached);
+        assert_eq!(first.classification, Some(answer("simple", Some(0.9))));
+        let second = second.classification.unwrap();
+        assert!(second.cached);
+        assert_eq!(second.reason, Reason::Classified);
+        assert_eq!(second.error, None);
+        // The same answer, with nothing billed for it this time.
+        assert_eq!(
+            second.classification,
+            Some(Classification {
+                input_tokens: 0,
+                ..answer("simple", Some(0.9))
+            })
+        );
+
+        // Another input is another question.
+        let other = resolver
+            .resolve("auto", false, asking("something else"))
+            .await
+            .unwrap();
+        assert!(!other.classification.unwrap().cached);
+        assert_eq!(classifier.calls(), 2);
+    }
+
+    /// An answer given for one alias is not reused for another, even one
+    /// with the same classifier and tiers.
+    #[tokio::test]
+    async fn another_alias_with_the_same_input_is_a_miss() {
+        let classifier = FakeClassifier::new(Answer::Tier("simple", Some(0.9)));
+        let config = with_second_alias(gateway_config(json!({})));
+        let resolver = resolver_for(&config, &classifier);
+
+        for (alias, calls) in [("auto", 1), ("auto-2", 2), ("auto", 2), ("auto-2", 2)] {
+            let decision = resolver.resolve(alias, false, input).await.unwrap();
+            assert_eq!(decision.served_alias(), "fast", "{alias}");
+            assert_eq!(classifier.calls(), calls, "{alias}");
+        }
+    }
+
+    /// The key a route gives an input covers the classifier's model and
+    /// every tier's `when` text, so a config change that could change the
+    /// answer never finds the old one.
+    #[test]
+    fn a_changed_when_text_or_classifier_model_changes_the_key() {
+        let classifier = FakeClassifier::new(Answer::Hang);
+        let key = |config: &Config| {
+            let resolver = resolver_for(config, &classifier);
+            cache::key(&resolver.classified["auto"].key_prefix, &input(0))
+        };
+        let base = gateway_config(json!({}));
+
+        let mut reworded = base.clone();
+        let auto = reworded.models.iter_mut().find(|m| m.alias == "auto");
+        let tiers = &mut auto.unwrap().classifier.as_mut().unwrap().tiers;
+        tiers.get_mut("simple").unwrap().when = "Anything short".to_string();
+
+        assert_eq!(key(&base), key(&gateway_config(json!({}))));
+        assert_ne!(key(&base), key(&reworded));
+        assert_ne!(key(&base), key(&gateway_config(json!({"model": "jev-2"}))));
+    }
+
+    /// Only an answer that was followed is kept: after any other outcome
+    /// the same input asks the classifier again.
+    #[tokio::test]
+    async fn an_outcome_that_was_not_followed_is_not_cached() {
+        let failed = ClassifierError::Failed("upstream said 529".to_string());
+        let cases = [
+            (Answer::Fail(ClassifierError::Timeout), Reason::Timeout),
+            (Answer::Hang, Reason::Timeout),
+            (Answer::Fail(failed), Reason::Error),
+            (
+                Answer::Fail(ClassifierError::Unavailable("down".to_string())),
+                Reason::Error,
+            ),
+            (
+                Answer::Fail(ClassifierError::UnknownChoice),
+                Reason::UnknownChoice,
+            ),
+            (Answer::Tier("medium", Some(0.9)), Reason::UnknownChoice),
+            (Answer::Tier("simple", Some(0.59)), Reason::LowConfidence),
+            (
+                Answer::Tier("simple", Some(f64::NAN)),
+                Reason::LowConfidence,
+            ),
+        ];
+        for (reply, reason) in cases {
+            let classifier = FakeClassifier::new(reply.clone());
+            let resolver = resolver(&classifier);
+
+            for call in 1..=2 {
+                let decision = resolver.resolve("auto", false, input).await.unwrap();
+                let case = format!("{reply:?} call {call}");
+                assert_eq!(decision.served_alias(), "smart", "{case}");
+                assert_eq!(classifier.calls(), call, "{case}");
+                let record = decision.classification.expect(&case);
+                assert_eq!(record.reason, reason, "{case}");
+                assert!(!record.cached, "{case}");
+            }
+        }
+    }
+
+    /// A shadow answer is one that would have been followed, so it is kept:
+    /// the repeat is still served by the fallback and still reported as a
+    /// shadow.
+    #[tokio::test]
+    async fn a_shadow_answer_is_cached() {
+        let classifier = FakeClassifier::new(Answer::Tier("simple", Some(0.9)));
+        let resolver = resolver_for(&shadowed(gateway_config(json!({}))), &classifier);
+
+        for cached in [false, true] {
+            let decision = resolver.resolve("auto", false, input).await.unwrap();
+            assert_eq!(decision.served_alias(), "smart", "cached={cached}");
+            let record = decision.classification.unwrap();
+            assert_eq!(record.reason, Reason::Shadow, "cached={cached}");
+            assert_eq!(record.cached, cached);
+        }
+        assert_eq!(classifier.calls(), 1);
+    }
+
+    /// An answer already given is served while the classifier is down; an
+    /// input it has not answered falls back as before.
+    #[tokio::test]
+    async fn a_hit_is_served_while_the_breaker_is_open() {
+        let classifier = FakeClassifier::new(Answer::Tier("simple", Some(0.9)));
+        let config = gateway_config(json!({
+            "circuit_breaker": {"failure_threshold": 1, "recovery_timeout_secs": 30},
+        }));
+        let resolver = resolver_for(&config, &classifier);
+        resolver.resolve("auto", false, input).await.unwrap();
+
+        let breaker = &resolver.classified["auto"].breaker;
+        breaker.record_failure();
+        assert!(!breaker.can_serve());
+
+        let hit = resolver.resolve("auto", false, input).await.unwrap();
+        assert_eq!(hit.served_alias(), "fast");
+        let record = hit.classification.unwrap();
+        assert_eq!(record.reason, Reason::Classified);
+        assert!(record.cached);
+
+        let miss = resolver
+            .resolve("auto", false, asking("something else"))
+            .await
+            .unwrap();
+        assert_eq!(miss.served_alias(), "smart");
+        let record = miss.classification.unwrap();
+        assert_eq!(record.reason, Reason::BreakerOpen);
+        assert!(!record.cached);
+
+        // Neither the hit nor the miss reached the classifier or took the
+        // breaker's probe.
+        assert_eq!(classifier.calls(), 1);
+        assert!(!breaker.probe_in_flight());
+    }
+
+    /// `cache_ttl_secs: 0` or `cache_max_entries: 0` is no cache: every
+    /// request calls the classifier, and an open breaker is noticed before
+    /// the request is read.
+    #[tokio::test]
+    async fn a_disabled_cache_changes_nothing() {
+        for off in [
+            json!({"cache_ttl_secs": 0}),
+            json!({"cache_max_entries": 0}),
+        ] {
+            let classifier = FakeClassifier::new(Answer::Tier("simple", Some(0.9)));
+            let mut settings = off.clone();
+            settings["circuit_breaker"] =
+                json!({"failure_threshold": 1, "recovery_timeout_secs": 30});
+            let resolver = resolver_for(&gateway_config(settings), &classifier);
+            assert!(resolver.classified["auto"].cache.is_none(), "{off}");
+
+            for call in 1..=2 {
+                let decision = resolver.resolve("auto", false, input).await.unwrap();
+                assert_eq!(decision.served_alias(), "fast", "{off}");
+                assert!(!decision.classification.unwrap().cached, "{off}");
+                assert_eq!(classifier.calls(), call, "{off}");
+            }
+
+            resolver.classified["auto"].breaker.record_failure();
+            let decision = resolver
+                .resolve("auto", false, |_| {
+                    panic!("an open breaker must not extract input")
+                })
+                .await
+                .unwrap();
+            assert_eq!(
+                decision.classification.unwrap().reason,
+                Reason::BreakerOpen,
+                "{off}"
+            );
+            assert_eq!(classifier.calls(), 2, "{off}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_cached_answer_expires_after_the_ttl() {
+        let classifier = FakeClassifier::new(Answer::Tier("simple", Some(0.9)));
+        let resolver = resolver_for(&gateway_config(json!({"cache_ttl_secs": 1})), &classifier);
+
+        resolver.resolve("auto", false, input).await.unwrap();
+        let hit = resolver.resolve("auto", false, input).await.unwrap();
+        assert!(hit.classification.unwrap().cached);
+        assert_eq!(classifier.calls(), 1);
+
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+
+        let expired = resolver.resolve("auto", false, input).await.unwrap();
+        assert_eq!(expired.served_alias(), "fast");
+        assert!(!expired.classification.unwrap().cached);
+        assert_eq!(classifier.calls(), 2);
     }
 
     #[tokio::test]

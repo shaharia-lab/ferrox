@@ -119,6 +119,15 @@ a failover to a provider that does not cache).
 | `ferrox_circuit_breaker_state` | Gauge | `provider`, `model_alias` | State: `0`=closed, `1`=open, `2`=half-open. A classifier's breaker reports `provider="classifier:<id>"` with an empty `model_alias` |
 | `ferrox_circuit_breaker_trips_total` | Counter | `provider` | Times a circuit transitioned to open |
 
+### Classifier cache metrics
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `ferrox_classifier_cache_hits_total` | Counter | `classifier` | Classified requests routed by a cached classifier answer, without a classifier call |
+| `ferrox_classifier_cache_misses_total` | Counter | `classifier` | Classified requests whose input had no cached answer |
+
+`classifier` is the `classifiers[].id`. Neither counter moves for a classifier whose cache is disabled.
+
 ### Webhook metrics
 
 | Metric | Type | Labels | Description |

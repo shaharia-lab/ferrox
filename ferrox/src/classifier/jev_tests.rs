@@ -343,11 +343,15 @@ async fn an_answer_slower_than_the_timeout_serves_the_fallback() {
 }
 
 /// Breaker settings that open on the second failure and allow a probe one
-/// second later.
+/// second later. The decision cache is off, so every request to the alias
+/// reaches the breaker.
 fn breaker() -> Value {
-    json!({"circuit_breaker": {
-        "failure_threshold": 2, "success_threshold": 1, "recovery_timeout_secs": 1
-    }})
+    json!({
+        "circuit_breaker": {
+            "failure_threshold": 2, "success_threshold": 1, "recovery_timeout_secs": 1
+        },
+        "cache_ttl_secs": 0,
+    })
 }
 
 #[tokio::test]
@@ -498,13 +502,17 @@ async fn aliases_sharing_a_classifier_share_its_breaker() {
     assert_eq!(calls(&server).await, 1);
 }
 
-/// With the breaker open a request is not even read for its text.
+/// With the breaker open and no decision cache, a request is not even read
+/// for its text.
 #[tokio::test]
 async fn an_open_breaker_skips_input_extraction() {
     let server = server(ResponseTemplate::new(529)).await;
     let resolver = resolver(
         &server,
-        json!({"circuit_breaker": {"failure_threshold": 1, "recovery_timeout_secs": 30}}),
+        json!({
+            "circuit_breaker": {"failure_threshold": 1, "recovery_timeout_secs": 30},
+            "cache_ttl_secs": 0,
+        }),
     );
     assert_eq!(resolve(&resolver).await.0, Reason::Error);
 

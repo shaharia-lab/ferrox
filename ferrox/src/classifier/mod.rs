@@ -15,7 +15,10 @@
 //!   fail a request. An alias in shadow mode, and a request that opts out
 //!   with the `x-ferrox-classifier: skip` header, are served by the
 //!   `fallback_alias` too.
+//! - `cache` keeps each classifier's recent answers in memory, so an input
+//!   it has already answered is routed without calling it again.
 
+mod cache;
 mod input;
 mod jev;
 mod resolver;

@@ -78,6 +78,10 @@ base64 = "0.21"
 deadpool-redis = { version = "0.15", features = ["rt_tokio_1"] }
 redis = { version = "0.25", default-features = false, features = ["tokio-comp", "script"] }
 
+# Classifier decision cache
+moka = { version = "0.12", default-features = false, features = ["sync"] }  # bounded, TTL'd concurrent cache
+sha2 = "0.10"  # cache key digest
+
 # Database (for usage log persistence)
 sqlx = { version = "0.8", default-features = false, features = [
     "postgres",
