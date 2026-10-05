@@ -283,20 +283,34 @@ impl ClassifiedRoute {
             .as_ref()
             .and_then(|answer| self.tiers.iter().find(|t| t.name == answer.tier))
             .map_or(NO_TIER, |t| t.name.as_str());
-        CLASSIFIER_DECISIONS_TOTAL
-            .with_label_values(&[alias, tier, reason.as_str()])
-            .inc();
-        RouteDecision {
-            requested_alias: alias,
-            pool,
-            classification: Some(ClassificationRecord {
-                reason,
-                classification,
-                error,
-                latency: start.elapsed(),
-                cached,
-            }),
-        }
+        let record = ClassificationRecord {
+            reason,
+            classification,
+            error,
+            latency: start.elapsed(),
+            cached,
+        };
+        counted_decision(alias, pool, tier, record)
+    }
+}
+
+/// The decision for a request to the classified alias `alias`, counted in
+/// `ferrox_classifier_decisions_total`: the one place such a decision is
+/// built, so none goes uncounted. `tier` is a configured tier's name or
+/// [`NO_TIER`].
+fn counted_decision<'a>(
+    alias: &'a str,
+    pool: Arc<RoutePool>,
+    tier: &str,
+    record: ClassificationRecord,
+) -> RouteDecision<'a> {
+    CLASSIFIER_DECISIONS_TOTAL
+        .with_label_values(&[alias, tier, record.reason.as_str()])
+        .inc();
+    RouteDecision {
+        requested_alias: alias,
+        pool,
+        classification: Some(record),
     }
 }
 
@@ -469,20 +483,19 @@ impl RouteResolver {
         // Before the breaker and the input: an opted-out request costs
         // neither, and says nothing about the classifier's health.
         if skip_classifier {
-            CLASSIFIER_DECISIONS_TOTAL
-                .with_label_values(&[alias, NO_TIER, Reason::OptOut.as_str()])
-                .inc();
-            return Ok(RouteDecision {
-                requested_alias: alias,
-                pool: route.fallback.clone(),
-                classification: Some(ClassificationRecord {
-                    reason: Reason::OptOut,
-                    classification: None,
-                    error: None,
-                    latency: start.elapsed(),
-                    cached: false,
-                }),
-            });
+            let record = ClassificationRecord {
+                reason: Reason::OptOut,
+                classification: None,
+                error: None,
+                latency: start.elapsed(),
+                cached: false,
+            };
+            return Ok(counted_decision(
+                alias,
+                route.fallback.clone(),
+                NO_TIER,
+                record,
+            ));
         }
         // With a decision cache the input comes first, because the key is
         // made from it: an answer already given is served whatever state the

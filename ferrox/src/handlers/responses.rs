@@ -157,7 +157,9 @@ pub async fn responses(
         .with_routing(decision.routing_record())
     };
 
-    if req.is_streaming() {
+    // Every successful answer below, native or translated, streamed or not,
+    // leaves through the one place that names the served alias.
+    let response: Result<Response, ProxyError> = if req.is_streaming() {
         let served = dispatch(
             pool,
             retry_config,
@@ -198,11 +200,9 @@ pub async fn responses(
                         None => frame,
                     })
                 });
-                Ok(decision.with_routed_model_header(
-                    Sse::new(sse_stream)
-                        .keep_alive(KeepAlive::default())
-                        .into_response(),
-                ))
+                Ok(Sse::new(sse_stream)
+                    .keep_alive(KeepAlive::default())
+                    .into_response())
             }
             Ok((Served::Translated(stream), provider_name, model_id)) => {
                 // The emitter drains the metered stream before it emits the
@@ -214,11 +214,9 @@ pub async fn responses(
                         .wrap_stream(stream)
                         .boxed(),
                 );
-                Ok(decision.with_routed_model_header(
-                    Sse::new(sse_stream)
-                        .keep_alive(KeepAlive::default())
-                        .into_response(),
-                ))
+                Ok(Sse::new(sse_stream)
+                    .keep_alive(KeepAlive::default())
+                    .into_response())
             }
             Err(e) => {
                 record_error_metrics(model_alias, "", &e, start);
@@ -254,24 +252,21 @@ pub async fn responses(
                 finalizer(provider_name, model_id)
                     .finish(resp.usage.as_ref())
                     .await;
-                Ok(decision.with_routed_model_header(
-                    ([(CONTENT_TYPE, "application/json")], resp.body).into_response(),
-                ))
+                Ok(([(CONTENT_TYPE, "application/json")], resp.body).into_response())
             }
             Ok((Served::Translated(resp), provider_name, model_id)) => {
                 finalizer(provider_name, model_id)
                     .finish(resp.usage.as_ref())
                     .await;
-                Ok(decision.with_routed_model_header(
-                    Json(to_responses_response(resp, &req, assign_response_id())).into_response(),
-                ))
+                Ok(Json(to_responses_response(resp, &req, assign_response_id())).into_response())
             }
             Err(e) => {
                 record_error_metrics(model_alias, "", &e, start);
                 Err(e)
             }
         }
-    }
+    };
+    response.map(|response| decision.with_routed_model_header(response))
 }
 
 /// What one attempt produced: the upstream's own Responses answer, or a chat
