@@ -14,6 +14,7 @@ flowchart TD
         Axum[axum HTTP server]
         Auth[auth middleware\nBearer token or x-api-key — static key or JWT]
         Translate[format translation\nAnthropic ↔ internal OpenAI format]
+        Resolver[RouteResolver\nstatic alias, or classifier -> served alias]
         Router[ModelRouter\nalias -> RoutePool]
         Dispatch[dispatch\nprimary targets + fallback chain]
         CB[CircuitBreaker\nper provider+model]
@@ -21,7 +22,8 @@ flowchart TD
 
         Axum --> Auth
         Auth --> Translate
-        Translate --> Router
+        Translate --> Resolver
+        Resolver --> Router
         Router --> Dispatch
         Dispatch --> CB
         CB --> Retry
@@ -31,6 +33,8 @@ flowchart TD
     Retry -->|HTTP| OpenAI
     Retry -->|HTTP| Gemini
     Retry -->|AWS SDK| Bedrock
+
+    Resolver -.->|classified alias only\nHTTP, capped request text| Jev[Classifier\nTypeSafe Jev]
 
     Ferrox -->|Prometheus text| Scraper[Prometheus scraper]
     Ferrox -->|OTLP gRPC| Collector[OTEL Collector]
@@ -285,6 +289,8 @@ sequenceDiagram
     participant C as Client
     participant A as Auth Middleware
     participant JWKS as JwksCache
+    participant RR as RouteResolver
+    participant K as Classifier
     participant R as ModelRouter
     participant P as RoutePool
     participant CB as CircuitBreaker
@@ -304,8 +310,20 @@ sequenceDiagram
         A->>A: check per-key rate limit (RateLimitBackend)
     end
 
-    A->>R: attach RequestContext, forward request
+    A->>RR: attach RequestContext, forward request
 
+    alt classified alias
+        RR->>RR: if x-ferrox-classifier is skip, serve fallback_alias (opt_out)
+        RR->>RR: decision cache lookup (digest of alias, tiers and input), a hit skips the call
+        RR->>RR: if the classifier's breaker is open, serve fallback_alias (breaker_open)
+        RR->>K: classify capped user/assistant text, one attempt within timeout_ms
+        K-->>RR: tier and confidence, or timeout / error
+        RR->>RR: decide on the tier's alias or fallback_alias<br/>(low confidence, unknown tier, shadow, failure)
+    else statically routed alias
+        RR->>RR: served alias = requested alias
+    end
+
+    RR->>R: served alias
     R->>P: resolve model alias
 
     loop primary targets (LB strategy)

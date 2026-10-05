@@ -51,6 +51,8 @@ allowed_models: ["claude-sonnet", "gpt-4o"]   # specific aliases only
 
 Requests to a model alias not in the list receive a `403 Forbidden` response.
 
+For a [classified alias](routing.md#classified-aliases), the list is checked against the alias the client asked for only. A key allowed `auto` is served by any of its tiers and by its `fallback_alias`, even when the key may not request those aliases by name. A key not allowed `auto` gets `403` before the classifier runs.
+
 ## Rate limiting
 
 Each virtual key can be independently rate-limited. Ferrox uses a token bucket per key.
@@ -181,6 +183,9 @@ That covers a rejected body, a disallowed model, an unknown alias, every target
 failing, and a client that disconnects while it waits. The model listings
 (`GET /v1/models`, `GET /anthropic/v1/models`) reserve nothing. If a provider
 answers without reporting usage, the 4096-token reservation stays charged.
+
+On a [classified alias](routing.md#classified-aliases), the tokens the classifier
+itself uses are recorded with the request but never charged to the budget.
 
 ### Key rotation
 
