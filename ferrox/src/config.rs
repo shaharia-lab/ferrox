@@ -1016,7 +1016,8 @@ models:
 
     /// The classified alias (`auto`) of [`classified_config`].
     fn auto(config: &mut Config) -> &mut ClassifiedAliasConfig {
-        config.models[2].classifier.as_mut().unwrap()
+        let model = config.models.iter_mut().find(|m| m.alias == "auto");
+        model.unwrap().classifier.as_mut().unwrap()
     }
 
     #[test]

@@ -200,7 +200,7 @@ mod tests {
         assert!(router.resolve("smart").is_ok());
         match router.resolve("auto") {
             Err(ProxyError::ModelNotFound(msg)) => {
-                assert_eq!(msg, "Model alias 'auto' is not configured")
+                assert_eq!(msg, "Model alias 'auto' is not configured");
             }
             Err(e) => panic!("unexpected error: {e}"),
             Ok(_) => panic!("a classified alias must not get a pool"),
