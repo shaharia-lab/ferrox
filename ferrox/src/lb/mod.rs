@@ -3,7 +3,7 @@ pub mod strategy;
 
 use std::sync::Arc;
 
-use crate::config::{DefaultsConfig, ModelConfig, ProviderConfig, RoutingStrategy};
+use crate::config::{DefaultsConfig, ProviderConfig, RoutingConfig, RoutingStrategy};
 use crate::providers::{ProviderAdapter, ProviderRegistry};
 use crate::telemetry::metrics::ROUTING_TARGET_SELECTED;
 
@@ -44,13 +44,12 @@ pub struct RoutePool {
 
 impl RoutePool {
     pub fn from_config(
-        model: &ModelConfig,
+        alias: &str,
+        routing: &RoutingConfig,
         providers: &ProviderRegistry,
         provider_configs: &[ProviderConfig],
         defaults: &DefaultsConfig,
     ) -> Result<Self, anyhow::Error> {
-        let routing = &model.routing;
-
         let (strategy, strategy_name) = match routing.strategy {
             RoutingStrategy::RoundRobin => (LbStrategy::round_robin(), "round_robin"),
             RoutingStrategy::Failover => (LbStrategy::failover(), "failover"),
@@ -68,17 +67,17 @@ impl RoutePool {
         let targets = routing
             .targets
             .iter()
-            .map(|t| build_target(t, &model.alias, providers, provider_configs, defaults))
+            .map(|t| build_target(t, alias, providers, provider_configs, defaults))
             .collect::<Result<Vec<_>, _>>()?;
 
         let fallbacks = routing
             .fallback
             .iter()
-            .map(|t| build_target(t, &model.alias, providers, provider_configs, defaults))
+            .map(|t| build_target(t, alias, providers, provider_configs, defaults))
             .collect::<Result<Vec<_>, _>>()?;
 
         Ok(RoutePool {
-            alias: model.alias.clone(),
+            alias: alias.to_string(),
             strategy,
             strategy_name,
             targets,
@@ -275,7 +274,8 @@ pub(crate) mod test_support {
             })
             .collect::<HashMap<_, _>>();
         let pool = RoutePool::from_config(
-            &config.models[0],
+            alias,
+            config.models[0].routing.as_ref().unwrap(),
             &registry,
             &config.providers,
             &config.defaults,

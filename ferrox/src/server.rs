@@ -107,7 +107,10 @@ mod tests {
     /// except `providers`/`models` (required by deserialization); the caller
     /// tweaks `telemetry.metrics` before calling.
     fn build_state(config: Config) -> AppState {
-        let registry: crate::providers::ProviderRegistry = std::collections::HashMap::new();
+        build_state_with(config, std::collections::HashMap::new())
+    }
+
+    fn build_state_with(config: Config, registry: crate::providers::ProviderRegistry) -> AppState {
         let router = crate::router::ModelRouter::from_config(&config, &registry).unwrap();
         let jwks_cache = crate::jwks::JwksCache::new(vec![], 300, reqwest::Client::new());
         AppState {
@@ -219,6 +222,97 @@ mod tests {
                 "{path} must be an OpenAPI 3.x document"
             );
             assert!(doc["paths"]["/v1/chat/completions"].is_object());
+        }
+    }
+
+    /// A gateway with two statically routed aliases and `auto`, classified
+    /// between them. The virtual key `sk-test` may use every alias.
+    async fn classified_app() -> Router {
+        let config: Config = serde_json::from_value(serde_json::json!({
+            "providers": [{"name": "mock", "type": "openai", "api_key": "k"}],
+            "classifiers": [{"id": "jev-main", "type": "jev", "api_key": "k"}],
+            "models": [
+                {"alias": "fast", "routing": {"strategy": "failover", "targets": [{"provider": "mock", "model_id": "s"}]}},
+                {"alias": "smart", "routing": {"strategy": "failover", "targets": [{"provider": "mock", "model_id": "l"}]}},
+                {"alias": "auto", "classifier": {
+                    "use": "jev-main",
+                    "fallback_alias": "smart",
+                    "tiers": {"simple": {"alias": "fast", "when": "short"}}}},
+            ],
+            "virtual_keys": [{"key": "sk-test", "name": "test", "allowed_models": ["*"]}],
+        }))
+        .unwrap();
+        crate::config::validate(&config).unwrap();
+
+        let registry = crate::providers::build_registry(&config.providers, &config.defaults)
+            .await
+            .unwrap();
+        build_router(build_state_with(config, registry))
+    }
+
+    async fn send(app: Router, request: Request<Body>) -> (StatusCode, serde_json::Value) {
+        let resp = app.oneshot(request).await.unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    #[tokio::test]
+    async fn model_listings_include_classified_aliases() {
+        for path in ["/v1/models", "/anthropic/v1/models"] {
+            let request = Request::builder()
+                .uri(path)
+                .header("authorization", "Bearer sk-test")
+                .body(Body::empty())
+                .unwrap();
+            let (status, body) = send(classified_app().await, request).await;
+            assert_eq!(status, StatusCode::OK, "{path}");
+            let ids: Vec<&str> = body["data"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|m| m["id"].as_str().unwrap())
+                .collect();
+            assert_eq!(ids, ["fast", "smart", "auto"], "{path}");
+        }
+    }
+
+    /// Until the resolver exists, a classified alias has no pool: every
+    /// inbound surface answers with the ordinary "not configured" 404.
+    #[tokio::test]
+    async fn classified_alias_is_not_configured_on_every_surface() {
+        let message = serde_json::json!([{"role": "user", "content": "hi"}]);
+        let cases = [
+            (
+                "/v1/chat/completions",
+                serde_json::json!({"model": "auto", "messages": message}),
+            ),
+            (
+                "/v1/responses",
+                serde_json::json!({"model": "auto", "input": "hi"}),
+            ),
+            (
+                "/anthropic/v1/messages",
+                serde_json::json!({"model": "auto", "max_tokens": 16, "messages": message}),
+            ),
+        ];
+        for (path, body) in cases {
+            let request = Request::builder()
+                .method("POST")
+                .uri(path)
+                .header("authorization", "Bearer sk-test")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap();
+            let (status, body) = send(classified_app().await, request).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{path}: {body}");
+            assert!(
+                body.to_string()
+                    .contains("Model alias 'auto' is not configured"),
+                "{path}: {body}"
+            );
         }
     }
 }

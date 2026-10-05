@@ -1,6 +1,6 @@
 use anyhow::{bail, Context};
 use serde::{Deserialize, Deserializer, Serialize};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::env;
 
 /// The provider-facing slice of the configuration lives in `ferrox-providers`
@@ -223,10 +223,120 @@ pub struct RoutingConfig {
     pub fallback: Vec<TargetConfig>,
 }
 
+/// A model alias is resolved either statically (`routing`) or by a classifier
+/// that picks one of several statically routed aliases (`classifier`).
+/// Exactly one of the two must be set; `validate()` enforces it so the error
+/// can name the alias.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelConfig {
     pub alias: String,
-    pub routing: RoutingConfig,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routing: Option<RoutingConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub classifier: Option<ClassifiedAliasConfig>,
+}
+
+/// The `classifier` form of a model alias: which classifier decides, the
+/// tiers it may choose between, and where the request goes when it cannot
+/// decide.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClassifiedAliasConfig {
+    /// Id of an entry in the top-level `classifiers` list.
+    #[serde(rename = "use")]
+    pub classifier: String,
+    /// Tier name → the statically routed alias that serves it.
+    pub tiers: BTreeMap<String, TierConfig>,
+    /// Statically routed alias used whenever the classifier gives no usable
+    /// answer (error, timeout, low confidence).
+    pub fallback_alias: String,
+    /// Answers below this confidence go to `fallback_alias`. 0 accepts all.
+    #[serde(default)]
+    pub confidence_threshold: f64,
+    /// When true the classifier runs and its choice is recorded, but the
+    /// request is still served by `fallback_alias`.
+    #[serde(default)]
+    pub shadow: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TierConfig {
+    /// Statically routed alias that serves requests classified into this tier.
+    pub alias: String,
+    /// Plain-language description of when this tier applies; shown to the
+    /// classifier as the option's description.
+    pub when: String,
+}
+
+// ── Classifiers ──────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ClassifierType {
+    Jev,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct ClassifierConfig {
+    /// Unique id; a classified alias refers to it with `use`.
+    pub id: String,
+    #[serde(rename = "type")]
+    pub classifier_type: ClassifierType,
+    pub api_key: String,
+    #[serde(default = "default_classifier_model")]
+    pub model: String,
+    #[serde(default = "default_classifier_base_url")]
+    pub base_url: String,
+    #[serde(default = "default_classifier_timeout_ms")]
+    pub timeout_ms: u64,
+    /// Breaker around the classifier itself. Falls back to
+    /// `defaults.circuit_breaker` when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub circuit_breaker: Option<CircuitBreakerConfig>,
+    /// Upper bound on the request text sent to the classifier.
+    #[serde(default = "default_classifier_max_input_chars")]
+    pub max_input_chars: usize,
+    /// How long a decision is reused for an identical input. 0 disables the
+    /// cache.
+    #[serde(default = "default_classifier_cache_ttl_secs")]
+    pub cache_ttl_secs: u64,
+    #[serde(default = "default_classifier_cache_max_entries")]
+    pub cache_max_entries: usize,
+}
+
+fn default_classifier_model() -> String {
+    "jev-latest".to_string()
+}
+fn default_classifier_base_url() -> String {
+    "https://api.typesafe.ai".to_string()
+}
+fn default_classifier_timeout_ms() -> u64 {
+    500
+}
+fn default_classifier_max_input_chars() -> usize {
+    8000
+}
+fn default_classifier_cache_ttl_secs() -> u64 {
+    300
+}
+fn default_classifier_cache_max_entries() -> usize {
+    10_000
+}
+
+impl std::fmt::Debug for ClassifierConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClassifierConfig")
+            .field("id", &self.id)
+            .field("classifier_type", &self.classifier_type)
+            .field("api_key", &"[REDACTED]")
+            .field("model", &self.model)
+            .field("base_url", &self.base_url)
+            .field("timeout_ms", &self.timeout_ms)
+            .field("circuit_breaker", &self.circuit_breaker)
+            .field("max_input_chars", &self.max_input_chars)
+            .field("cache_ttl_secs", &self.cache_ttl_secs)
+            .field("cache_max_entries", &self.cache_max_entries)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -309,6 +419,9 @@ pub struct Config {
     #[serde(default)]
     pub defaults: DefaultsConfig,
     pub providers: Vec<ProviderConfig>,
+    /// Classifiers that classified aliases (`models[].classifier`) refer to.
+    #[serde(default)]
+    pub classifiers: Vec<ClassifierConfig>,
     pub models: Vec<ModelConfig>,
     #[serde(default)]
     pub virtual_keys: Vec<VirtualKeyConfig>,
@@ -366,9 +479,13 @@ pub fn load_config_from(path: &str) -> Result<Config, anyhow::Error> {
     let raw = std::fs::read_to_string(path)
         .with_context(|| format!("Failed to read config file: {path}"))?;
 
+    parse_config(&raw).with_context(|| format!("Failed to load config from {path}"))
+}
+
+fn parse_config(raw: &str) -> Result<Config, anyhow::Error> {
     // Parse YAML into a Value tree first
     let mut value: serde_yaml::Value =
-        serde_yaml::from_str(&raw).with_context(|| format!("Failed to parse YAML in {path}"))?;
+        serde_yaml::from_str(raw).with_context(|| "Failed to parse YAML")?;
 
     // Interpolate env vars in string leaves (safe — no re-parsing)
     interpolate_yaml(&mut value).with_context(|| "Environment variable interpolation failed")?;
@@ -483,13 +600,41 @@ pub(crate) fn validate(config: &Config) -> Result<(), anyhow::Error> {
         );
     }
 
+    // Unique classifier ids
+    let mut classifier_ids = HashSet::new();
+    for c in &config.classifiers {
+        if !classifier_ids.insert(c.id.as_str()) {
+            bail!("Duplicate classifier id: '{}'", c.id);
+        }
+    }
+
+    // Every alias is either statically routed or classified, never both.
+    let mut static_aliases = HashSet::new();
+    for m in &config.models {
+        match (&m.routing, &m.classifier) {
+            (Some(_), None) => {
+                static_aliases.insert(m.alias.as_str());
+            }
+            (None, Some(_)) => {}
+            (Some(_), Some(_)) => bail!(
+                "Model '{}' sets both 'routing' and 'classifier'; exactly one is required",
+                m.alias
+            ),
+            (None, None) => bail!(
+                "Model '{}' sets neither 'routing' nor 'classifier'; exactly one is required",
+                m.alias
+            ),
+        }
+    }
+
     // Validate model routing references
     for m in &config.models {
-        if m.routing.targets.is_empty() {
+        let Some(routing) = &m.routing else { continue };
+        if routing.targets.is_empty() {
             bail!("Model '{}' must have at least one target", m.alias);
         }
-        if m.routing.strategy == RoutingStrategy::Weighted {
-            for t in &m.routing.targets {
+        if routing.strategy == RoutingStrategy::Weighted {
+            for t in &routing.targets {
                 if t.weight.is_none() {
                     bail!(
                         "Model '{}' uses weighted strategy but target '{}' has no weight",
@@ -499,7 +644,7 @@ pub(crate) fn validate(config: &Config) -> Result<(), anyhow::Error> {
                 }
             }
         }
-        for t in m.routing.targets.iter().chain(m.routing.fallback.iter()) {
+        for t in routing.targets.iter().chain(routing.fallback.iter()) {
             if !provider_names.contains(&t.provider) {
                 bail!(
                     "Model '{}' references unknown provider '{}'",
@@ -507,6 +652,54 @@ pub(crate) fn validate(config: &Config) -> Result<(), anyhow::Error> {
                     t.provider
                 );
             }
+        }
+    }
+
+    // Validate classified aliases. Tiers and the fallback must be statically
+    // routed, so a classified alias can never chain or cycle into another.
+    for m in &config.models {
+        let Some(classified) = &m.classifier else {
+            continue;
+        };
+        if !classifier_ids.contains(classified.classifier.as_str()) {
+            bail!(
+                "Model '{}' uses unknown classifier '{}'",
+                m.alias,
+                classified.classifier
+            );
+        }
+        if classified.tiers.is_empty() {
+            bail!("Model '{}' must have at least one classifier tier", m.alias);
+        }
+        let targets = classified
+            .tiers
+            .iter()
+            .map(|(name, tier)| (format!("tier '{name}'"), tier.alias.as_str()))
+            .chain([(
+                "fallback_alias".to_string(),
+                classified.fallback_alias.as_str(),
+            )]);
+        for (what, alias) in targets {
+            if !model_aliases.contains(alias) {
+                bail!(
+                    "Model '{}' {what} references unknown alias '{alias}'",
+                    m.alias
+                );
+            }
+            if !static_aliases.contains(alias) {
+                bail!(
+                    "Model '{}' {what} references classified alias '{alias}'; it must be a statically routed alias",
+                    m.alias
+                );
+            }
+        }
+        // Written so NaN is rejected too.
+        if !(0.0..=1.0).contains(&classified.confidence_threshold) {
+            bail!(
+                "Model '{}' confidence_threshold must be between 0 and 1, got {}",
+                m.alias,
+                classified.confidence_threshold
+            );
         }
     }
 
@@ -629,7 +822,8 @@ mod tests {
             }],
             models: vec![ModelConfig {
                 alias: alias.to_string(),
-                routing: RoutingConfig {
+                classifier: None,
+                routing: Some(RoutingConfig {
                     strategy: RoutingStrategy::RoundRobin,
                     targets: vec![TargetConfig {
                         provider: provider_name.to_string(),
@@ -637,8 +831,9 @@ mod tests {
                         weight: None,
                     }],
                     fallback: vec![],
-                },
+                }),
             }],
+            classifiers: vec![],
             virtual_keys: vec![],
             trusted_issuers: vec![],
             jwks_cache_ttl_secs: default_jwks_cache_ttl_secs(),
@@ -690,7 +885,8 @@ mod tests {
         let mut config = minimal_config("openai", "gpt-4");
         config.models.push(ModelConfig {
             alias: "gpt-4".to_string(),
-            routing: RoutingConfig {
+            classifier: None,
+            routing: Some(RoutingConfig {
                 strategy: RoutingStrategy::RoundRobin,
                 targets: vec![TargetConfig {
                     provider: "openai".to_string(),
@@ -698,7 +894,7 @@ mod tests {
                     weight: None,
                 }],
                 fallback: vec![],
-            },
+            }),
         });
         let err = validate(&config).unwrap_err().to_string();
         assert!(err.contains("Duplicate model alias"));
@@ -723,7 +919,7 @@ mod tests {
     #[test]
     fn validate_rejects_model_with_no_targets() {
         let mut config = minimal_config("openai", "gpt-4");
-        config.models[0].routing.targets.clear();
+        config.models[0].routing.as_mut().unwrap().targets.clear();
         let err = validate(&config).unwrap_err().to_string();
         assert!(err.contains("at least one target"));
     }
@@ -747,7 +943,7 @@ mod tests {
     #[test]
     fn validate_rejects_unknown_provider_reference() {
         let mut config = minimal_config("openai", "gpt-4");
-        config.models[0].routing.targets[0].provider = "nonexistent".to_string();
+        config.models[0].routing.as_mut().unwrap().targets[0].provider = "nonexistent".to_string();
         let err = validate(&config).unwrap_err().to_string();
         assert!(err.contains("unknown provider"));
     }
@@ -755,7 +951,7 @@ mod tests {
     #[test]
     fn validate_rejects_weighted_target_without_weight() {
         let mut config = minimal_config("openai", "gpt-4");
-        config.models[0].routing.strategy = RoutingStrategy::Weighted;
+        config.models[0].routing.as_mut().unwrap().strategy = RoutingStrategy::Weighted;
         // target has weight: None — should fail
         let err = validate(&config).unwrap_err().to_string();
         assert!(err.contains("no weight"));
@@ -764,21 +960,262 @@ mod tests {
     #[test]
     fn validate_accepts_weighted_targets_with_weights() {
         let mut config = minimal_config("openai", "gpt-4");
-        config.models[0].routing.strategy = RoutingStrategy::Weighted;
-        config.models[0].routing.targets[0].weight = Some(100);
+        config.models[0].routing.as_mut().unwrap().strategy = RoutingStrategy::Weighted;
+        config.models[0].routing.as_mut().unwrap().targets[0].weight = Some(100);
         assert!(validate(&config).is_ok());
     }
 
     #[test]
     fn validate_checks_fallback_provider_refs_too() {
         let mut config = minimal_config("openai", "gpt-4");
-        config.models[0].routing.fallback.push(TargetConfig {
-            provider: "ghost_provider".to_string(),
-            model_id: "some-model".to_string(),
-            weight: None,
-        });
+        config.models[0]
+            .routing
+            .as_mut()
+            .unwrap()
+            .fallback
+            .push(TargetConfig {
+                provider: "ghost_provider".to_string(),
+                model_id: "some-model".to_string(),
+                weight: None,
+            });
         let err = validate(&config).unwrap_err().to_string();
         assert!(err.contains("unknown provider"));
+    }
+
+    // ── classifiers and classified aliases ───────────────────────────────────
+
+    /// The example from the epic's design comment (#170).
+    const CLASSIFIED_YAML: &str = r#"
+providers:
+  - name: openai
+    type: openai
+classifiers:
+  - id: jev-main
+    type: jev
+    api_key: "${_FERROX_TEST_TYPESAFE_KEY:-ts-secret}"
+    model: jev-latest
+    timeout_ms: 500
+models:
+  - alias: fast
+    routing: { strategy: failover, targets: [{ provider: openai, model_id: small }] }
+  - alias: smart
+    routing: { strategy: failover, targets: [{ provider: openai, model_id: large }] }
+  - alias: auto
+    classifier:
+      use: jev-main
+      confidence_threshold: 0.6
+      fallback_alias: smart
+      tiers:
+        simple:  { alias: fast,  when: "Short factual or chat" }
+        complex: { alias: smart, when: "Multi-step reasoning or code" }
+"#;
+
+    fn classified_config() -> Config {
+        parse_config(CLASSIFIED_YAML).unwrap()
+    }
+
+    /// The classified alias (`auto`) of [`classified_config`].
+    fn auto(config: &mut Config) -> &mut ClassifiedAliasConfig {
+        let model = config.models.iter_mut().find(|m| m.alias == "auto");
+        model.unwrap().classifier.as_mut().unwrap()
+    }
+
+    #[test]
+    fn classified_alias_example_loads() {
+        let mut config = classified_config();
+
+        let classifier = &config.classifiers[0];
+        assert_eq!(classifier.id, "jev-main");
+        assert_eq!(classifier.classifier_type, ClassifierType::Jev);
+        assert_eq!(classifier.api_key, "ts-secret");
+        assert_eq!(classifier.model, "jev-latest");
+        assert_eq!(classifier.timeout_ms, 500);
+
+        assert!(config.models[0].classifier.is_none());
+        assert!(config.models[2].routing.is_none());
+        let auto = auto(&mut config);
+        assert_eq!(auto.classifier, "jev-main");
+        assert_eq!(auto.fallback_alias, "smart");
+        assert_eq!(auto.confidence_threshold, 0.6);
+        assert!(!auto.shadow);
+        assert_eq!(auto.tiers["simple"].alias, "fast");
+        assert_eq!(auto.tiers["complex"].when, "Multi-step reasoning or code");
+    }
+
+    #[test]
+    fn classifier_defaults_apply_when_only_required_fields_are_set() {
+        let classifier: ClassifierConfig =
+            serde_yaml::from_str("{ id: c, type: jev, api_key: k }").unwrap();
+        assert_eq!(classifier.model, "jev-latest");
+        assert_eq!(classifier.base_url, "https://api.typesafe.ai");
+        assert_eq!(classifier.timeout_ms, 500);
+        assert!(classifier.circuit_breaker.is_none());
+        assert_eq!(classifier.max_input_chars, 8000);
+        assert_eq!(classifier.cache_ttl_secs, 300);
+        assert_eq!(classifier.cache_max_entries, 10_000);
+
+        let classified: ClassifiedAliasConfig = serde_yaml::from_str(
+            "{ use: c, fallback_alias: a, tiers: { t: { alias: a, when: w } } }",
+        )
+        .unwrap();
+        assert_eq!(classified.confidence_threshold, 0.0);
+        assert!(!classified.shadow);
+    }
+
+    #[test]
+    fn classifier_type_rejects_unknown_backend() {
+        let err = serde_yaml::from_str::<ClassifierConfig>("{ id: c, type: llm, api_key: k }")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unknown variant `llm`"), "{err}");
+    }
+
+    #[test]
+    fn config_without_classifiers_loads_unchanged() {
+        let config = parse_config(
+            r#"
+providers:
+  - name: openai
+    type: openai
+models:
+  - alias: gpt-4
+    routing:
+      strategy: round_robin
+      targets: [{ provider: openai, model_id: gpt-4 }]
+"#,
+        )
+        .unwrap();
+        assert!(config.classifiers.is_empty());
+        assert!(config.models[0].classifier.is_none());
+        assert_eq!(
+            config.models[0].routing.as_ref().unwrap().targets[0].model_id,
+            "gpt-4"
+        );
+    }
+
+    #[test]
+    fn classifier_debug_redacts_api_key() {
+        let config = classified_config();
+        let debug = format!("{config:?}");
+        assert!(!debug.contains("ts-secret"), "{debug}");
+        assert!(debug.contains("[REDACTED]"));
+        assert!(debug.contains("jev-main"));
+    }
+
+    #[test]
+    fn validate_rejects_duplicate_classifier_id() {
+        let mut config = classified_config();
+        config.classifiers.push(config.classifiers[0].clone());
+        let err = validate(&config).unwrap_err().to_string();
+        assert_eq!(err, "Duplicate classifier id: 'jev-main'");
+    }
+
+    #[test]
+    fn validate_rejects_alias_with_both_routing_and_classifier() {
+        let mut config = classified_config();
+        config.models[2].routing = config.models[0].routing.clone();
+        let err = validate(&config).unwrap_err().to_string();
+        assert!(err.contains("Model 'auto' sets both"), "{err}");
+    }
+
+    #[test]
+    fn validate_rejects_alias_with_neither_routing_nor_classifier() {
+        let mut config = classified_config();
+        config.models[2].classifier = None;
+        let err = validate(&config).unwrap_err().to_string();
+        assert!(err.contains("Model 'auto' sets neither"), "{err}");
+    }
+
+    #[test]
+    fn validate_rejects_unknown_classifier() {
+        let mut config = classified_config();
+        auto(&mut config).classifier = "ghost".to_string();
+        let err = validate(&config).unwrap_err().to_string();
+        assert_eq!(err, "Model 'auto' uses unknown classifier 'ghost'");
+    }
+
+    #[test]
+    fn validate_rejects_empty_tiers() {
+        let mut config = classified_config();
+        auto(&mut config).tiers.clear();
+        let err = validate(&config).unwrap_err().to_string();
+        assert_eq!(err, "Model 'auto' must have at least one classifier tier");
+    }
+
+    #[test]
+    fn validate_rejects_tier_naming_missing_alias() {
+        let mut config = classified_config();
+        auto(&mut config).tiers.get_mut("simple").unwrap().alias = "ghost".to_string();
+        let err = validate(&config).unwrap_err().to_string();
+        assert_eq!(
+            err,
+            "Model 'auto' tier 'simple' references unknown alias 'ghost'"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_tier_naming_classified_alias() {
+        let mut config = classified_config();
+        let mut other = config.models[2].clone();
+        other.alias = "auto-2".to_string();
+        config.models.push(other);
+        auto(&mut config).tiers.get_mut("complex").unwrap().alias = "auto-2".to_string();
+        let err = validate(&config).unwrap_err().to_string();
+        assert!(
+            err.starts_with("Model 'auto' tier 'complex' references classified alias 'auto-2'"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_tier_naming_its_own_alias() {
+        let mut config = classified_config();
+        auto(&mut config).tiers.get_mut("simple").unwrap().alias = "auto".to_string();
+        let err = validate(&config).unwrap_err().to_string();
+        assert!(
+            err.starts_with("Model 'auto' tier 'simple' references classified alias 'auto'"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_fallback_naming_missing_alias() {
+        let mut config = classified_config();
+        auto(&mut config).fallback_alias = "ghost".to_string();
+        let err = validate(&config).unwrap_err().to_string();
+        assert_eq!(
+            err,
+            "Model 'auto' fallback_alias references unknown alias 'ghost'"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_fallback_naming_classified_alias() {
+        let mut config = classified_config();
+        auto(&mut config).fallback_alias = "auto".to_string();
+        let err = validate(&config).unwrap_err().to_string();
+        assert!(
+            err.starts_with("Model 'auto' fallback_alias references classified alias 'auto'"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_confidence_threshold_outside_unit_range() {
+        for bad in [-0.1, 1.1, f64::NAN] {
+            let mut config = classified_config();
+            auto(&mut config).confidence_threshold = bad;
+            let err = validate(&config).unwrap_err().to_string();
+            assert!(
+                err.starts_with("Model 'auto' confidence_threshold must be between 0 and 1"),
+                "{bad}: {err}"
+            );
+        }
+        for ok in [0.0, 1.0] {
+            let mut config = classified_config();
+            auto(&mut config).confidence_threshold = ok;
+            assert!(validate(&config).is_ok(), "{ok}");
+        }
     }
 
     // ── rate_limiting validation ──────────────────────────────────────────────

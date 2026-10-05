@@ -14,6 +14,12 @@
       "items": { "$ref": "#/definitions/ProviderConfig" },
       "minItems": 1
     },
+    "classifiers": {
+      "type": "array",
+      "items": { "$ref": "#/definitions/ClassifierConfig" },
+      "default": [],
+      "description": "Classifiers that a classified model alias (models[].classifier) can use to pick a tier per request."
+    },
     "models": {
       "type": "array",
       "items": { "$ref": "#/definitions/ModelConfig" },
@@ -253,11 +259,119 @@
     },
     "ModelConfig": {
       "type": "object",
-      "required": ["alias", "routing"],
+      "required": ["alias"],
       "additionalProperties": false,
+      "description": "A model alias. Exactly one of 'routing' (static) or 'classifier' (a classifier picks a tier per request) is required.",
+      "oneOf": [
+        { "required": ["routing"] },
+        { "required": ["classifier"] }
+      ],
       "properties": {
         "alias": { "type": "string", "minLength": 1 },
-        "routing": { "$ref": "#/definitions/RoutingConfig" }
+        "routing": { "$ref": "#/definitions/RoutingConfig" },
+        "classifier": { "$ref": "#/definitions/ClassifiedAliasConfig" }
+      }
+    },
+    "ClassifiedAliasConfig": {
+      "type": "object",
+      "required": ["use", "tiers", "fallback_alias"],
+      "additionalProperties": false,
+      "properties": {
+        "use": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Id of an entry in the top-level 'classifiers' list."
+        },
+        "tiers": {
+          "type": "object",
+          "minProperties": 1,
+          "additionalProperties": { "$ref": "#/definitions/TierConfig" },
+          "description": "Tier name to the alias that serves it. The classifier chooses among these tiers only."
+        },
+        "fallback_alias": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Statically routed alias used whenever the classifier gives no usable answer (error, timeout, low confidence)."
+        },
+        "confidence_threshold": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "default": 0,
+          "description": "Answers below this confidence are served by fallback_alias. 0 accepts every answer."
+        },
+        "shadow": {
+          "type": "boolean",
+          "default": false,
+          "description": "When true the classifier runs and its choice is recorded, but requests are still served by fallback_alias."
+        }
+      }
+    },
+    "TierConfig": {
+      "type": "object",
+      "required": ["alias", "when"],
+      "additionalProperties": false,
+      "properties": {
+        "alias": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Statically routed alias that serves requests classified into this tier."
+        },
+        "when": {
+          "type": "string",
+          "description": "Plain-language description of when this tier applies, given to the classifier."
+        }
+      }
+    },
+    "ClassifierConfig": {
+      "type": "object",
+      "required": ["id", "type", "api_key"],
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Unique id; a classified alias refers to it with 'use'."
+        },
+        "type": {
+          "type": "string",
+          "enum": ["jev"],
+          "description": "Classifier backend."
+        },
+        "api_key": {
+          "type": "string",
+          "description": "API key for the classifier backend. Supports ${ENV_VAR} interpolation."
+        },
+        "model": { "type": "string", "default": "jev-latest" },
+        "base_url": { "type": "string", "default": "https://api.typesafe.ai" },
+        "timeout_ms": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 500,
+          "description": "Time allowed for one classification, in milliseconds."
+        },
+        "circuit_breaker": {
+          "$ref": "#/definitions/CircuitBreakerConfig",
+          "description": "Circuit breaker around the classifier itself. Defaults to defaults.circuit_breaker."
+        },
+        "max_input_chars": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 8000,
+          "description": "Upper bound on the request text sent to the classifier."
+        },
+        "cache_ttl_secs": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 300,
+          "description": "How long a decision is reused for an identical input. 0 disables the cache."
+        },
+        "cache_max_entries": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 10000,
+          "description": "Maximum number of cached decisions."
+        }
       }
     },
     "RateLimitConfig": {

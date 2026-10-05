@@ -99,7 +99,7 @@ Client → [auth middleware] → [rate limiter] → ModelRouter
 
 ## Configuration
 
-**Gateway config** is YAML, validated against `ferrox/config.schema.json`. Key sections: `server`, `telemetry`, `defaults` (retry/circuit breaker/timeout defaults), `providers`, `models` (aliases → routing strategies), `rate_limiting`, `trusted_issuers`, `virtual_keys`, `usage_database_url`, `event_endpoints`.
+**Gateway config** is YAML, validated against `ferrox/config.schema.json`. Key sections: `server`, `telemetry`, `defaults` (retry/circuit breaker/timeout defaults), `providers`, `classifiers`, `models` (aliases → routing strategies or a classifier), `rate_limiting`, `trusted_issuers`, `virtual_keys`, `usage_database_url`, `event_endpoints`.
 
 **Control plane** is configured entirely via environment variables (see `.env.example`): `DATABASE_URL`, `CP_ENCRYPTION_KEY` (64 hex chars), `CP_ADMIN_KEY`, `CP_ISSUER`, `CP_PORT`.
 

@@ -17,9 +17,19 @@ impl ModelRouter {
     ) -> Result<Self, anyhow::Error> {
         let mut pools = HashMap::new();
 
+        // Classified aliases have no pool of their own: they resolve to one
+        // of the statically routed aliases built here.
         for model in &config.models {
-            let pool =
-                RoutePool::from_config(model, providers, &config.providers, &config.defaults)?;
+            let Some(routing) = &model.routing else {
+                continue;
+            };
+            let pool = RoutePool::from_config(
+                &model.alias,
+                routing,
+                providers,
+                &config.providers,
+                &config.defaults,
+            )?;
             pools.insert(model.alias.clone(), Arc::new(pool));
         }
 
@@ -112,7 +122,8 @@ mod tests {
                 .iter()
                 .map(|alias| ModelConfig {
                     alias: alias.to_string(),
-                    routing: RoutingConfig {
+                    classifier: None,
+                    routing: Some(RoutingConfig {
                         strategy: RoutingStrategy::RoundRobin,
                         targets: vec![TargetConfig {
                             provider: "mock".to_string(),
@@ -120,9 +131,10 @@ mod tests {
                             weight: None,
                         }],
                         fallback: vec![],
-                    },
+                    }),
                 })
                 .collect(),
+            classifiers: vec![],
             virtual_keys: vec![],
             trusted_issuers: vec![],
             jwks_cache_ttl_secs: 300,
@@ -169,9 +181,37 @@ mod tests {
     }
 
     #[test]
+    fn classified_alias_gets_no_pool() {
+        let mut config = mock_config(&["fast", "smart"]);
+        config.models.push(
+            serde_json::from_value(serde_json::json!({
+                "alias": "auto",
+                "classifier": {
+                    "use": "jev-main",
+                    "fallback_alias": "smart",
+                    "tiers": {"simple": {"alias": "fast", "when": "short"}}
+                }
+            }))
+            .unwrap(),
+        );
+        let router = ModelRouter::from_config(&config, &mock_registry()).unwrap();
+
+        assert!(router.resolve("fast").is_ok());
+        assert!(router.resolve("smart").is_ok());
+        match router.resolve("auto") {
+            Err(ProxyError::ModelNotFound(msg)) => {
+                assert_eq!(msg, "Model alias 'auto' is not configured");
+            }
+            Err(e) => panic!("unexpected error: {e}"),
+            Ok(_) => panic!("a classified alias must not get a pool"),
+        }
+    }
+
+    #[test]
     fn from_config_fails_when_provider_not_in_registry() {
         let mut config = mock_config(&["gpt-4"]);
-        config.models[0].routing.targets[0].provider = "missing_provider".to_string();
+        config.models[0].routing.as_mut().unwrap().targets[0].provider =
+            "missing_provider".to_string();
         // Also update providers to avoid validate() rejecting it, but here
         // we bypass validate() and test build_target() failure directly.
         config.providers.push(ProviderConfig {

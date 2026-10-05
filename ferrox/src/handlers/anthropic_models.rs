@@ -58,11 +58,12 @@ mod tests {
             .iter()
             .map(|a| ModelConfig {
                 alias: a.to_string(),
-                routing: RoutingConfig {
+                classifier: None,
+                routing: Some(RoutingConfig {
                     strategy: RoutingStrategy::RoundRobin,
                     targets: vec![],
                     fallback: vec![],
-                },
+                }),
             })
             .collect();
 
@@ -71,6 +72,7 @@ mod tests {
             telemetry: TelemetryConfig::default(),
             defaults: DefaultsConfig::default(),
             providers: vec![],
+            classifiers: vec![],
             models,
             virtual_keys: vec![],
             trusted_issuers: vec![],
