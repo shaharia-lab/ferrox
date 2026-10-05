@@ -7,6 +7,7 @@
 //! - [`ClassifierInput`] is what a backend sees: the text of the recent
 //!   user and assistant turns, extracted the same way on every inbound
 //!   surface and capped in size.
+//! - `jev` is the one backend so far: TypeSafe's System One model.
 //! - [`RouteResolver`] is the single place the inbound handlers resolve a
 //!   model alias. A statically routed alias costs the same map lookup as
 //!   before; a classified one runs its classifier and falls back to the
@@ -14,8 +15,11 @@
 //!   fail a request.
 
 mod input;
+mod jev;
 mod resolver;
 
+#[cfg(test)]
+mod jev_tests;
 #[cfg(test)]
 pub(crate) mod test_support;
 
@@ -36,7 +40,6 @@ pub struct Tier {
     /// one of these.
     pub name: String,
     /// Plain-language description of when the tier applies.
-    #[allow(dead_code)] // read by classifier backends; none is built in yet
     pub when: String,
 }
 
@@ -64,6 +67,19 @@ pub enum ClassifierError {
     Timeout,
     #[error("request has no user text to classify")]
     NoInput,
+    /// The classifier's circuit breaker is open; it was not called.
+    #[error("classifier circuit breaker is open")]
+    BreakerOpen,
+    /// The classifier answered with an option it was not offered.
+    #[error("classifier chose an option that was not offered")]
+    UnknownChoice,
+    /// The classifier could not be reached or is overloaded (a connection
+    /// error, HTTP 408, 429 or 5xx). Counts against its circuit breaker, as a
+    /// timeout does.
+    #[error("{0}")]
+    Unavailable(String),
+    /// Any other failure: one that says nothing about whether the next call
+    /// would succeed, or that waiting cannot fix (a rejected key or request).
     #[error("{0}")]
     Failed(String),
 }
@@ -85,38 +101,16 @@ pub trait Classifier: Send + Sync {
 pub type ClassifierRegistry = HashMap<String, Arc<dyn Classifier>>;
 
 /// Build the backend of every configured classifier.
-fn build_registry(configs: &[ClassifierConfig]) -> ClassifierRegistry {
+fn build_registry(configs: &[ClassifierConfig]) -> Result<ClassifierRegistry, anyhow::Error> {
+    // One connection pool for every classifier.
+    let client = reqwest::Client::new();
     configs
         .iter()
         .map(|config| {
             let classifier: Arc<dyn Classifier> = match config.classifier_type {
-                ClassifierType::Jev => {
-                    tracing::warn!(
-                        classifier = %config.id,
-                        "Classifier backend 'jev' is not available in this build; \
-                         aliases using it serve their fallback_alias"
-                    );
-                    Arc::new(UnavailableClassifier)
-                }
+                ClassifierType::Jev => Arc::new(jev::JevClassifier::new(config, client.clone())?),
             };
-            (config.id.clone(), classifier)
+            Ok((config.id.clone(), classifier))
         })
         .collect()
-}
-
-/// Stands in for a backend this build does not have. It never answers, so
-/// every alias using it serves its `fallback_alias`.
-struct UnavailableClassifier;
-
-#[async_trait]
-impl Classifier for UnavailableClassifier {
-    async fn classify(
-        &self,
-        _input: &ClassifierInput,
-        _tiers: &[Tier],
-    ) -> Result<Classification, ClassifierError> {
-        Err(ClassifierError::Failed(
-            "classifier backend is not available in this build".to_string(),
-        ))
-    }
 }

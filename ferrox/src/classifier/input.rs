@@ -20,6 +20,13 @@ pub enum Role {
 }
 
 impl Role {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::Assistant => "assistant",
+        }
+    }
+
     fn parse(role: &str) -> Option<Self> {
         match role {
             "user" => Some(Self::User),

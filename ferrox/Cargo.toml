@@ -86,6 +86,10 @@ sqlx = { version = "0.8", default-features = false, features = [
     "chrono",
 ] }
 
+[dev-dependencies]
+wiremock = "0.6"       # mock HTTP upstream for the classifier backend tests
+tracing-test = "0.2"   # asserts on what a test logged
+
 [lints.rust]
 unsafe_code = "forbid"
 unused_must_use = "deny"

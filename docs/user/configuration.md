@@ -171,9 +171,9 @@ See [Routing](routing.md) for details on circuit breakers and fallback behavior.
 
 An alias has exactly one of `routing` or `classifier`. With `classifier`, a classifier from the top-level [`classifiers`](#classifiers) list picks one of the listed tiers per request.
 
-A request to a classified alias is served by the alias of the tier the classifier chose, or by `fallback_alias` when the classifier fails, times out, answers with too little confidence or names a tier that is not listed. The classifier never fails a request. See [Classified aliases](routing.md#classified-aliases) for how such a request is handled.
+A request to a classified alias is served by the alias of the tier the classifier chose, or by `fallback_alias` when the classifier fails, times out, answers with too little confidence, names a tier that is not listed, or is skipped because its circuit breaker is open. The classifier never fails a request. See [Classified aliases](routing.md#classified-aliases) for how such a request is handled.
 
-> **No classifier backend yet.** The `jev` backend is not built in, so until it is, every request to a classified alias is served by its `fallback_alias`. `shadow` and the `cache_*` and `circuit_breaker` fields of a classifier are parsed and validated but have no effect yet.
+> **Not in effect yet.** `shadow` and the `cache_*` fields of a classifier are parsed and validated but have no effect yet.
 
 ```yaml
 models:
@@ -214,12 +214,12 @@ classifiers:
 | Field | Required | Default | Description |
 |---|---|---|---|
 | `id` | yes | | Unique id |
-| `type` | yes | | Backend; only `jev` is supported |
+| `type` | yes | | Backend; only `jev` ([TypeSafe](https://docs.typesafe.ai) System One) is supported |
 | `api_key` | yes | | API key for the backend |
 | `model` | no | `jev-latest` | Classifier model |
-| `base_url` | no | `https://api.typesafe.ai` | Backend base URL |
-| `timeout_ms` | no | `500` | Time allowed for one classification |
-| `circuit_breaker` | no | `defaults.circuit_breaker` | Circuit breaker around the classifier itself |
+| `base_url` | no | `https://api.typesafe.ai` | Backend base URL; the gateway calls `POST {base_url}/v1/systemone` |
+| `timeout_ms` | no | `500` | Time allowed for one classification. One attempt, no retries |
+| `circuit_breaker` | no | `defaults.circuit_breaker` | Circuit breaker around the classifier itself; see [Classified aliases](routing.md#classified-aliases) |
 | `max_input_chars` | no | `8000` | Cap on the request text sent to the classifier |
 | `cache_ttl_secs` | no | `300` | How long a decision is reused for an identical input; `0` disables the cache |
 | `cache_max_entries` | no | `10000` | Maximum number of cached decisions |

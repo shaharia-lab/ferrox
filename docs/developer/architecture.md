@@ -221,7 +221,8 @@ ferrox/src/
   classifier/
     mod.rs            Classifier trait, Tier, Classification, ClassifierError
     input.rs          ClassifierInput: capped user/assistant text from a chat or Responses request
-    resolver.rs       RouteResolver: requested alias -> RouteDecision (served pool + classification record)
+    jev.rs            JevClassifier: one choice question per request to TypeSafe's /v1/systemone
+    resolver.rs       RouteResolver: requested alias -> RouteDecision (served pool + classification record); per-classifier circuit breaker
 
   lb/
     mod.rs            RoutePool, RouteTarget, select_target

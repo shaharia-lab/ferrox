@@ -29,8 +29,13 @@ An alias configured with `classifier` instead of `routing` has no pool of its ow
 | `timeout`: no answer within the classifier's `timeout_ms` | `fallback_alias` |
 | `error`: the classifier failed, or the request has no user text | `fallback_alias` |
 | `unknown_choice`: the answer names a tier that is not listed | `fallback_alias` |
+| `breaker_open`: the classifier's circuit breaker is open, so it was not called | `fallback_alias` |
 
 The classifier is tried once and never fails a request. Each classified request logs one `Classified request` line with the requested alias, the served alias and the reason.
+
+**Classifier circuit breaker.** Each classifier has its own circuit breaker (`classifiers[].circuit_breaker`, defaulting to `defaults.circuit_breaker`), shared by every alias that uses it. Timeouts, connection errors and `408`, `429` or `5xx` responses count as failures. Once it opens, requests skip the classifier and go straight to `fallback_alias`, so a classifier that is down stops adding its `timeout_ms` to every request; after `recovery_timeout_secs` a single request probes it. A response that shows a misconfiguration rather than an outage (`401` for a wrong key, `422` for a request the backend rejects) is logged at error level and does not count against the breaker. The breaker reports `ferrox_circuit_breaker_state` and `ferrox_circuit_breaker_trips_total` with `provider="classifier:<id>"` (and an empty `model_alias`).
+
+**The `jev` backend.** One `POST {base_url}/v1/systemone` per classified request, asking a single `choice` question whose options are the tier names, each described by its `when` text. The gateway never logs or returns the body of an error response from the classifier, only its HTTP status and `x-typesafe-request-id`.
 
 **What the classifier sees.** Only text: the last user message and as many of the user and assistant turns before it as fit in the classifier's `max_input_chars`. A last user message longer than the cap is cut to its final `max_input_chars` characters. Images, tool calls, tool results and the system prompt (`system` and `developer` messages, Responses `instructions`) are never sent. The same rules apply on all three inbound endpoints.
 

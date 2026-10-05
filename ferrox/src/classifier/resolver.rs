@@ -12,6 +12,7 @@ use super::{
 };
 use crate::config::Config;
 use crate::error::ProxyError;
+use crate::lb::circuit_breaker::CircuitBreaker;
 use crate::lb::RoutePool;
 use crate::router::ModelRouter;
 
@@ -28,6 +29,8 @@ pub enum Reason {
     Error,
     /// The classifier answered with a tier the alias does not list.
     UnknownChoice,
+    /// The classifier's circuit breaker is open, so it was not called.
+    BreakerOpen,
 }
 
 impl Reason {
@@ -38,6 +41,7 @@ impl Reason {
             Self::Timeout => "timeout",
             Self::Error => "error",
             Self::UnknownChoice => "unknown_choice",
+            Self::BreakerOpen => "breaker_open",
         }
     }
 }
@@ -49,7 +53,8 @@ pub struct ClassificationRecord {
     /// The classifier's answer, when it gave one — also when the answer was
     /// not followed (`low_confidence`, `unknown_choice`).
     pub classification: Option<Classification>,
-    /// Why there is no answer (`timeout`, `error`).
+    /// Why there is no answer (`timeout`, `error`, `breaker_open`, and an
+    /// `unknown_choice` the backend itself refused).
     pub error: Option<ClassifierError>,
     /// Time spent on classification, input extraction included.
     pub latency: Duration,
@@ -100,6 +105,8 @@ impl RouteDecision<'_> {
 /// A classified alias, with everything a request needs resolved at startup.
 struct ClassifiedRoute {
     classifier: Arc<dyn Classifier>,
+    /// The classifier's breaker, shared by every alias that uses it.
+    breaker: Arc<CircuitBreaker>,
     tiers: Vec<Tier>,
     /// The pool serving each tier; parallel to `tiers`.
     tier_pools: Vec<Arc<RoutePool>>,
@@ -128,7 +135,14 @@ impl ClassifiedRoute {
                 None,
                 Some(ClassifierError::Timeout),
             ),
-            Err(e) => (fallback(), Reason::Error, None, Some(e)),
+            Err(e) => {
+                let reason = match e {
+                    ClassifierError::BreakerOpen => Reason::BreakerOpen,
+                    ClassifierError::UnknownChoice => Reason::UnknownChoice,
+                    _ => Reason::Error,
+                };
+                (fallback(), reason, None, Some(e))
+            }
             Ok(answer) => {
                 let Some(tier) = self.tiers.iter().position(|t| t.name == answer.tier) else {
                     return (fallback(), Reason::UnknownChoice, Some(answer), None);
@@ -151,6 +165,29 @@ impl ClassifiedRoute {
     }
 }
 
+impl ClassifiedRoute {
+    /// The decision for a request to `alias` whose classification, begun at
+    /// `start`, ended in `outcome`.
+    fn decision<'a>(
+        &self,
+        alias: &'a str,
+        outcome: Result<Classification, ClassifierError>,
+        start: Instant,
+    ) -> RouteDecision<'a> {
+        let (pool, reason, classification, error) = self.decide(outcome);
+        RouteDecision {
+            requested_alias: alias,
+            pool,
+            classification: Some(ClassificationRecord {
+                reason,
+                classification,
+                error,
+                latency: start.elapsed(),
+            }),
+        }
+    }
+}
+
 /// Resolves a requested model alias to the pool that serves it.
 ///
 /// A statically routed alias resolves exactly as [`ModelRouter::resolve`]
@@ -166,7 +203,7 @@ pub struct RouteResolver {
 impl RouteResolver {
     /// The resolver for `config`, with the classifier backends it names.
     pub fn build(config: &Config, router: ModelRouter) -> Result<Self, anyhow::Error> {
-        Self::from_config(config, router, &super::build_registry(&config.classifiers))
+        Self::from_config(config, router, &super::build_registry(&config.classifiers)?)
     }
 
     /// `classifiers` holds the backend of every entry in `config.classifiers`.
@@ -177,6 +214,22 @@ impl RouteResolver {
         router: ModelRouter,
         classifiers: &ClassifierRegistry,
     ) -> Result<Self, anyhow::Error> {
+        // One breaker per classifier, however many aliases use it. A pool's
+        // breaker is labelled with a provider name and a model alias; the
+        // empty alias keeps a classifier's apart from every one of those.
+        let breakers: HashMap<&str, Arc<CircuitBreaker>> = config
+            .classifiers
+            .iter()
+            .map(|c| {
+                let settings = c
+                    .circuit_breaker
+                    .clone()
+                    .unwrap_or_else(|| config.defaults.circuit_breaker.clone());
+                let breaker = CircuitBreaker::new(settings, format!("classifier:{}", c.id), "");
+                (c.id.as_str(), Arc::new(breaker))
+            })
+            .collect();
+
         let mut classified = HashMap::new();
         for model in &config.models {
             let Some(alias) = &model.classifier else {
@@ -217,6 +270,7 @@ impl RouteResolver {
                 model.alias.clone(),
                 ClassifiedRoute {
                     classifier,
+                    breaker: breakers[settings.id.as_str()].clone(),
                     tiers,
                     tier_pools,
                     fallback: pool(&alias.fallback_alias)?,
@@ -235,7 +289,9 @@ impl RouteResolver {
     /// [`ModelRouter::resolve`].
     ///
     /// The classifier never fails a request: the only error is the ordinary
-    /// "not configured" one for an alias that does not exist.
+    /// "not configured" one for an alias that does not exist. While its
+    /// circuit breaker is open it is not called at all, so a classifier that
+    /// keeps timing out stops adding its `timeout_ms` to every request.
     pub async fn resolve<'a>(
         &self,
         alias: &'a str,
@@ -256,28 +312,35 @@ impl RouteResolver {
         };
 
         let start = Instant::now();
-        let input = input(route.max_input_chars);
+        // Asked before the input is built: an open breaker costs a request
+        // no extraction either. Reads only, so nothing is claimed for a
+        // request that then has nothing to classify.
+        let input = if route.breaker.can_serve() {
+            input(route.max_input_chars)
+        } else {
+            return Ok(route.decision(alias, Err(ClassifierError::BreakerOpen), start));
+        };
         let outcome = if input.turns.is_empty() {
             Err(ClassifierError::NoInput)
-        } else {
+        } else if let Some(permit) = route.breaker.try_acquire() {
             let answer = route.classifier.classify(&input, &route.tiers);
-            match tokio::time::timeout(route.timeout, answer).await {
+            let outcome = match tokio::time::timeout(route.timeout, answer).await {
                 Ok(outcome) => outcome,
                 Err(_) => Err(ClassifierError::Timeout),
+            };
+            match &outcome {
+                // An answer nobody can use is still a classifier that works.
+                Ok(_) | Err(ClassifierError::UnknownChoice) => permit.success(),
+                Err(ClassifierError::Timeout | ClassifierError::Unavailable(_)) => permit.failure(),
+                // Says nothing about the classifier's health: leave the
+                // breaker as it is.
+                Err(_) => drop(permit),
             }
+            outcome
+        } else {
+            Err(ClassifierError::BreakerOpen)
         };
-        let (pool, reason, classification, error) = route.decide(outcome);
-
-        Ok(RouteDecision {
-            requested_alias: alias,
-            pool,
-            classification: Some(ClassificationRecord {
-                reason,
-                classification,
-                error,
-                latency: start.elapsed(),
-            }),
-        })
+        Ok(route.decision(alias, outcome, start))
     }
 }
 
