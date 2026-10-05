@@ -55,6 +55,8 @@ services:
       OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
       GEMINI_API_KEY: "${GEMINI_API_KEY:-}"
       GLM_API_KEY: "${GLM_API_KEY:-}"
+      # Classifier key; only read when the config has a `classifiers:` entry
+      TYPESAFE_API_KEY: "${TYPESAFE_API_KEY:-}"
       AWS_ACCESS_KEY_ID: "${AWS_ACCESS_KEY_ID:-}"
       AWS_SECRET_ACCESS_KEY: "${AWS_SECRET_ACCESS_KEY:-}"
       AWS_REGION: "${AWS_REGION:-us-east-1}"

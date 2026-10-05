@@ -195,7 +195,13 @@ sum by (alias) (rate(ferrox_classifier_decisions_total{reason!="classified"}[5m]
 sum by (alias) (rate(ferrox_classifier_decisions_total[5m]))
 ```
 
-On an alias in shadow mode every request is a fallback, so graph `reason="shadow"` there instead: that is the share of requests going live would reroute.
+On an alias in shadow mode every request is a fallback, so graph `reason="shadow"` by `tier` there instead. That is the share of requests whose answer would be followed once the alias goes live; the part of it that would change which model answers is the tiers whose alias differs from `fallback_alias`:
+
+```promql
+sum by (alias, tier) (rate(ferrox_classifier_decisions_total{reason="shadow"}[5m]))
+/ ignoring (tier) group_left
+sum by (alias) (rate(ferrox_classifier_decisions_total[5m]))
+```
 
 **p95 classifier latency**:
 
