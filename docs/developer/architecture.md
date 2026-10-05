@@ -220,6 +220,7 @@ ferrox/src/
 
   classifier/
     mod.rs            Classifier trait, Tier, Classification, ClassifierError
+    cache.rs          DecisionCache: per-classifier bounded TTL cache of followed answers, keyed by a SHA-256 digest
     input.rs          ClassifierInput: capped user/assistant text from a chat or Responses request
     jev.rs            JevClassifier: one choice question per request to TypeSafe's /v1/systemone
     resolver.rs       RouteResolver: requested alias -> RouteDecision (served pool + classification record); per-classifier circuit breaker

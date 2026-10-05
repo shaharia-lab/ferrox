@@ -173,8 +173,6 @@ An alias has exactly one of `routing` or `classifier`. With `classifier`, a clas
 
 A request to a classified alias is served by the alias of the tier the classifier chose, or by `fallback_alias` when the classifier fails, times out, answers with too little confidence, names a tier that is not listed, or is skipped because its circuit breaker is open. The classifier never fails a request. See [Classified aliases](routing.md#classified-aliases) for how such a request is handled.
 
-> **Not in effect yet.** The `cache_*` fields of a classifier are parsed and validated but have no effect yet.
-
 ```yaml
 models:
   - alias: "auto"
@@ -222,7 +220,7 @@ classifiers:
 | `circuit_breaker` | no | `defaults.circuit_breaker` | Circuit breaker around the classifier itself; see [Classified aliases](routing.md#classified-aliases) |
 | `max_input_chars` | no | `8000` | Cap on the request text sent to the classifier |
 | `cache_ttl_secs` | no | `300` | How long a decision is reused for an identical input; `0` disables the cache |
-| `cache_max_entries` | no | `10000` | Maximum number of cached decisions |
+| `cache_max_entries` | no | `10000` | Maximum number of cached decisions; `0` disables the cache |
 
 ---
 

@@ -370,7 +370,7 @@
           "type": "integer",
           "minimum": 0,
           "default": 10000,
-          "description": "Maximum number of cached decisions."
+          "description": "Maximum number of cached decisions. 0 disables the cache."
         }
       }
     },

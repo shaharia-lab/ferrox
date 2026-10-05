@@ -103,6 +103,30 @@ pub static CIRCUIT_BREAKER_TRIPS_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
     .expect("register ferrox_circuit_breaker_trips_total")
 });
 
+// ── Classifier decision cache ─────────────────────────────────────────────────
+
+/// Classified requests routed by a cached classifier answer.
+/// Labels: classifier (`classifiers[].id`)
+pub static CLASSIFIER_CACHE_HITS_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
+    register_counter_vec!(
+        "ferrox_classifier_cache_hits_total",
+        "Classified requests routed by a cached classifier answer",
+        &["classifier"]
+    )
+    .expect("register ferrox_classifier_cache_hits_total")
+});
+
+/// Classified requests whose input had no cached classifier answer.
+/// Labels: classifier (`classifiers[].id`)
+pub static CLASSIFIER_CACHE_MISSES_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
+    register_counter_vec!(
+        "ferrox_classifier_cache_misses_total",
+        "Classified requests whose input had no cached classifier answer",
+        &["classifier"]
+    )
+    .expect("register ferrox_classifier_cache_misses_total")
+});
+
 // ── Routing ───────────────────────────────────────────────────────────────────
 
 /// Fallback activations.
