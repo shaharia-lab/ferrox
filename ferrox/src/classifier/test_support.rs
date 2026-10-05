@@ -129,6 +129,16 @@ pub(crate) fn gateway_config(classifier: Value) -> Config {
     config
 }
 
+/// `config` with its classified alias `auto` in shadow mode.
+pub(crate) fn shadowed(mut config: Config) -> Config {
+    for model in &mut config.models {
+        if let Some(classified) = &mut model.classifier {
+            classified.shadow = true;
+        }
+    }
+    config
+}
+
 /// A provider that answers every request with "Hello" (11 prompt / 7
 /// completion tokens), reporting `<name>-model` as the upstream model.
 pub(crate) struct Upstream {

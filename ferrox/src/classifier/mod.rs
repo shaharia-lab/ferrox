@@ -12,7 +12,9 @@
 //!   model alias. A statically routed alias costs the same map lookup as
 //!   before; a classified one runs its classifier and falls back to the
 //!   alias's `fallback_alias` on any failure, so the classifier can never
-//!   fail a request.
+//!   fail a request. An alias in shadow mode, and a request that opts out
+//!   with the `x-ferrox-classifier: skip` header, are served by the
+//!   `fallback_alias` too.
 
 mod input;
 mod jev;
@@ -31,7 +33,7 @@ use async_trait::async_trait;
 use crate::config::{ClassifierConfig, ClassifierType};
 
 pub use input::ClassifierInput;
-pub use resolver::RouteResolver;
+pub use resolver::{skip_requested, RouteResolver};
 
 /// One option a classifier chooses between.
 #[derive(Debug, Clone, PartialEq, Eq)]

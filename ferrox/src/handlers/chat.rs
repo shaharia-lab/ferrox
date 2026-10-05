@@ -5,7 +5,7 @@ use std::time::Instant;
 use axum::response::sse::{Event, KeepAlive};
 use axum::{
     extract::{Extension, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response, Sse},
     Json,
 };
@@ -15,7 +15,7 @@ use ferrox_providers::responses_emitter::{
 use futures::StreamExt;
 
 use crate::budget_enforcer::BudgetReservation;
-use crate::classifier::ClassifierInput;
+use crate::classifier::{skip_requested, ClassifierInput};
 use crate::config::RetryConfig;
 use crate::error::ProxyError;
 use crate::handlers::finalize::{record_error_metrics, RequestFinalizer, Surface};
@@ -32,6 +32,12 @@ use crate::types::{ChatCompletionRequest, ChatCompletionResponse, RequestContext
     tag = "OpenAI",
     security(("bearer_auth" = [])),
     request_body = ChatCompletionRequestCore,
+    params(
+        ("x-ferrox-classifier" = Option<String>, Header, nullable = false, description = "Set to `skip` \
+            (case-insensitive) to skip classification for this request: a classified alias \
+            is then served by its `fallback_alias` and the classifier is not called. Any \
+            other value, and the header on a statically routed alias, has no effect."),
+    ),
     responses(
         (status = 200, description = "Chat completion. JSON body (mirrors the OpenAI Chat \
             Completions response), or an SSE stream of `chat.completion.chunk` events \
@@ -47,6 +53,7 @@ pub async fn chat_completions(
     State(state): State<AppState>,
     Extension(ctx): Extension<RequestContext>,
     reservation: Option<Extension<BudgetReservation>>,
+    headers: HeaderMap,
     Json(req): Json<ChatCompletionRequest>,
 ) -> Result<Response, ProxyError> {
     let start = Instant::now();
@@ -61,7 +68,7 @@ pub async fn chat_completions(
 
     let decision = state
         .resolver
-        .resolve(&req.model, |max_input_chars| {
+        .resolve(&req.model, skip_requested(&headers), |max_input_chars| {
             ClassifierInput::from_chat(&req, max_input_chars)
         })
         .await?;

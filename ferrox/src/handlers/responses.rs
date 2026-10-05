@@ -31,7 +31,7 @@ use std::time::Instant;
 use axum::{
     body::Bytes,
     extract::{Extension, State},
-    http::header::CONTENT_TYPE,
+    http::{header::CONTENT_TYPE, HeaderMap},
     response::{
         sse::{Event, KeepAlive},
         IntoResponse, Response, Sse,
@@ -49,7 +49,7 @@ use futures::StreamExt as _;
 use serde_json::{Map, Value};
 
 use crate::budget_enforcer::BudgetReservation;
-use crate::classifier::ClassifierInput;
+use crate::classifier::{skip_requested, ClassifierInput};
 use crate::error::ProxyError;
 use crate::handlers::chat::{dispatch, is_model_allowed};
 use crate::handlers::finalize::{record_error_metrics, RequestFinalizer, Surface};
@@ -63,6 +63,12 @@ use crate::types::RequestContext;
     tag = "OpenAI",
     security(("bearer_auth" = [])),
     request_body = ResponsesRequestCore,
+    params(
+        ("x-ferrox-classifier" = Option<String>, Header, nullable = false, description = "Set to `skip` \
+            (case-insensitive) to skip classification for this request: a classified alias \
+            is then served by its `fallback_alias` and the classifier is not called. Any \
+            other value, and the header on a statically routed alias, has no effect."),
+    ),
     responses(
         (status = 200, description = "Response object. JSON body (mirrors the OpenAI Responses \
             API `response` object), or an SSE stream of typed `response.*` events ending in \
@@ -85,6 +91,7 @@ pub async fn responses(
     State(state): State<AppState>,
     Extension(ctx): Extension<RequestContext>,
     reservation: Option<Extension<BudgetReservation>>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, ProxyError> {
     let start = Instant::now();
@@ -100,7 +107,7 @@ pub async fn responses(
 
     let decision = state
         .resolver
-        .resolve(&req.model, |max_input_chars| {
+        .resolve(&req.model, skip_requested(&headers), |max_input_chars| {
             ClassifierInput::from_responses(&req, max_input_chars)
         })
         .await?;
