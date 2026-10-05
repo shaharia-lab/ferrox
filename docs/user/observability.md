@@ -116,7 +116,7 @@ a failover to a provider that does not cache).
 
 | Metric | Type | Labels | Description |
 |---|---|---|---|
-| `ferrox_circuit_breaker_state` | Gauge | `provider`, `model_alias` | State: `0`=closed, `1`=open, `2`=half-open |
+| `ferrox_circuit_breaker_state` | Gauge | `provider`, `model_alias` | State: `0`=closed, `1`=open, `2`=half-open. A classifier's breaker reports `provider="classifier:<id>"` with an empty `model_alias` |
 | `ferrox_circuit_breaker_trips_total` | Counter | `provider` | Times a circuit transitioned to open |
 
 ### Webhook metrics

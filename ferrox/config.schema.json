@@ -291,7 +291,7 @@
         "fallback_alias": {
           "type": "string",
           "minLength": 1,
-          "description": "Statically routed alias used whenever the classifier gives no usable answer (error, timeout, low confidence)."
+          "description": "Statically routed alias used whenever the classifier gives no usable answer (error, timeout, low confidence, open circuit breaker)."
         },
         "confidence_threshold": {
           "type": "number",

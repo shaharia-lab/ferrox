@@ -185,8 +185,6 @@ models:
 # A classified alias has a `classifier` block instead of `routing`: a
 # classifier looks at each request and picks one of the listed tiers. Every
 # tier and the fallback must be a statically routed alias from `models`.
-# NOTE: the `jev` backend is not built in yet, so for now every request to a
-# classified alias is served by its `fallback_alias`.
 # ─────────────────────────────────────────
 # classifiers:
 #   - id: jev-main
@@ -198,7 +196,7 @@ models:
 #     max_input_chars: 8000            # default; cap on request text sent to the classifier
 #     cache_ttl_secs: 300              # default; 0 disables the decision cache
 #     cache_max_entries: 10000         # default
-#     circuit_breaker:                 # optional; defaults to defaults.circuit_breaker
+#     circuit_breaker:                 # optional; defaults to defaults.circuit_breaker. While open, the classifier is skipped
 #       failure_threshold: 5
 #       success_threshold: 2
 #       recovery_timeout_secs: 30
@@ -208,7 +206,7 @@ models:
 #     classifier:
 #       use: jev-main                  # a classifier id from `classifiers`
 #       confidence_threshold: 0.6      # default 0; lower-confidence answers use fallback_alias
-#       fallback_alias: "claude-sonnet"   # used on classifier error, timeout or low confidence
+#       fallback_alias: "claude-sonnet"   # used on classifier error, timeout, low confidence or open breaker
 #       shadow: false                  # default; true = classify and record, still serve fallback_alias
 #       tiers:
 #         simple:  { alias: "claude-haiku",  when: "Short factual or chat" }
