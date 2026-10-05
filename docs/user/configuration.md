@@ -15,6 +15,7 @@ server:               { ... }   # optional; all fields have defaults
 telemetry:            { ... }   # optional; all fields have defaults
 defaults:             { ... }   # optional; all fields have defaults
 providers:            [ ... ]   # required
+classifiers:          [ ... ]   # optional; classifiers for classified model aliases
 models:               [ ... ]   # required
 virtual_keys:         [ ... ]   # optional; static Bearer keys
 trusted_issuers:      [ ... ]   # optional; JWKS-based JWT auth
@@ -165,6 +166,61 @@ models:
 | `random` | Picks a random available target per request |
 
 See [Routing](routing.md) for details on circuit breakers and fallback behavior.
+
+### Classified aliases
+
+An alias has exactly one of `routing` or `classifier`. With `classifier`, a classifier from the top-level [`classifiers`](#classifiers) list picks one of the listed tiers per request.
+
+> **Not active yet.** This configuration is parsed and validated at startup, but classification is not wired into request handling: a classified alias is listed by `GET /v1/models` and answers `404` when requested.
+
+```yaml
+models:
+  - alias: "auto"
+    classifier:
+      use: jev-main               # id of an entry in `classifiers`
+      confidence_threshold: 0.6   # 0 to 1, default 0
+      fallback_alias: smart
+      shadow: false               # default
+      tiers:
+        simple:  { alias: fast,  when: "Short factual or chat" }
+        complex: { alias: smart, when: "Multi-step reasoning or code" }
+```
+
+| Field | Required | Default | Description |
+|---|---|---|---|
+| `use` | yes | | Id of the classifier that decides |
+| `tiers` | yes | | Tier name to `{ alias, when }`; at least one. `when` describes, in plain language, when the tier applies |
+| `fallback_alias` | yes | | Alias that serves the request when the classifier gives no usable answer |
+| `confidence_threshold` | no | `0` | Answers below this confidence go to `fallback_alias` |
+| `shadow` | no | `false` | Classify and record the choice, but keep serving `fallback_alias` |
+
+Every tier alias and `fallback_alias` must be a statically routed alias (one with `routing`); a classified alias cannot point at another classified alias.
+
+---
+
+## classifiers
+
+Classifiers that classified aliases refer to with `use`. Ids must be unique.
+
+```yaml
+classifiers:
+  - id: jev-main
+    type: jev
+    api_key: "${TYPESAFE_API_KEY}"
+```
+
+| Field | Required | Default | Description |
+|---|---|---|---|
+| `id` | yes | | Unique id |
+| `type` | yes | | Backend; only `jev` is supported |
+| `api_key` | yes | | API key for the backend |
+| `model` | no | `jev-latest` | Classifier model |
+| `base_url` | no | `https://api.typesafe.ai` | Backend base URL |
+| `timeout_ms` | no | `500` | Time allowed for one classification |
+| `circuit_breaker` | no | `defaults.circuit_breaker` | Circuit breaker around the classifier itself |
+| `max_input_chars` | no | `8000` | Cap on the request text sent to the classifier |
+| `cache_ttl_secs` | no | `300` | How long a decision is reused for an identical input; `0` disables the cache |
+| `cache_max_entries` | no | `10000` | Maximum number of cached decisions |
 
 ---
 

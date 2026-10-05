@@ -489,6 +489,7 @@ mod tests {
                 telemetry: TelemetryConfig::default(),
                 defaults: DefaultsConfig::default(),
                 providers: vec![],
+                classifiers: vec![],
                 models: vec![],
                 virtual_keys: vec![VirtualKeyConfig {
                     key: key_str.to_string(),
@@ -662,6 +663,7 @@ mod tests {
                 telemetry: TelemetryConfig::default(),
                 defaults: DefaultsConfig::default(),
                 providers: vec![],
+                classifiers: vec![],
                 models: vec![],
                 virtual_keys: vec![],
                 trusted_issuers: vec![TrustedIssuerConfig {

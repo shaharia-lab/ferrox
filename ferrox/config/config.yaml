@@ -181,6 +181,40 @@ models:
           model_id: "GLM-4.7"
 
 # ─────────────────────────────────────────
+# Classifier-based routing (optional)
+# A classified alias has a `classifier` block instead of `routing`: a
+# classifier looks at each request and picks one of the listed tiers. Every
+# tier and the fallback must be a statically routed alias from `models`.
+# NOTE: this configuration is validated at startup, but classification is not
+# wired into request handling yet — a classified alias answers 404 for now.
+# ─────────────────────────────────────────
+# classifiers:
+#   - id: jev-main
+#     type: jev                        # only `jev` is supported
+#     api_key: "${TYPESAFE_API_KEY}"
+#     model: jev-latest                # default
+#     base_url: "https://api.typesafe.ai"   # default
+#     timeout_ms: 500                  # default; one attempt, no retries
+#     max_input_chars: 8000            # default; cap on request text sent to the classifier
+#     cache_ttl_secs: 300              # default; 0 disables the decision cache
+#     cache_max_entries: 10000         # default
+#     circuit_breaker:                 # optional; defaults to defaults.circuit_breaker
+#       failure_threshold: 5
+#       success_threshold: 2
+#       recovery_timeout_secs: 30
+#
+# Then add the classified alias to `models:` above:
+#   - alias: "auto"
+#     classifier:
+#       use: jev-main                  # a classifier id from `classifiers`
+#       confidence_threshold: 0.6      # default 0; lower-confidence answers use fallback_alias
+#       fallback_alias: "claude-sonnet"   # used on classifier error, timeout or low confidence
+#       shadow: false                  # default; true = classify and record, still serve fallback_alias
+#       tiers:
+#         simple:  { alias: "claude-haiku",  when: "Short factual or chat" }
+#         complex: { alias: "claude-sonnet", when: "Multi-step reasoning or code" }
+
+# ─────────────────────────────────────────
 # Usage tracking (optional)
 # Persist per-request token usage to PostgreSQL.
 # Points to the same database as ferrox-cp (usage_log table).
