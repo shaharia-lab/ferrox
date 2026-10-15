@@ -158,7 +158,7 @@ function ApiKeyModal({
           able to retrieve it later.
         </div>
         <div className="flex items-center gap-2">
-          <code className="flex-1 rounded bg-gray-100 px-3 py-2 text-sm font-mono break-all">
+          <code className="flex-1 rounded-sm bg-gray-100 px-3 py-2 text-sm font-mono break-all">
             {apiKey}
           </code>
           <Button variant="secondary" size="sm" onClick={copy}>

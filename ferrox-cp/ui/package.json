@@ -18,10 +18,10 @@
     "recharts": "^2.13.3"
   },
   "devDependencies": {
+    "@tailwindcss/postcss": "^4.3.3",
     "@types/react": "^18.3.18",
     "@types/react-dom": "^18.3.5",
     "@vitejs/plugin-react": "^5.2.0",
-    "autoprefixer": "^10.4.20",
     "postcss": "^8.5.23",
     "tailwindcss": "^4.3.3",
     "typescript": "^5.7.2",

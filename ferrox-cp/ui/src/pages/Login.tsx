@@ -39,7 +39,7 @@ export default function Login({ onLogin }: { onLogin: () => void }) {
           <h1 className="text-2xl font-bold text-gray-900">Ferrox Control Plane</h1>
           <p className="text-sm text-gray-500 mt-1">Sign in with your admin key</p>
         </div>
-        <form onSubmit={handleSubmit} className="bg-white shadow rounded-lg p-6 space-y-4">
+        <form onSubmit={handleSubmit} className="bg-white shadow-sm rounded-lg p-6 space-y-4">
           <div className="space-y-1.5">
             <Label htmlFor="key">Admin Key</Label>
             <Input
