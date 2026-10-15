@@ -78,7 +78,7 @@ export default function AuditLog() {
             id="f-client"
             value={clientId}
             onChange={(e) => setClientId(e.target.value)}
-            className="block w-full rounded-md border border-gray-300 px-3 py-2 text-sm focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500 bg-white"
+            className="block w-full rounded-md border border-gray-300 px-3 py-2 text-sm focus:border-indigo-500 focus:outline-hidden focus:ring-1 focus:ring-indigo-500 bg-white"
           >
             <option value="">All clients</option>
             {clients.data?.map((c) => (
@@ -94,7 +94,7 @@ export default function AuditLog() {
             id="f-event"
             value={event}
             onChange={(e) => setEvent(e.target.value)}
-            className="block w-full rounded-md border border-gray-300 px-3 py-2 text-sm focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500 bg-white"
+            className="block w-full rounded-md border border-gray-300 px-3 py-2 text-sm focus:border-indigo-500 focus:outline-hidden focus:ring-1 focus:ring-indigo-500 bg-white"
           >
             {EVENT_TYPES.map((t) => (
               <option key={t.value} value={t.value}>

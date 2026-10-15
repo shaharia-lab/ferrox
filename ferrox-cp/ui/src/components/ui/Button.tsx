@@ -28,7 +28,7 @@ const Button = forwardRef<HTMLButtonElement, Props>(
   ({ variant = 'primary', size = 'md', className = '', ...props }, ref) => (
     <button
       ref={ref}
-      className={`inline-flex items-center gap-1.5 rounded-md font-medium focus:outline-none focus:ring-2 focus:ring-offset-1 transition-colors cursor-pointer ${variants[variant]} ${sizes[size]} ${className}`}
+      className={`inline-flex items-center gap-1.5 rounded-md font-medium focus:outline-hidden focus:ring-2 focus:ring-offset-1 transition-colors cursor-pointer ${variants[variant]} ${sizes[size]} ${className}`}
       {...props}
     />
   ),
