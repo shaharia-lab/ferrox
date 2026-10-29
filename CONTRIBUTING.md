@@ -16,10 +16,22 @@ Every pull request must be linked to a GitHub issue.
 
 1. Search existing issues to avoid duplicates.
 2. Open a new issue if none exists.
-3. Wait for acknowledgment before starting significant work.
+3. Wait for the issue to get the `ready-for-pr` label before starting significant work.
 4. Reference the issue in your PR (`Fixes #42` or `Closes #42`).
 
 Pull requests created without a corresponding issue may be closed.
+
+## New Features Need Community Review First
+
+A feature request (a new endpoint, provider, config field, routing strategy or other new behavior) gets a community review before anyone builds it:
+
+1. It is labelled `needs-community-review` and stays open for at least 14 days.
+2. After that it gets `ready-for-pr` only if at least 3 people other than the author back it, with a 👍, ❤️, 🚀 or 🎉 reaction or a comment describing their own use case.
+3. The maintainer may apply `ready-for-pr` at any time.
+
+Please do not open a PR for a feature until its issue has `ready-for-pr`. A PR for a feature whose issue does not have it yet is not reviewed: it gets a short "on hold" comment and stays open until the issue is marked `ready-for-pr`.
+
+Bug fixes, documentation, dependency updates and security fixes are not features and follow the normal rules above.
 
 ## Development Setup
 
@@ -64,7 +76,7 @@ See [Development](docs/developer/development.md) for more detail.
 
 ### Before submitting
 
-- [ ] Linked to a GitHub issue.
+- [ ] Linked to a GitHub issue (for a new feature, one labelled `ready-for-pr`).
 - [ ] `cargo test` passes.
 - [ ] `cargo fmt --check` passes.
 - [ ] `cargo clippy -- -D warnings` passes.
@@ -101,7 +113,7 @@ Include documentation updates in the same PR as code changes. This covers:
 
 AI-generated contributions are welcome and go through the same process as human contributions:
 
-1. An issue must exist before a pull request is created.
+1. An issue must exist before a pull request is created, and a new feature's issue must have `ready-for-pr` (see [New Features Need Community Review First](#new-features-need-community-review-first)).
 2. All checks (`cargo test`, `cargo fmt`, `cargo clippy`) must pass.
 3. Code must meet the same quality and security standards.
 
