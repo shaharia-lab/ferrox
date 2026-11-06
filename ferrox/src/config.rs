@@ -1281,4 +1281,53 @@ models:
         // default backend is memory, no redis_url needed
         assert!(validate(&config).is_ok());
     }
+
+    // ── aws.auth validation ───────────────────────────────────────────────────
+
+    fn config_with_aws_auth(auth: AwsAuthConfig) -> Config {
+        let mut config = minimal_config("bedrock", "claude");
+        config.providers[0].provider_type = ProviderType::Bedrock;
+        config.providers[0].aws = Some(AwsConfig {
+            auth: Some(auth),
+            ..AwsConfig::default()
+        });
+        config
+    }
+
+    #[test]
+    fn validate_rejects_aws_access_key_without_secret() {
+        let config = config_with_aws_auth(AwsAuthConfig {
+            access_key_id: Some("AKIA".to_string()),
+            ..AwsAuthConfig::default()
+        });
+        let err = validate(&config).unwrap_err().to_string();
+        assert_eq!(
+            err,
+            "Provider 'bedrock': aws.auth requires both access_key_id and secret_access_key together"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_aws_static_keys_with_profile() {
+        let config = config_with_aws_auth(AwsAuthConfig {
+            access_key_id: Some("AKIA".to_string()),
+            secret_access_key: Some("secret".to_string()),
+            profile: Some("dev".to_string()),
+            ..AwsAuthConfig::default()
+        });
+        let err = validate(&config).unwrap_err().to_string();
+        assert_eq!(
+            err,
+            "Provider 'bedrock': aws.auth sets both static credentials and a profile; use exactly one base source"
+        );
+    }
+
+    #[test]
+    fn validate_accepts_aws_profile_only() {
+        let config = config_with_aws_auth(AwsAuthConfig {
+            profile: Some("dev".to_string()),
+            ..AwsAuthConfig::default()
+        });
+        assert!(validate(&config).is_ok());
+    }
 }
