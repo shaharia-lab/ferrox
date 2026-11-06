@@ -559,56 +559,71 @@ pub(crate) fn interpolate_env(s: &str) -> Result<String, anyhow::Error> {
 }
 
 pub(crate) fn validate(config: &Config) -> Result<(), anyhow::Error> {
-    // Unique provider names
-    let mut provider_names = HashSet::new();
-    for p in &config.providers {
-        if !provider_names.insert(p.name.clone()) {
-            bail!("Duplicate provider name: '{}'", p.name);
+    let provider_names = unique_names(
+        config.providers.iter().map(|p| p.name.as_str()),
+        "provider name",
+    )?;
+    let model_aliases = unique_names(
+        config.models.iter().map(|m| m.alias.as_str()),
+        "model alias",
+    )?;
+    unique_names(
+        config.virtual_keys.iter().map(|k| k.name.as_str()),
+        "virtual key name",
+    )?;
+    validate_rate_limiting(config)?;
+    validate_metrics_path(config)?;
+    let classifier_ids = unique_names(
+        config.classifiers.iter().map(|c| c.id.as_str()),
+        "classifier id",
+    )?;
+    let static_aliases = validate_alias_kinds(config)?;
+    validate_model_routing(config, &provider_names)?;
+    validate_classified_aliases(config, &model_aliases, &static_aliases, &classifier_ids)?;
+    validate_native_responses(config)?;
+    validate_aws_auth(config)?;
+    Ok(())
+}
+
+/// Collects `names` into a set, failing on the first duplicate.
+fn unique_names<'a>(
+    names: impl Iterator<Item = &'a str>,
+    what: &str,
+) -> Result<HashSet<&'a str>, anyhow::Error> {
+    let mut seen = HashSet::new();
+    for name in names {
+        if !seen.insert(name) {
+            bail!("Duplicate {what}: '{name}'");
         }
     }
+    Ok(seen)
+}
 
-    // Unique model aliases
-    let mut model_aliases = HashSet::new();
-    for m in &config.models {
-        if !model_aliases.insert(m.alias.clone()) {
-            bail!("Duplicate model alias: '{}'", m.alias);
-        }
-    }
-
-    // Unique virtual key names
-    let mut key_names = HashSet::new();
-    for k in &config.virtual_keys {
-        if !key_names.insert(k.name.clone()) {
-            bail!("Duplicate virtual key name: '{}'", k.name);
-        }
-    }
-
-    // Validate rate limiting config
+fn validate_rate_limiting(config: &Config) -> Result<(), anyhow::Error> {
     if config.rate_limiting.backend == RateLimitBackendType::Redis
         && config.rate_limiting.redis_url.is_none()
     {
         bail!("rate_limiting.backend is 'redis' but redis_url is not set");
     }
+    Ok(())
+}
 
-    // Validate the metrics route path: it is mounted verbatim on the router,
-    // and axum panics at startup on a path that doesn't start with '/'. Fail
-    // here with a clear message instead.
+/// The metrics route path is mounted verbatim on the router, and axum panics
+/// at startup on a path that doesn't start with '/'. Fail here with a clear
+/// message instead.
+fn validate_metrics_path(config: &Config) -> Result<(), anyhow::Error> {
     if config.telemetry.metrics.enabled && !config.telemetry.metrics.path.starts_with('/') {
         bail!(
             "telemetry.metrics.path must start with '/', got '{}'",
             config.telemetry.metrics.path
         );
     }
+    Ok(())
+}
 
-    // Unique classifier ids
-    let mut classifier_ids = HashSet::new();
-    for c in &config.classifiers {
-        if !classifier_ids.insert(c.id.as_str()) {
-            bail!("Duplicate classifier id: '{}'", c.id);
-        }
-    }
-
-    // Every alias is either statically routed or classified, never both.
+/// Every alias is either statically routed or classified, never both.
+/// Returns the statically routed aliases.
+fn validate_alias_kinds(config: &Config) -> Result<HashSet<&str>, anyhow::Error> {
     let mut static_aliases = HashSet::new();
     for m in &config.models {
         match (&m.routing, &m.classifier) {
@@ -626,26 +641,29 @@ pub(crate) fn validate(config: &Config) -> Result<(), anyhow::Error> {
             ),
         }
     }
+    Ok(static_aliases)
+}
 
-    // Validate model routing references
+fn validate_model_routing(
+    config: &Config,
+    provider_names: &HashSet<&str>,
+) -> Result<(), anyhow::Error> {
     for m in &config.models {
         let Some(routing) = &m.routing else { continue };
         if routing.targets.is_empty() {
             bail!("Model '{}' must have at least one target", m.alias);
         }
         if routing.strategy == RoutingStrategy::Weighted {
-            for t in &routing.targets {
-                if t.weight.is_none() {
-                    bail!(
-                        "Model '{}' uses weighted strategy but target '{}' has no weight",
-                        m.alias,
-                        t.provider
-                    );
-                }
+            if let Some(t) = routing.targets.iter().find(|t| t.weight.is_none()) {
+                bail!(
+                    "Model '{}' uses weighted strategy but target '{}' has no weight",
+                    m.alias,
+                    t.provider
+                );
             }
         }
         for t in routing.targets.iter().chain(routing.fallback.iter()) {
-            if !provider_names.contains(&t.provider) {
+            if !provider_names.contains(t.provider.as_str()) {
                 bail!(
                     "Model '{}' references unknown provider '{}'",
                     m.alias,
@@ -654,9 +672,17 @@ pub(crate) fn validate(config: &Config) -> Result<(), anyhow::Error> {
             }
         }
     }
+    Ok(())
+}
 
-    // Validate classified aliases. Tiers and the fallback must be statically
-    // routed, so a classified alias can never chain or cycle into another.
+/// Tiers and the fallback must be statically routed, so a classified alias can
+/// never chain or cycle into another.
+fn validate_classified_aliases(
+    config: &Config,
+    model_aliases: &HashSet<&str>,
+    static_aliases: &HashSet<&str>,
+    classifier_ids: &HashSet<&str>,
+) -> Result<(), anyhow::Error> {
     for m in &config.models {
         let Some(classified) = &m.classifier else {
             continue;
@@ -702,9 +728,12 @@ pub(crate) fn validate(config: &Config) -> Result<(), anyhow::Error> {
             );
         }
     }
+    Ok(())
+}
 
-    // Native /responses passthrough needs an upstream that speaks the
-    // Responses API; only a generic OpenAI-protocol provider can.
+/// Native /responses passthrough needs an upstream that speaks the Responses
+/// API; only a generic OpenAI-protocol provider can.
+fn validate_native_responses(config: &Config) -> Result<(), anyhow::Error> {
     for p in &config.providers {
         if p.responses == ResponsesMode::Native && p.provider_type != ProviderType::OpenAI {
             bail!(
@@ -713,26 +742,29 @@ pub(crate) fn validate(config: &Config) -> Result<(), anyhow::Error> {
             );
         }
     }
+    Ok(())
+}
 
-    // Validate AWS credential configuration for Bedrock providers.
+/// AWS credential configuration for Bedrock providers.
+fn validate_aws_auth(config: &Config) -> Result<(), anyhow::Error> {
     for p in &config.providers {
-        if let Some(auth) = p.aws.as_ref().and_then(|a| a.auth.as_ref()) {
-            let has_static = auth.access_key_id.is_some() || auth.secret_access_key.is_some();
-            if auth.access_key_id.is_some() != auth.secret_access_key.is_some() {
-                bail!(
-                    "Provider '{}': aws.auth requires both access_key_id and secret_access_key together",
-                    p.name
-                );
-            }
-            if has_static && auth.profile.is_some() {
-                bail!(
-                    "Provider '{}': aws.auth sets both static credentials and a profile; use exactly one base source",
-                    p.name
-                );
-            }
+        let Some(auth) = p.aws.as_ref().and_then(|a| a.auth.as_ref()) else {
+            continue;
+        };
+        let has_static = auth.access_key_id.is_some() || auth.secret_access_key.is_some();
+        if auth.access_key_id.is_some() != auth.secret_access_key.is_some() {
+            bail!(
+                "Provider '{}': aws.auth requires both access_key_id and secret_access_key together",
+                p.name
+            );
+        }
+        if has_static && auth.profile.is_some() {
+            bail!(
+                "Provider '{}': aws.auth sets both static credentials and a profile; use exactly one base source",
+                p.name
+            );
         }
     }
-
     Ok(())
 }
 
@@ -1247,6 +1279,55 @@ models:
     fn validate_accepts_memory_backend_without_url() {
         let config = minimal_config("openai", "gpt-4");
         // default backend is memory, no redis_url needed
+        assert!(validate(&config).is_ok());
+    }
+
+    // ── aws.auth validation ───────────────────────────────────────────────────
+
+    fn config_with_aws_auth(auth: AwsAuthConfig) -> Config {
+        let mut config = minimal_config("bedrock", "claude");
+        config.providers[0].provider_type = ProviderType::Bedrock;
+        config.providers[0].aws = Some(AwsConfig {
+            auth: Some(auth),
+            ..AwsConfig::default()
+        });
+        config
+    }
+
+    #[test]
+    fn validate_rejects_aws_access_key_without_secret() {
+        let config = config_with_aws_auth(AwsAuthConfig {
+            access_key_id: Some("AKIA".to_string()),
+            ..AwsAuthConfig::default()
+        });
+        let err = validate(&config).unwrap_err().to_string();
+        assert_eq!(
+            err,
+            "Provider 'bedrock': aws.auth requires both access_key_id and secret_access_key together"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_aws_static_keys_with_profile() {
+        let config = config_with_aws_auth(AwsAuthConfig {
+            access_key_id: Some("AKIA".to_string()),
+            secret_access_key: Some("secret".to_string()),
+            profile: Some("dev".to_string()),
+            ..AwsAuthConfig::default()
+        });
+        let err = validate(&config).unwrap_err().to_string();
+        assert_eq!(
+            err,
+            "Provider 'bedrock': aws.auth sets both static credentials and a profile; use exactly one base source"
+        );
+    }
+
+    #[test]
+    fn validate_accepts_aws_profile_only() {
+        let config = config_with_aws_auth(AwsAuthConfig {
+            profile: Some("dev".to_string()),
+            ..AwsAuthConfig::default()
+        });
         assert!(validate(&config).is_ok());
     }
 }
