@@ -32,7 +32,7 @@ rsa = { version = "0.9", features = ["sha2", "pem"] }
 aes-gcm = "0.10"
 rand = "0.8"  # pinned to 0.8: rsa 0.9 requires rand_core 0.6; rand 0.10 is incompatible (see #66)
 # JWT signing
-jsonwebtoken = { version = "10", features = ["rust_crypto"] }
+jsonwebtoken = { version = "10", features = ["aws_lc_rs"] }
 # Hex decoding for CP_ENCRYPTION_KEY
 hex = "0.4"
 # Constant-time comparisons to prevent timing side-channels

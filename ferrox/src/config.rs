@@ -31,7 +31,10 @@ pub struct ServerConfig {
     pub timeouts: TimeoutsConfig,
     #[serde(default = "default_graceful_shutdown_timeout_secs")]
     pub graceful_shutdown_timeout_secs: u64,
-    #[serde(default = "default_max_request_body_bytes")]
+    #[serde(
+        default = "default_max_request_body_bytes",
+        deserialize_with = "deserialize_usize_or_string"
+    )]
     pub max_request_body_bytes: usize,
 }
 
@@ -44,8 +47,10 @@ fn default_port() -> u16 {
 fn default_graceful_shutdown_timeout_secs() -> u64 {
     30
 }
+/// 32 MiB: room for several inline base64 images plus long conversation
+/// context, in line with what upstream providers accept for multimodal input.
 fn default_max_request_body_bytes() -> usize {
-    10 * 1024 * 1024
+    32 * 1024 * 1024
 }
 
 impl Default for ServerConfig {
@@ -101,6 +106,27 @@ where
         U16OrString::Int(n) => Ok(n),
         U16OrString::Str(s) => s.trim().parse::<u16>().map_err(|_| {
             serde::de::Error::custom(format!("expected a port number (0–65535), got \"{s}\""))
+        }),
+    }
+}
+
+/// Accepts both a YAML integer and a string representation of one, so sizes
+/// can come from env-var interpolation, e.g.
+/// `max_request_body_bytes: "${FERROX_MAX_REQUEST_BODY_BYTES:-33554432}"`.
+fn deserialize_usize_or_string<'de, D>(de: D) -> Result<usize, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum UsizeOrString {
+        Int(usize),
+        Str(String),
+    }
+    match UsizeOrString::deserialize(de)? {
+        UsizeOrString::Int(n) => Ok(n),
+        UsizeOrString::Str(s) => s.trim().parse::<usize>().map_err(|_| {
+            serde::de::Error::custom(format!("expected a non-negative byte count, got \"{s}\""))
         }),
     }
 }
@@ -1248,5 +1274,31 @@ models:
         let config = minimal_config("openai", "gpt-4");
         // default backend is memory, no redis_url needed
         assert!(validate(&config).is_ok());
+    }
+
+    #[test]
+    fn max_request_body_bytes_accepts_int_string_and_env_default() {
+        let parse = |value: &str| {
+            parse_config(&format!(
+                "server:\n  max_request_body_bytes: {value}\nproviders: []\nmodels: []\n"
+            ))
+        };
+        assert_eq!(
+            parse("1048576").unwrap().server.max_request_body_bytes,
+            1_048_576
+        );
+        assert_eq!(
+            parse("\"2048\"").unwrap().server.max_request_body_bytes,
+            2048
+        );
+        // Unset var falls back to the inline default.
+        assert_eq!(
+            parse("\"${FERROX_TEST_UNSET_BODY_LIMIT_VAR:-4096}\"")
+                .unwrap()
+                .server
+                .max_request_body_bytes,
+            4096
+        );
+        assert!(parse("\"lots\"").is_err());
     }
 }

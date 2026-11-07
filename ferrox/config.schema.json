@@ -72,7 +72,14 @@
           "description": "TCP port the gateway listens on. Accepts a plain integer or a ${FERROX_PORT:-8080} env-var reference."
         },
         "graceful_shutdown_timeout_secs": { "type": "integer", "minimum": 0, "default": 30 },
-        "max_request_body_bytes": { "type": "integer", "minimum": 0, "default": 10485760 },
+        "max_request_body_bytes": {
+          "oneOf": [
+            { "type": "integer", "minimum": 0 },
+            { "type": "string", "description": "Env-var reference, e.g. \"${FERROX_MAX_REQUEST_BODY_BYTES:-33554432}\"" }
+          ],
+          "default": 33554432,
+          "description": "Maximum request body size in bytes on every route; larger bodies get a JSON 413. Accepts a plain integer or an env-var reference."
+        },
         "timeouts": { "$ref": "#/definitions/TimeoutsConfig" }
       }
     },
