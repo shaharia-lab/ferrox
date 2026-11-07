@@ -1,7 +1,10 @@
 use axum::{
-    middleware,
+    extract::{DefaultBodyLimit, Request, State},
+    http::{header, StatusCode},
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
     routing::{get, post},
-    Router,
+    Json, Router,
 };
 use std::time::Duration;
 use tower_http::{
@@ -66,11 +69,73 @@ pub fn build_router(state: AppState) -> Router {
         .merge(v1_routes)
         .merge(anthropic_routes)
         .merge(public_routes)
+        // `server.max_request_body_bytes` replaces axum's built-in 2 MB
+        // extractor cap on every route (`Json` and `Bytes` both honor it).
+        // The middleware sits outside auth, so a declared-oversize body is
+        // refused before any work, and rewrites axum's plain-text 413 into
+        // the route surface's JSON error shape.
+        .layer(DefaultBodyLimit::max(
+            state.config.server.max_request_body_bytes,
+        ))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            body_limit_middleware,
+        ))
         .layer(TraceLayer::new_for_http())
         .layer(CorsLayer::permissive())
         .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
         .layer(TimeoutLayer::new(request_timeout))
         .with_state(state)
+}
+
+/// Enforces `server.max_request_body_bytes` with a JSON 413.
+///
+/// A `Content-Length` above the limit is rejected up front. A body without one
+/// (chunked) is cut off by the extractor's [`DefaultBodyLimit`], whose
+/// plain-text 413 is rewritten here. JSON 413s (e.g. relayed from a provider)
+/// pass through untouched.
+async fn body_limit_middleware(
+    State(state): State<AppState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let limit = state.config.server.max_request_body_bytes;
+    let anthropic = request.uri().path().starts_with("/anthropic/");
+
+    let declared = request
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok());
+    if declared.is_some_and(|len| len > limit as u64) {
+        return payload_too_large(limit, anthropic);
+    }
+
+    let response = next.run(request).await;
+    let is_json = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.starts_with("application/json"));
+    if response.status() == StatusCode::PAYLOAD_TOO_LARGE && !is_json {
+        return payload_too_large(limit, anthropic);
+    }
+    response
+}
+
+fn payload_too_large(limit: usize, anthropic: bool) -> Response {
+    let message = format!("request body exceeds {limit} bytes");
+    let body = if anthropic {
+        serde_json::json!({
+            "type": "error",
+            "error": {"type": "request_too_large", "message": message}
+        })
+    } else {
+        serde_json::json!({
+            "error": {"message": message, "type": "invalid_request_error", "code": 413}
+        })
+    };
+    (StatusCode::PAYLOAD_TOO_LARGE, Json(body)).into_response()
 }
 
 async fn metrics_handler() -> impl axum::response::IntoResponse {
@@ -278,5 +343,121 @@ mod tests {
                 .collect();
             assert_eq!(ids, ["fast", "smart", "auto"], "{path}");
         }
+    }
+
+    // ── Request body limit ──────────────────────────────────────────────────
+
+    /// App with one virtual key and no models, so a body that gets past the
+    /// size limit and parses fails later with a non-413 status.
+    fn body_limit_app(limit: Option<usize>) -> Router {
+        let mut config: Config = serde_json::from_value(serde_json::json!({
+            "providers": [],
+            "models": [],
+            "virtual_keys": [{"key": "sk-test", "name": "test", "allowed_models": ["*"]}],
+        }))
+        .unwrap();
+        if let Some(limit) = limit {
+            config.server.max_request_body_bytes = limit;
+        }
+        build_router(build_state(config))
+    }
+
+    /// A valid chat-completions JSON body padded to roughly `size` bytes.
+    fn chat_body(size: usize) -> Vec<u8> {
+        let padding = "a".repeat(size);
+        serde_json::to_vec(&serde_json::json!({
+            "model": "missing",
+            "messages": [{"role": "user", "content": padding}],
+        }))
+        .unwrap()
+    }
+
+    fn post(path: &str, body: Vec<u8>, with_content_length: bool) -> Request<Body> {
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri(path)
+            .header("authorization", "Bearer sk-test")
+            .header("content-type", "application/json");
+        if with_content_length {
+            builder = builder.header("content-length", body.len());
+        }
+        builder.body(Body::from(body)).unwrap()
+    }
+
+    #[test]
+    fn default_body_limit_is_32_mib() {
+        assert_eq!(
+            minimal_config().server.max_request_body_bytes,
+            32 * 1024 * 1024
+        );
+    }
+
+    #[tokio::test]
+    async fn body_between_10_and_32_mib_is_accepted_on_every_post_route() {
+        let body = chat_body(20 * 1024 * 1024);
+        for path in [
+            "/v1/chat/completions",
+            "/v1/responses",
+            "/anthropic/v1/messages",
+        ] {
+            for with_len in [true, false] {
+                let resp = body_limit_app(None)
+                    .oneshot(post(path, body.clone(), with_len))
+                    .await
+                    .unwrap();
+                assert_ne!(
+                    resp.status(),
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "{path} (content-length: {with_len}) rejected a 20 MiB body"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn body_over_limit_gets_json_413_naming_the_limit() {
+        let limit = 1024 * 1024;
+        let body = chat_body(2 * limit);
+        for path in [
+            "/v1/chat/completions",
+            "/v1/responses",
+            "/anthropic/v1/messages",
+        ] {
+            // With Content-Length (rejected up front) and without (chunked,
+            // cut off by the extractor).
+            for with_len in [true, false] {
+                let (status, json) = send(
+                    body_limit_app(Some(limit)),
+                    post(path, body.clone(), with_len),
+                )
+                .await;
+                assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{path} {with_len}");
+                assert_eq!(
+                    json["error"]["message"],
+                    format!("request body exceeds {limit} bytes"),
+                    "{path} {with_len}"
+                );
+                if path.starts_with("/anthropic/") {
+                    assert_eq!(json["type"], "error");
+                    assert_eq!(json["error"]["type"], "request_too_large");
+                } else {
+                    assert_eq!(json["error"]["type"], "invalid_request_error");
+                    assert_eq!(json["error"]["code"], 413);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn oversize_declared_body_is_rejected_before_auth() {
+        let limit = 1024;
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-length", limit + 1)
+            .body(Body::from(vec![b'x'; limit + 1]))
+            .unwrap();
+        let (status, _) = send(body_limit_app(Some(limit)), request).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
     }
 }

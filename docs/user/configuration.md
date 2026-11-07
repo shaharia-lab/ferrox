@@ -36,7 +36,7 @@ server:
   host: "0.0.0.0"          # bind address
   port: 8080                # bind port
   graceful_shutdown_timeout_secs: 30
-  max_request_body_bytes: 10485760   # 10 MB
+  max_request_body_bytes: 33554432   # 32 MiB
 
   timeouts:
     connect_secs: 10   # TCP + TLS handshake to provider

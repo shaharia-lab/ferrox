@@ -44,8 +44,10 @@ fn default_port() -> u16 {
 fn default_graceful_shutdown_timeout_secs() -> u64 {
     30
 }
+/// 32 MiB: room for several inline base64 images plus long conversation
+/// context, in line with what upstream providers accept for multimodal input.
 fn default_max_request_body_bytes() -> usize {
-    10 * 1024 * 1024
+    32 * 1024 * 1024
 }
 
 impl Default for ServerConfig {
