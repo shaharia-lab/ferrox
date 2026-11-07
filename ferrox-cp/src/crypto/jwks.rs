@@ -1,7 +1,5 @@
+use aws_lc_rs::rsa::PublicKey;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-use rsa::pkcs8::DecodePublicKey;
-use rsa::traits::PublicKeyParts;
-use rsa::RsaPublicKey;
 use serde::Serialize;
 use utoipa::ToSchema;
 
@@ -23,11 +21,12 @@ pub struct Jwk {
 
 /// Convert DER-encoded SubjectPublicKeyInfo bytes to a [`Jwk`].
 pub fn public_key_to_jwk(kid: &str, public_key_der: &[u8]) -> Result<Jwk, CpError> {
-    let public_key = RsaPublicKey::from_public_key_der(public_key_der)
+    let public_key = PublicKey::from_der(public_key_der)
         .map_err(|e| CpError::Jwks(format!("failed to parse public key DER: {e}")))?;
 
-    let n = URL_SAFE_NO_PAD.encode(public_key.n().to_bytes_be());
-    let e = URL_SAFE_NO_PAD.encode(public_key.e().to_bytes_be());
+    // Big-endian, no leading zeros — exactly the RFC 7518 §6.3.1 encoding.
+    let n = URL_SAFE_NO_PAD.encode(public_key.modulus().big_endian_without_leading_zero());
+    let e = URL_SAFE_NO_PAD.encode(public_key.exponent().big_endian_without_leading_zero());
 
     Ok(Jwk {
         kty: "RSA".to_string(),
@@ -75,5 +74,20 @@ mod tests {
         assert_eq!(json["alg"], "RS256");
         assert!(json["n"].is_string());
         assert!(json["e"].is_string());
+    }
+
+    /// A key generated and stored by the previous `rsa`-crate implementation
+    /// must publish the exact same JWK, so already-issued tokens keep verifying.
+    #[test]
+    fn legacy_stored_key_publishes_identical_jwk() {
+        use base64::engine::general_purpose::STANDARD;
+        let spki = STANDARD
+            .decode(include_str!("testdata/legacy_public_spki.der.b64").trim())
+            .unwrap();
+        let want: serde_json::Value =
+            serde_json::from_str(include_str!("testdata/legacy_jwk.json")).unwrap();
+        let jwk = public_key_to_jwk("legacy", &spki).expect("jwk ok");
+        assert_eq!(jwk.n, want["n"]);
+        assert_eq!(jwk.e, want["e"]);
     }
 }
