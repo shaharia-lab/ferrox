@@ -184,10 +184,11 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           # RUSTSEC-2023-0071: timing side-channel in `rsa` crate (Marvin Attack),
-          # no patched release upstream. ferrox-cp uses `rsa` directly, but only
-          # for RSA key generation and public-key parsing; JWT signing runs on
-          # aws-lc-rs (jsonwebtoken `aws_lc_rs` backend). No private-key
-          # decryption/signing via `rsa` is reachable by a remote timing observer.
+          # no patched release upstream. `rsa` is NOT compiled into any binary:
+          # ferrox-cp moved RSA keygen/JWKS to aws-lc-rs, and the only remaining
+          # reference is a Cargo.lock entry via sqlx → sqlx-mysql, which sqlx
+          # locks even though only the `postgres` driver is enabled (verify:
+          # `cargo tree -i rsa --target all -e all` prints nothing).
           ignore: RUSTSEC-2023-0071
 
   # ── Admin UI ──────────────────────────────────────────────────────────────────

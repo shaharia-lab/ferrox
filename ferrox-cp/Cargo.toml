@@ -28,9 +28,11 @@ serde_json = "1"
 thiserror = "1"
 anyhow = "1"
 # Crypto
-rsa = { version = "0.9", features = ["sha2", "pem"] }
 aes-gcm = "0.10"
-rand = "0.8"  # pinned to 0.8: rsa 0.9 requires rand_core 0.6; rand 0.10 is incompatible (see #66)
+rand = "0.8"
+# RSA keygen + JWKS encoding. Already in the tree via rustls/jsonwebtoken;
+# replaces the `rsa` crate (RUSTSEC-2023-0071, Marvin timing side-channel).
+aws-lc-rs = "1"
 # JWT signing
 jsonwebtoken = { version = "10", features = ["aws_lc_rs"] }
 # Hex decoding for CP_ENCRYPTION_KEY

@@ -1376,6 +1376,7 @@ version = "0.1.0"
 dependencies = [
  "aes-gcm",
  "anyhow",
+ "aws-lc-rs",
  "axum",
  "axum-test",
  "base64 0.22.1",
@@ -1386,7 +1387,6 @@ dependencies = [
  "jsonwebtoken",
  "mime_guess",
  "rand 0.8.7",
- "rsa",
  "serde",
  "serde_json",
  "sqlx",
@@ -3128,7 +3128,6 @@ dependencies = [
  "pkcs1",
  "pkcs8",
  "rand_core 0.6.4",
- "sha2 0.10.9",
  "signature",
  "spki",
  "subtle",

@@ -123,9 +123,17 @@ mod tests {
     use super::*;
     use crate::crypto::encrypt::encrypt_private_key;
     use crate::crypto::keys::generate_keypair;
+    use aws_lc_rs::rsa::PublicKey;
     use jsonwebtoken::{decode, DecodingKey, Validation};
-    use rsa::pkcs8::DecodePublicKey;
-    use rsa::RsaPublicKey;
+
+    /// SPKI DER → PKCS#1 `RSAPublicKey` DER, which `DecodingKey::from_rsa_der`
+    /// expects.
+    fn pkcs1_public(spki_der: &[u8]) -> Vec<u8> {
+        PublicKey::from_der(spki_der)
+            .expect("public key ok")
+            .as_ref()
+            .to_vec()
+    }
 
     fn make_client() -> Client {
         Client {
@@ -184,14 +192,7 @@ mod tests {
 
         // Verify using the public key — mirrors what the gateway does.
         // jsonwebtoken::DecodingKey::from_rsa_der expects PKCS#1 DER.
-        let public_key =
-            RsaPublicKey::from_public_key_der(&signing_key.public_key).expect("public key ok");
-        let public_key_pkcs1_der = {
-            use rsa::pkcs1::EncodeRsaPublicKey;
-            public_key.to_pkcs1_der().unwrap().as_bytes().to_vec()
-        };
-
-        let decoding_key = DecodingKey::from_rsa_der(&public_key_pkcs1_der);
+        let decoding_key = DecodingKey::from_rsa_der(&pkcs1_public(&signing_key.public_key));
         let mut validation = Validation::new(Algorithm::RS256);
         validation.set_audience(&["ferrox"]);
 
@@ -255,12 +256,7 @@ mod tests {
         // Generate a completely different keypair and try to verify.
         // Convert SPKI DER → PKCS#1 DER for DecodingKey.
         let other_kp = generate_keypair().expect("keygen ok");
-        let other_public_pkcs1 = {
-            use rsa::pkcs1::EncodeRsaPublicKey;
-            let pk = RsaPublicKey::from_public_key_der(&other_kp.public_key_der).unwrap();
-            pk.to_pkcs1_der().unwrap().as_bytes().to_vec()
-        };
-        let decoding_key = DecodingKey::from_rsa_der(&other_public_pkcs1);
+        let decoding_key = DecodingKey::from_rsa_der(&pkcs1_public(&other_kp.public_key_der));
         let mut validation = Validation::new(Algorithm::RS256);
         validation.set_audience(&["ferrox"]);
         let result = decode::<Claims>(&signed.token, &decoding_key, &validation);
@@ -268,5 +264,40 @@ mod tests {
             result.is_err(),
             "token must not verify with a different key"
         );
+    }
+
+    /// A private key stored by the previous `rsa`-crate implementation (PKCS#1
+    /// DER) must still sign, and verify against the JWKS the CP publishes for it.
+    #[test]
+    fn legacy_stored_key_still_signs_and_verifies_via_jwks() {
+        use base64::engine::general_purpose::STANDARD;
+        use base64::Engine;
+        let private = STANDARD
+            .decode(include_str!("testdata/legacy_private_pkcs1.der.b64").trim())
+            .unwrap();
+        let spki = STANDARD
+            .decode(include_str!("testdata/legacy_public_spki.der.b64").trim())
+            .unwrap();
+        let signing_key = SigningKey {
+            kid: "legacy".to_string(),
+            algorithm: "RS256".to_string(),
+            private_key: vec![],
+            public_key: spki.clone(),
+            active: true,
+            created_at: Utc::now(),
+            retired_at: None,
+        };
+        let signer = JwtSigner::new(&signing_key, &private, "https://ferrox-cp".to_string())
+            .expect("signer ok");
+        let signed = signer
+            .sign(&make_client())
+            .expect("legacy key must still sign");
+
+        // Verify the way the gateway does: from the published JWK components.
+        let jwk = crate::crypto::jwks::public_key_to_jwk("legacy", &spki).unwrap();
+        let decoding_key = DecodingKey::from_rsa_components(&jwk.n, &jwk.e).unwrap();
+        let mut validation = Validation::new(Algorithm::RS256);
+        validation.set_audience(&["ferrox"]);
+        decode::<Claims>(&signed.token, &decoding_key, &validation).expect("jwt must verify");
     }
 }
