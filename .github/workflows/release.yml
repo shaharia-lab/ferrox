@@ -23,7 +23,7 @@ env:
   IMAGE_NAME: ${{ github.repository }}
 
 # Least-privilege default token scope. Jobs widen it locally where needed
-# (upload-assets/docker/docker-cp declare their own writes; homebrew uses a PAT;
+# (upload-assets/docker/docker-cp declare their own writes; homebrew uses a GitHub App token;
 # announce adds actions: read).
 permissions:
   contents: read
@@ -230,15 +230,29 @@ jobs:
   # ── Homebrew tap ──────────────────────────────────────────────────────────────
   # Updates the ferrox.rb formula and creates a versioned ferrox@X.Y.Z.rb formula
   # in the shaharia-lab/homebrew-tap repository.
-  # Requires a HOMEBREW_TAP_TOKEN secret with write access to that repo.
+  # Authenticates as the lab's slab-homebrew-tap-publisher GitHub App: a
+  # one-hour token, minted per run, scoped to homebrew-tap contents only. The
+  # App credentials are secrets of the `publish` environment, which admits
+  # v* tag refs only — so no other branch's workflow can read them.
   homebrew:
     name: Update Homebrew formula
     needs: upload-assets
     runs-on: ubuntu-latest
+    environment: publish
     steps:
+      - name: Mint a token for the tap publisher, limited to the tap's contents
+        id: tap-token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ secrets.HOMEBREW_TAP_APP_CLIENT_ID }}
+          private-key: ${{ secrets.HOMEBREW_TAP_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: homebrew-tap
+          permission-contents: write
+
       - name: Update Homebrew formulas
         env:
-          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          GH_TOKEN: ${{ steps.tap-token.outputs.token }}
         run: |
           VERSION="${{ github.ref_name }}"
           VERSION_NUM="${VERSION#v}"
