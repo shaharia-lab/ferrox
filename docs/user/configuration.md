@@ -36,7 +36,7 @@ server:
   host: "0.0.0.0"          # bind address
   port: 8080                # bind port
   graceful_shutdown_timeout_secs: 30
-  max_request_body_bytes: 33554432   # 32 MiB
+  max_request_body_bytes: "${FERROX_MAX_REQUEST_BODY_BYTES:-33554432}"   # 32 MiB default; env-overridable
 
   timeouts:
     connect_secs: 10   # TCP + TLS handshake to provider
