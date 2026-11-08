@@ -44,6 +44,20 @@ pub enum ProxyError {
         message: String,
     },
 
+    /// An OpenAI-format upstream reported an error *inside* a stream it had
+    /// already answered with 200: a `data:` frame holding
+    /// `{"error":{…}}`. `body` is that frame exactly as received, so the
+    /// OpenAI chat surface can forward it byte for byte; `message` is the
+    /// upstream's `error.message`, and `status` its `error.code` when that is
+    /// an HTTP error status (else 502).
+    #[error("Provider stream error from {provider} (status {status}): {message}")]
+    ProviderStreamError {
+        provider: String,
+        status: u16,
+        message: String,
+        body: String,
+    },
+
     #[error("Upstream timeout: {0}")]
     UpstreamTimeout(String),
 
@@ -81,6 +95,14 @@ fn http_status_or_bad_gateway(status: u16) -> u16 {
 /// Framework-free on purpose: a consumer builds its own response from the pair,
 /// and the `axum` feature's `IntoResponse` is just one such consumer.
 pub fn openai_error_body(e: &ProxyError) -> (u16, serde_json::Value) {
+    // Already OpenAI-shaped: the upstream's own error object, as received.
+    if let ProxyError::ProviderStreamError { status, body, .. } = e {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(body) {
+            if value.get("error").is_some_and(|v| !v.is_null()) {
+                return (http_status_or_bad_gateway(*status), value);
+            }
+        }
+    }
     let (status, error_type, message) = match e {
         ProxyError::Unauthorized(msg) => (401, "unauthorized", msg.clone()),
         ProxyError::Forbidden(msg) => (403, "forbidden", msg.clone()),
@@ -92,6 +114,10 @@ pub fn openai_error_body(e: &ProxyError) -> (u16, serde_json::Value) {
         ProxyError::BudgetExceeded(msg) => (429, "budget_exceeded", msg.clone()),
         ProxyError::CircuitOpen(msg) => (502, "circuit_open", msg.clone()),
         ProxyError::ProviderError {
+            status, message, ..
+        }
+        // Reached only if its frame was not an error object after all.
+        | ProxyError::ProviderStreamError {
             status, message, ..
         } => (
             http_status_or_bad_gateway(*status),
@@ -125,6 +151,17 @@ pub fn openai_error_body(e: &ProxyError) -> (u16, serde_json::Value) {
     (status, body)
 }
 
+/// The `data:` payload of the terminal error event of an OpenAI chat
+/// completion stream: an upstream's own in-band error frame, byte for byte,
+/// and otherwise [`openai_error_body`] — the body a non-streaming request
+/// failing the same way is served.
+pub fn openai_stream_error_data(e: &ProxyError) -> String {
+    match e {
+        ProxyError::ProviderStreamError { body, .. } => body.clone(),
+        _ => openai_error_body(e).1.to_string(),
+    }
+}
+
 /// Maps every variant onto an Anthropic-shaped JSON error body —
 /// `{"type":"error","error":{"type":…,"message":…}}` — plus the HTTP status.
 ///
@@ -147,6 +184,9 @@ pub fn anthropic_error_body(e: &ProxyError) -> (u16, serde_json::Value) {
         // 529 is Anthropic's "overloaded" status; 502 is the closest standard code.
         ProxyError::CircuitOpen(msg) => (502, "overloaded_error", msg.clone()),
         ProxyError::ProviderError {
+            status, message, ..
+        }
+        | ProxyError::ProviderStreamError {
             status, message, ..
         } => (
             http_status_or_bad_gateway(*status),
@@ -194,6 +234,18 @@ mod body_tests {
             provider: "anthropic".to_string(),
             status,
             message: "overloaded".to_string(),
+        }
+    }
+
+    /// The exact frame an OpenAI-compatible shim sends when it fails part-way.
+    const SHIM_ERROR_FRAME: &str = r#"{"error":{"message":"Claude stopped after reaching the maximum number of turns without producing a reply","type":"server_error","code":null}}"#;
+
+    fn provider_stream_error() -> ProxyError {
+        ProxyError::ProviderStreamError {
+            provider: "shim".to_string(),
+            status: 502,
+            message: "Claude stopped after reaching the maximum number of turns without producing a reply".to_string(),
+            body: SHIM_ERROR_FRAME.to_string(),
         }
     }
 
@@ -246,7 +298,7 @@ mod body_tests {
 
     /// Every `ProxyError` variant, so the tables below cannot silently fall
     /// behind the enum: add a variant and the length assertions fail.
-    const VARIANT_COUNT: usize = 14;
+    const VARIANT_COUNT: usize = 15;
 
     // ── OpenAI shape ─────────────────────────────────────────────────────────
 
@@ -283,8 +335,9 @@ mod body_tests {
 
         assert_eq!(
             cases.len(),
-            VARIANT_COUNT - 1,
-            "every variant except HttpClientError (covered separately, it branches)"
+            VARIANT_COUNT - 2,
+            "every variant except HttpClientError (covered separately, it branches) \
+             and ProviderStreamError (forwarded as received, covered separately)"
         );
 
         for (err, want_status, want_type) in cases {
@@ -312,6 +365,36 @@ mod body_tests {
         // Other variants keep their exact pre-existing shape: no `param`.
         let (_, body) = openai_error_body(&ProxyError::Forbidden("k".into()));
         assert!(body["error"].get("param").is_none());
+    }
+
+    #[test]
+    fn openai_shape_forwards_an_upstream_stream_error_as_received() {
+        let (status, body) = openai_error_body(&provider_stream_error());
+        assert_eq!(status, 502);
+        assert_eq!(
+            body,
+            serde_json::from_str::<serde_json::Value>(SHIM_ERROR_FRAME).unwrap()
+        );
+        // The stream event carries the frame byte for byte.
+        assert_eq!(
+            openai_stream_error_data(&provider_stream_error()),
+            SHIM_ERROR_FRAME
+        );
+        // Anything else is the non-streaming body.
+        let e = ProxyError::StreamError("cut".into());
+        assert_eq!(
+            openai_stream_error_data(&e),
+            openai_error_body(&e).1.to_string()
+        );
+    }
+
+    #[test]
+    fn anthropic_shape_uses_the_upstream_message_of_a_stream_error() {
+        let (_, body) = anthropic_error_body(&provider_stream_error());
+        assert_eq!(
+            body["error"]["message"],
+            "Claude stopped after reaching the maximum number of turns without producing a reply"
+        );
     }
 
     #[test]
@@ -345,6 +428,7 @@ mod body_tests {
             ),
             (ProxyError::CircuitOpen("c".into()), 502, "overloaded_error"),
             (provider_error(503), 503, "api_error"),
+            (provider_stream_error(), 502, "api_error"),
             (ProxyError::UpstreamTimeout("t".into()), 504, "api_error"),
             (ProxyError::StreamError("s".into()), 500, "api_error"),
             // The catch-all arm: everything else is a 500 api_error.

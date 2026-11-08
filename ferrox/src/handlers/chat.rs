@@ -103,7 +103,11 @@ pub async fn chat_completions(
                 )
                 .with_routing(decision.routing_record());
                 // The wrapper finishes its accounting before it ends, so the
-                // chained `[DONE]` always follows the recorded usage.
+                // chained `[DONE]` always follows the recorded usage. An
+                // upstream failure part-way (the wrapper ends right after it)
+                // becomes one OpenAI `{"error":{…}}` event rather than an
+                // `Err` item, on which axum would abort the body and leave the
+                // client with a truncated response and no reason.
                 let sse_stream = finalizer
                     .wrap_stream(stream)
                     .filter_map(|chunk_result| {
@@ -112,7 +116,8 @@ pub async fn chat_completions(
                                 let data = serde_json::to_string(&chunk).unwrap_or_default();
                                 Ok(Event::default().data(data))
                             }),
-                            Err(e) => Some(Err(e)),
+                            Err(e) => Some(Ok(Event::default()
+                                .data(ferrox_providers::error::openai_stream_error_data(&e)))),
                         };
                         std::future::ready(event)
                     })

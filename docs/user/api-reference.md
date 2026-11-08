@@ -151,6 +151,16 @@ data: {"id":"chatcmpl-abc","object":"chat.completion.chunk","created":1735000000
 data: [DONE]
 ```
 
+If the upstream fails after the stream has started (the `200` is already sent), the stream ends with one error event and then `data: [DONE]`, rather than a cut connection. When the upstream itself sent an OpenAI-format error frame, that frame is forwarded unchanged; otherwise the payload has the same shape as a [non-streaming error](#error-responses):
+
+```
+data: {"error":{"message":"...","type":"server_error","code":null}}
+
+data: [DONE]
+```
+
+The failure is logged once at `WARN` (with `request_id`, `model_alias`, `provider`, `model_id`, `upstream_status`, `chunks_forwarded`) and counted in `ferrox_errors_total`.
+
 ### Error responses
 
 All errors use OpenAI error format:
@@ -425,6 +435,13 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":
 
 event: message_stop
 data: {"type":"message_stop"}
+```
+
+If the upstream fails after the stream has started, the stream ends with Anthropic's streaming `error` event, without `message_stop`:
+
+```
+event: error
+data: {"type":"error","error":{"type":"api_error","message":"..."}}
 ```
 
 ### Prompt-cache token counters

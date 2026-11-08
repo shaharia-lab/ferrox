@@ -10,3 +10,5 @@ pub mod responses;
 mod budget_refund_tests;
 #[cfg(test)]
 mod classified_tests;
+#[cfg(test)]
+mod stream_error_tests;
