@@ -17,7 +17,7 @@ places.
 
 ```toml
 [dependencies]
-ferrox-providers = { git = "https://github.com/shaharia-lab/ferrox", tag = "providers-v0.3.0",
+ferrox-providers = { git = "https://github.com/shaharia-lab/ferrox", tag = "providers-v0.4.0",
                      default-features = false, features = ["anthropic", "openai"] }
 ```
 
