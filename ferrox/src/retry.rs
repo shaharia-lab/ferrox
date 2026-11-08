@@ -14,6 +14,9 @@ pub fn is_retryable(e: &ProxyError) -> bool {
         ProxyError::UpstreamTimeout(_) => true,
         ProxyError::CircuitOpen(_) => true,
         ProxyError::ProviderError { status, .. } => *status >= 500 || *status == 429,
+        // Only ever raised after a stream started, past retry; classified
+        // like the HTTP error it reports for consistency.
+        ProxyError::ProviderStreamError { status, .. } => *status >= 500 || *status == 429,
         ProxyError::HttpClientError(e) => e.is_timeout() || e.is_connect(),
         ProxyError::StreamError(_) => true,
 

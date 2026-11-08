@@ -204,7 +204,38 @@ impl RequestFinalizer {
             last_usage: None,
             reconcile: None,
             held: None,
+            forwarded: 0,
+            failed: false,
         }
+    }
+
+    /// Account for an upstream error after the stream started: the client
+    /// already has a 200, so the handler ends the body with a terminal error
+    /// event; this is the one WARN and error count for it. The request itself
+    /// is still settled (usage, latency, budget) when the stream ends.
+    fn record_stream_error(&self, e: &ProxyError, chunks_forwarded: u64) {
+        ERRORS_TOTAL
+            .with_label_values(&[self.provider.as_str(), error_type_label(e)])
+            .inc();
+        let upstream_status = match e {
+            ProxyError::ProviderError { status, .. }
+            | ProxyError::ProviderStreamError { status, .. } => Some(*status),
+            _ => None,
+        };
+        tracing::warn!(
+            request_id = %self.request_id,
+            key_name = %self.key_name,
+            model_alias = %self.model_alias,
+            provider = %self.provider,
+            model_id = %self.model_id,
+            surface = ?self.surface,
+            error_type = error_type_label(e),
+            upstream_status,
+            chunks_forwarded,
+            elapsed_ms = self.start.elapsed().as_millis() as u64,
+            error = %e,
+            "stream_error: upstream failed mid-stream; ending the stream with an error event"
+        );
     }
 
     fn record_token_metrics(&self, c: TokenCounts) {
@@ -387,6 +418,10 @@ pub(crate) struct FinalizedStream<T = ChatCompletionChunk> {
     reconcile: Option<BoxFuture<'static, ()>>,
     /// A terminal item waiting for the request to settle.
     held: Option<T>,
+    /// Items already passed on to the handler, for the mid-stream error log.
+    forwarded: u64,
+    /// The upstream yielded an error; the stream ends after it.
+    failed: bool,
 }
 
 impl<T> FinalizedStream<T> {
@@ -415,7 +450,15 @@ impl<T: Metered + Unpin> Stream for FinalizedStream<T> {
             let Some(finalizer) = this.finalizer.as_ref() else {
                 return Poll::Ready(this.held.take().map(Ok));
             };
-            match ready!(this.inner.poll_next_unpin(cx)) {
+            // After an error nothing more is read from the upstream: the
+            // stream ends there, settled like any other end, so the handler's
+            // terminal error event follows the accounting.
+            let next = if this.failed {
+                None
+            } else {
+                ready!(this.inner.poll_next_unpin(cx))
+            };
+            match next {
                 Some(Ok(chunk)) => {
                     if let Some(usage) = chunk.usage() {
                         let c = TokenCounts::from_usage(usage);
@@ -423,6 +466,7 @@ impl<T: Metered + Unpin> Stream for FinalizedStream<T> {
                         this.last_usage = Some(c);
                     }
                     if !chunk.is_terminal() {
+                        this.forwarded += 1;
                         return Poll::Ready(Some(Ok(chunk)));
                     }
                     // The answer is complete: settle now, release it after,
@@ -434,7 +478,11 @@ impl<T: Metered + Unpin> Stream for FinalizedStream<T> {
                         None => return Poll::Ready(this.held.take().map(Ok)),
                     }
                 }
-                Some(Err(e)) => return Poll::Ready(Some(Err(e))),
+                Some(Err(e)) => {
+                    this.failed = true;
+                    finalizer.record_stream_error(&e, this.forwarded);
+                    return Poll::Ready(Some(Err(e)));
+                }
                 None => match this.settle() {
                     Some(fut) => this.reconcile = Some(fut),
                     None => return Poll::Ready(this.held.take().map(Ok)),
@@ -501,7 +549,9 @@ pub(crate) fn http_status_for_error(e: &ProxyError) -> u16 {
         ProxyError::InvalidRequest { .. } => 400,
         ProxyError::ModelNotFound(_) => 404,
         ProxyError::RateLimited(_) | ProxyError::BudgetExceeded(_) => 429,
-        ProxyError::CircuitOpen(_) | ProxyError::ProviderError { .. } => 502,
+        ProxyError::CircuitOpen(_)
+        | ProxyError::ProviderError { .. }
+        | ProxyError::ProviderStreamError { .. } => 502,
         ProxyError::UpstreamTimeout(_) => 504,
         _ => 500,
     }
@@ -516,7 +566,9 @@ pub(crate) fn error_type_label(e: &ProxyError) -> &'static str {
         ProxyError::RateLimited(_) => "rate_limited",
         ProxyError::BudgetExceeded(_) => "budget_exceeded",
         ProxyError::CircuitOpen(_) => "circuit_open",
-        ProxyError::ProviderError { .. } => "provider_error",
+        ProxyError::ProviderError { .. } | ProxyError::ProviderStreamError { .. } => {
+            "provider_error"
+        }
         ProxyError::UpstreamTimeout(_) => "upstream_timeout",
         ProxyError::StreamError(_) => "stream_error",
         ProxyError::HttpClientError(_) => "http_client_error",

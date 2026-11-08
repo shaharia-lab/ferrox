@@ -32,7 +32,10 @@ support, Gemini implicit-cache token reporting, and image-part/ChatMessage
 serialization fixes. `providers-v0.3.0` adds the Responses API wire types and
 Responses↔ChatCompletion translation (including the streaming event state
 machine), and Anthropic thinking-signature capture/replay with model-aware
-`reasoning_effort`. Each is a plain git tag, **not** a GitHub Release, and is
+`reasoning_effort`. `providers-v0.4.0` adds `ProxyError::ProviderStreamError` (an
+OpenAI-format upstream's in-band `{"error":…}` stream frame, kept as received)
+and `openai_stream_error_data`; matching `ProxyError` exhaustively needs the new
+arm. Each is a plain git tag, **not** a GitHub Release, and is
 versioned independently of Ferrox's own `v*` gateway releases.
 
 The crate is not on crates.io yet, so a git dependency is the only way to consume

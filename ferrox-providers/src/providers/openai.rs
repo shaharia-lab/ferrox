@@ -176,11 +176,17 @@ impl ProviderAdapter for OpenAIAdapter {
 
                 match serde_json::from_str::<ChatCompletionChunk>(&data) {
                     Ok(chunk) => yield Ok(chunk),
+                    // Only a frame that is not a chunk is checked for an
+                    // in-band error, so a normal chunk is parsed once.
                     Err(e) => {
-                        yield Err(ProxyError::StreamError(format!(
-                            "Failed to parse OpenAI chunk from {}: {e}",
-                            provider_name
-                        )));
+                        yield Err(in_band_stream_error(&provider_name, &data).unwrap_or_else(
+                            || {
+                                ProxyError::StreamError(format!(
+                                    "Failed to parse OpenAI chunk from {}: {e}",
+                                    provider_name
+                                ))
+                            },
+                        ));
                         return;
                     }
                 }
@@ -212,10 +218,63 @@ impl ProviderAdapter for OpenAIAdapter {
     ) -> Result<NativeResponsesStream, ProxyError> {
         let body = WithModel { body, model_id };
         let resp = self.post_json(&self.responses_url(), &body).await?;
-        let events = parse_sse_stream(resp)
-            .map(|item| item.map(|(event, data)| NativeResponsesEvent::new(event, data)));
+        let provider_name = self.name.clone();
+        let events = parse_sse_stream(resp).map(move |item| {
+            let (event, data) = item?;
+            // A Responses upstream names every event (its own `error` event
+            // included, and passed through verbatim), so only an unnamed frame
+            // can be a chat-style in-band error from an OpenAI-compatible shim.
+            if event.is_none() && data.contains("\"error\"") {
+                if let Some(e) = in_band_stream_error(&provider_name, &data) {
+                    return Err(e);
+                }
+            }
+            Ok(NativeResponsesEvent::new(event, data))
+        });
         Ok(Box::pin(events))
     }
+}
+
+/// An OpenAI-style error an upstream sends *inside* a stream it already
+/// answered with 200: a `data:` frame holding `{"error":{"message":…,"code":…}}`
+/// and no `choices`. Returned as a [`ProxyError::ProviderStreamError`] carrying
+/// the frame and the upstream's message, so the client learns why its stream
+/// ended; the status
+/// is `error.code` when that is an HTTP error status (400..=599), else 502.
+/// `None` for anything else, which the caller reports as a malformed frame.
+fn in_band_stream_error(provider: &str, data: &str) -> Option<ProxyError> {
+    let Value::Object(mut frame) = serde_json::from_str::<Value>(data).ok()? else {
+        return None;
+    };
+    if frame.contains_key("choices") {
+        return None;
+    }
+    let error = frame.remove("error")?;
+    let message = match &error {
+        Value::Null => return None,
+        Value::String(s) => s.clone(),
+        Value::Object(o) => match o.get("message") {
+            Some(Value::String(s)) => s.clone(),
+            _ => error.to_string(),
+        },
+        other => other.to_string(),
+    };
+    let status = error
+        .get("code")
+        .and_then(|c| match c {
+            Value::Number(n) => n.as_u64(),
+            Value::String(s) => s.parse().ok(),
+            _ => None,
+        })
+        .and_then(|c| u16::try_from(c).ok())
+        .filter(|c| (400..=599).contains(c))
+        .unwrap_or(502);
+    Some(ProxyError::ProviderStreamError {
+        provider: provider.to_string(),
+        status,
+        message,
+        body: data.to_string(),
+    })
 }
 
 /// A Responses body serialized with `model` replaced by the resolved upstream
@@ -848,5 +907,184 @@ mod tests {
         })
         .unwrap();
         assert_eq!(out, serde_json::json!({"model": "up-v1", "input": "hi"}));
+    }
+
+    // ── In-band stream errors ────────────────────────────────────────────────
+
+    /// The frames an OpenAI-compatible shim sends when it fails after it has
+    /// already answered 200: one ordinary chunk, then an error object, then
+    /// `[DONE]`.
+    const CHUNK_THEN_ERROR: &str = concat!(
+        "data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"m\",",
+        "\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"hi\"},",
+        "\"finish_reason\":null}]}\n\n",
+        "data: {\"error\":{\"message\":\"Claude stopped after reaching the maximum number of ",
+        "turns without producing a reply\",\"type\":\"server_error\",\"code\":null}}\n\n",
+        "data: [DONE]\n\n",
+    );
+
+    /// An adapter whose upstream answers every POST to `route` with `body`
+    /// as an SSE stream.
+    async fn adapter_streaming(
+        route: &str,
+        body: &str,
+        native: bool,
+    ) -> (wiremock::MockServer, OpenAIAdapter) {
+        use wiremock::matchers::{method, path};
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(method("POST"))
+            .and(path(format!("/v1{route}")))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_raw(body.as_bytes().to_vec(), "text/event-stream"),
+            )
+            .mount(&server)
+            .await;
+        let mut cfg = provider_cfg(Some(&format!("{}/v1", server.uri())));
+        if native {
+            cfg.responses = ResponsesMode::Native;
+        }
+        let adapter = OpenAIAdapter::new(&cfg, &defaults()).unwrap();
+        (server, adapter)
+    }
+
+    fn stream_request() -> ChatCompletionRequest {
+        serde_json::from_str(
+            r#"{"model":"m","stream":true,"messages":[{"role":"user","content":"hi"}]}"#,
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn chat_stream_surfaces_an_in_band_error_with_the_upstream_message() {
+        let (_server, adapter) =
+            adapter_streaming("/chat/completions", CHUNK_THEN_ERROR, false).await;
+        let items: Vec<_> = adapter
+            .chat_stream(&stream_request(), "m")
+            .await
+            .unwrap()
+            .collect()
+            .await;
+
+        assert_eq!(items.len(), 2, "the chunk, then the error, then the end");
+        let chunk = items[0].as_ref().expect("the chunk before the error");
+        assert_eq!(chunk.choices[0].delta.content.as_deref(), Some("hi"));
+        match &items[1] {
+            Err(ProxyError::ProviderStreamError {
+                provider,
+                status,
+                message,
+                body,
+            }) => {
+                assert_eq!(provider, "test");
+                assert_eq!(*status, 502, "a null code falls back to 502");
+                assert_eq!(
+                    message,
+                    "Claude stopped after reaching the maximum number of turns without producing a reply"
+                );
+                // The frame exactly as the upstream sent it.
+                let sent = CHUNK_THEN_ERROR.split("\n\n").nth(1).unwrap();
+                assert_eq!(Some(body.as_str()), sent.strip_prefix("data: "));
+            }
+            other => panic!("expected a ProviderStreamError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn in_band_error_status_comes_from_an_http_error_code() {
+        let status = |data: &str| match in_band_stream_error("p", data) {
+            Some(ProxyError::ProviderStreamError { status, .. }) => status,
+            other => panic!("expected a ProviderStreamError, got {other:?}"),
+        };
+        assert_eq!(status(r#"{"error":{"message":"m","code":429}}"#), 429);
+        assert_eq!(status(r#"{"error":{"message":"m","code":"503"}}"#), 503);
+        assert_eq!(status(r#"{"error":{"message":"m","code":200}}"#), 502);
+        assert_eq!(
+            status(r#"{"error":{"message":"m","code":"bad_thing"}}"#),
+            502
+        );
+        assert_eq!(status(r#"{"error":{"message":"m","code":70000}}"#), 502);
+        assert_eq!(status(r#"{"error":"plain"}"#), 502);
+    }
+
+    #[test]
+    fn only_an_error_object_is_an_in_band_error() {
+        // Malformed JSON, a chunk, and a frame without `error` all stay
+        // malformed-frame StreamErrors at the caller.
+        for data in [
+            "{not json",
+            r#"{"choices":[],"error":{"message":"m"}}"#,
+            r#"{"something":"else"}"#,
+            r#"{"error":null}"#,
+            r#"["error"]"#,
+        ] {
+            assert!(in_band_stream_error("p", data).is_none(), "{data}");
+        }
+    }
+
+    #[tokio::test]
+    async fn chat_stream_malformed_frame_stays_a_stream_error() {
+        let (_server, adapter) =
+            adapter_streaming("/chat/completions", "data: {not json\n\n", false).await;
+        let items: Vec<_> = adapter
+            .chat_stream(&stream_request(), "m")
+            .await
+            .unwrap()
+            .collect()
+            .await;
+        assert!(
+            matches!(items.as_slice(), [Err(ProxyError::StreamError(_))]),
+            "{items:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn native_responses_stream_surfaces_an_unnamed_in_band_error() {
+        let body = concat!(
+            "event: response.created\n",
+            "data: {\"type\":\"response.created\",\"sequence_number\":0}\n\n",
+            "data: {\"error\":{\"message\":\"upstream gave up\",\"code\":503}}\n\n",
+        );
+        let (_server, adapter) = adapter_streaming("/responses", body, true).await;
+        let items: Vec<_> = adapter
+            .responses_stream(
+                serde_json::json!({"input": "hi", "stream": true})
+                    .as_object()
+                    .unwrap(),
+                "m",
+            )
+            .await
+            .unwrap()
+            .collect()
+            .await;
+        assert_eq!(items.len(), 2);
+        assert_eq!(
+            items[0].as_ref().unwrap().event.as_deref(),
+            Some("response.created")
+        );
+        assert!(
+            matches!(
+                &items[1],
+                Err(ProxyError::ProviderStreamError { status: 503, message, .. }) if message == "upstream gave up"
+            ),
+            "{:?}",
+            items[1]
+        );
+    }
+
+    #[tokio::test]
+    async fn native_responses_error_event_passes_through_verbatim() {
+        let data = r#"{"type":"error","code":"server_error","message":"boom","sequence_number":1}"#;
+        let body = format!("event: error\ndata: {data}\n\n");
+        let (_server, adapter) = adapter_streaming("/responses", &body, true).await;
+        let items: Vec<_> = adapter
+            .responses_stream(serde_json::json!({"input": "hi"}).as_object().unwrap(), "m")
+            .await
+            .unwrap()
+            .collect()
+            .await;
+        let event = items[0].as_ref().unwrap();
+        assert_eq!(event.event.as_deref(), Some("error"));
+        assert_eq!(event.data, data);
     }
 }
