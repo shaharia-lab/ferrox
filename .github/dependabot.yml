@@ -3,12 +3,19 @@
 #   - github-actions: SHA-pinned in the workflows (B1)
 #   - docker: base images digest-pinned in the Dockerfile (B3)
 # Dependabot rewrites the pinned commit/digest + `# vX` comment on updates.
+# Each ecosystem's bumps are grouped into one PR, run on the 1st and 15th of
+# the month (Dependabot has no 14-day interval). Security updates ignore this
+# schedule and still open immediately.
 version: 2
 updates:
   - package-ecosystem: github-actions
     directory: "/"
     schedule:
-      interval: weekly
+      interval: cron
+      cronjob: "0 4 1,15 * *"
+    groups:
+      github-actions:
+        patterns: ["*"]
     open-pull-requests-limit: 5
     commit-message:
       prefix: build(deps)
@@ -16,7 +23,11 @@ updates:
   - package-ecosystem: docker
     directory: "/"
     schedule:
-      interval: weekly
+      interval: cron
+      cronjob: "0 4 1,15 * *"
+    groups:
+      docker:
+        patterns: ["*"]
     open-pull-requests-limit: 5
     commit-message:
       prefix: build(deps)
