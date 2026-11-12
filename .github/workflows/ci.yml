@@ -189,7 +189,12 @@ jobs:
           # reference is a Cargo.lock entry via sqlx → sqlx-mysql, which sqlx
           # locks even though only the `postgres` driver is enabled (verify:
           # `cargo tree -i rsa --target all -e all` prints nothing).
-          ignore: RUSTSEC-2023-0071
+          # RUSTSEC-2026-0459: bundled SQLite in `libsqlite3-sys` 0.30.1. Same
+          # story: only a Cargo.lock entry via sqlx → sqlx-sqlite, never
+          # compiled (`cargo tree -i libsqlite3-sys --target all -e all`
+          # prints nothing). The fix needs libsqlite3-sys 0.39, which sqlx 0.8
+          # cannot take.
+          ignore: RUSTSEC-2023-0071,RUSTSEC-2026-0459
 
   # ── Admin UI ──────────────────────────────────────────────────────────────────
   # Type-checks and builds the React + TypeScript SPA that is embedded into the
